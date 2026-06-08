@@ -87,6 +87,34 @@ def test_tp2_vocab_parallel_embedding(run_tp_probe) -> None:
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
+@pytest.mark.parametrize(
+    "probe",
+    [
+        "merged_column_parallel_linear",
+        "qkv_parallel_linear",
+        "row_parallel_linear",
+    ],
+)
+def test_tp_linear_layers(run_tp_probe, probe: str) -> None:
+    """End-to-end TP=2 test of a Spyre linear layer on Spyre cards.
+
+    Spawns one subprocess per rank, running through vllm's real
+    `init_worker_distributed_environment` against a real `VllmConfig`,
+    then verifies the layer returns numerically correct results on
+    TP=2 with Spyre communication. Parametrized over the three layer
+    types: SpyreMergedColumnParallelLinear (output sharding),
+    SpyreQKVParallelLinear (Q/K/V sharding), and SpyreRowParallelLinear
+    (input sharding).
+    """
+    run_tp_probe(probe, world_size=2)
+
+
+@pytest.mark.spyre
+@pytest.mark.uses_subprocess
+@pytest.mark.skipif(
+    _spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
+)
 @pytest.mark.xfail(
     strict=True,
     reason=(
