@@ -51,14 +51,16 @@ and the copier ships with a CPU-testable `torch_copy` backend as the default plu
 
 - [x] **Unit 0 — Tracking + branch.** `dev/kv-offload-m1` off
   `rfc/upstream-connector-port`; this doc.
-- [ ] **Unit 1 — `SpyreKvDmaCopier` + env var.**
+- [x] **Unit 1 — `SpyreKvDmaCopier` + env var.**
   `spyre_inference/v1/kv_offload/{__init__,copier}.py`; `SPYRE_KV_DMA_BACKEND` in
   `envs.py`. Backends: `torch_copy` (default, CPU+Spyre), `senlib_dma` (gated),
   `spyre_from_blob` (gated), `auto`.
-- [ ] **Unit 2 — KV adaptation layer.** `kv_offload/kv_adapter.py`. Plugin-side only,
+- [x] **Unit 2 — KV adaptation layer.** `kv_offload/kv_adapter.py`. Plugin-side only,
   no vLLM patch. Bridges `SpyrePagedKVCache` page-lists to handler-consumable views.
-- [ ] **Unit 3 — `SpyreCpuOffloadingHandlers`.** `kv_offload/handlers.py`. d2h/h2d
+- [x] **Unit 3 — `SpyreCpuOffloadingHandlers`.** `kv_offload/handlers.py`. d2h/h2d
   `OffloadingHandler`s against the 0.20.1 `worker/worker.py` contract; synchronous.
+  Also exposes `transfer_count`/`blocks_transferred`/`bytes_transferred` counters
+  and logs one line per transfer (host-hit signal; see runbook).
 - [x] **Unit 4 — `SpyreOffloadingSpec` + registration.** `kv_offload/spec.py`
   (subclasses `OffloadingSpec` directly; reuses `CPUOffloadingManager`);
   `register_spec(...)` in `spyre_inference/__init__.py`. **Includes a minimal
@@ -66,9 +68,11 @@ and the copier ships with a CPU-testable `torch_copy` backend as the default plu
   note below.
 - [x] **Unit 5 — Tests.** `tests/v1/kv_offload/`:
   `test_spec_registration.py` (CPU), `test_handler_dispatch.py` (CPU),
-  `test_copier_round_trip.py` (Spyre-gated, skips on CPU-only).
+  `test_copier_round_trip.py` (Spyre-gated), `test_e2e_offload.py` (Spyre-gated
+  end-to-end via the `LLM` API).
 - [x] **Unit 6 — Verify.** `ty check spyre_inference` clean, `ruff` lint + format
-  clean, `tests/v1/kv_offload/` = 7 passed / 1 skipped on this CPU-only host.
+  clean. CPU host: 7 passed / 1 skipped. On a Spyre card: the e2e test boots the
+  connector and matches the no-connector baseline at temperature=0 (see runbook).
 
 ### Verification note (how M1 was checked on this host)
 
@@ -103,14 +107,95 @@ Cleaner long-term alternative (filed, not done): the RFC §10 Q2 upstream one-li
 that lets `register_kv_caches` tolerate a non-tensor/paged cache would remove the need
 for this hook. Tracked under "Open follow-ups".
 
-## Acceptance gates deferred to a Spyre dev image
+## Runbook: running the end-to-end offload check on a Spyre card
 
-These cannot run on this CPU-only host and are not exercised in this pass:
+This reproduces the RFC A1.1 check on your own Spyre environment. It runs in-process
+through the `LLM` API (same engine path as `vllm serve`, easier to assert on).
 
-- RFC **A1.1** end-to-end `vllm serve --kv-transfer-config '{... "spec_name":
-  "SpyreOffloadingSpec" ...}'` two-prompt host-hit check at `temperature=0`.
-- RFC **A1.2** `test_copier_round_trip.py` on a Spyre runner.
+### Prerequisites
+- A host with a Spyre card and `torch-spyre` installed (the standard dev image).
+- The `spyre-inference` dev env. If `uv run` can provision it for you:
+  `uv sync --group dev`. On an image where `uv` cannot rebuild torch-spyre, run
+  against the already-provisioned runtime interpreter instead (that is what was used
+  to validate M1 here): `python -m pip install pytest` into that env, then invoke
+  `python -m pytest ...` directly.
+
+### Run the gated e2e test
+```bash
+# one Spyre process at a time — never run two Spyre-backed commands concurrently
+uv run pytest -m "not upstream" tests/v1/kv_offload/test_e2e_offload.py -v
+# or, against a hand-provisioned runtime interpreter:
+SKIP_UPSTREAM_TESTS=1 python -m pytest -p no:spyre_testing_plugin -o addopts="" \
+    tests/v1/kv_offload/test_e2e_offload.py -v
+```
+The test skips on CPU-only hosts. On a card it (1) boots an `LLM` with
+`OffloadingConnector` + `SpyreOffloadingSpec`, and (2) asserts the generated tokens
+are byte-identical to a no-connector baseline at `temperature=0`.
+
+### What you should see in the worker log
+- `Creating offloading spec with name: SpyreOffloadingSpec` — the factory resolved
+  our lazily-registered spec.
+- `SpyreKvDmaCopier using backend 'torch_copy'` — the device↔host copier initialized
+  (auto-detected `torch_copy`, since the DMPA accessors / libsenlib are absent).
+- If any KV block is physically moved, one line per transfer:
+  `SpyreOffloadingHandler GPU->CPU: job=… blocks=N bytes=…` (store) or `CPU->GPU…`
+  (host-tier load). `grep SpyreOffloadingHandler` over the run to count them.
+
+### Compile-envelope caveat (important)
+This card hits a **torch-spyre `torch.compile` RecursionError** in the Granite decode
+path at roughly **≥40-token** prompts. It reproduces with **no connector at all**
+(`granite.py: residual + hidden_states * residual_multiplier` →
+`torch_spyre/ops/eager.py: dispatch_to_torch_compile` → Dynamo recursion), so it is a
+torch-spyre issue, not M1's. A length sweep on this card: ~39 tokens OK, ~52 tokens
+crash. The e2e test therefore uses ~34-token prompts. If you change the prompts, keep
+them short, or you will hit this crash. (A larger model/longer context will need the
+torch-spyre compile issue resolved first.)
+
+### Manual `vllm serve` form (RFC A1.1 verbatim)
+The same connector config also works under `vllm serve` (subject to the same
+compile-envelope caveat for prompt length):
+```bash
+vllm serve ibm-ai-platform/micro-g3.3-8b-instruct-1b \
+  --max-model-len 128 \
+  --kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both",
+    "kv_connector_extra_config":{"spec_name":"SpyreOffloadingSpec",
+    "cpu_bytes_to_use":2000000000}}'
+```
+
+## Open question: triggering an actual device↔host transfer
+
+The e2e check proves the connector **boots and is transparent** (identical output),
+but in the small single-request workloads tested here **no KV block was physically
+transferred** — the upstream scheduler's store-decision path
+(`offloading/scheduler.py:_get_reqs_to_store`) did not engage, even with
+`num_gpu_blocks_override=16` forcing eviction pressure. The store gate is
+`num_offloadable_tokens // offloaded_block_size` minus already-stored blocks, then a
+`block_id != 0` filter over the GPU block ids; understanding why it stays empty on
+Spyre is upstream-vLLM / scheduler-interaction work, not M1 plugin code.
+
+To verify an actual `GPU->CPU`/`CPU->GPU` transfer once this is understood, watch for
+the `SpyreOffloadingHandler …` log lines (and/or the handler's `blocks_transferred`
+counter). This is tracked as the remaining piece of A1.1; the device↔host *mechanism*
+itself is unit-tested directly in `test_handler_dispatch.py` and
+`test_copier_round_trip.py`.
+
+## Acceptance status on a real Spyre card
+
+Validated on-card (`micro-g3.3-8b-instruct-1b`, `max_model_len=128`):
+
+- ✅ RFC **A1.1 boot + correctness** — `LLM` boots with `OffloadingConnector` +
+  `SpyreOffloadingSpec`; the runner hook primes the spec and registers handlers
+  without raising; generated tokens are byte-identical to the no-connector baseline
+  at `temperature=0`. Covered by `tests/v1/kv_offload/test_e2e_offload.py`.
+- ✅ RFC **A1.2** `test_copier_round_trip.py` — runs on the card.
+- ⏳ RFC **A1.1 host-hit (actual transfer)** — NOT yet observed; the scheduler store
+  path did not engage for the small workloads tested. See "Open question" above.
+
+Still not exercised here:
+
 - `senlib_dma`-backed copier round-trip (requires senlib from flex-runtime).
+- Larger models / longer contexts (blocked by the torch-spyre compile recursion at
+  ≥~40-token prompts — see the runbook's compile-envelope caveat).
 
 ## Open follow-ups (recorded, not done here)
 

@@ -87,6 +87,14 @@ class _SingleDirectionSpyreHandler(OffloadingHandler):
         # transfer_async and queued here for get_finished to drain.
         self._finished: deque[TransferResult] = deque()
 
+        # Cumulative counters across the handler's lifetime. These give an
+        # in-process host-hit signal (e.g. host->device blocks_transferred > 0
+        # means the host tier was read back) without depending on vLLM's
+        # stat-logging, which LLM(...) disables by default. Used by the e2e test.
+        self.transfer_count: int = 0
+        self.blocks_transferred: int = 0
+        self.bytes_transferred: int = 0
+
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
         src_spec, dst_spec = spec
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
@@ -108,6 +116,29 @@ class _SingleDirectionSpyreHandler(OffloadingHandler):
         host_blocks = dst_blocks if self._device_to_host else src_blocks
 
         num_bytes = self._run_transfer(device_blocks, host_blocks)
+
+        # Each (device, host) pair moves one logical block (its K and V pages),
+        # counted once per layer view.
+        n_blocks = len(device_blocks) * len(self._views)
+        self.transfer_count += 1
+        self.blocks_transferred += n_blocks
+        self.bytes_transferred += num_bytes
+
+        # One line per transfer so host hits are observable in the worker log
+        # even when vLLM stat-logging is disabled (the default under LLM(...)).
+        # "CPU->GPU" lines with n_blocks > 0 are host-tier loads (host hits).
+        logger.info(
+            "SpyreOffloadingHandler %s->%s: job=%d blocks=%d bytes=%d "
+            "(cumulative: transfers=%d blocks=%d bytes=%d)",
+            self._transfer_type[0],
+            self._transfer_type[1],
+            job_id,
+            n_blocks,
+            num_bytes,
+            self.transfer_count,
+            self.blocks_transferred,
+            self.bytes_transferred,
+        )
 
         return self._record(job_id, num_bytes)
 
