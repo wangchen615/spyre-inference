@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     SPYRE_ATTN_IMPL: str = "default"
     SPYRE_SCATTER_USE_OVERWRITE: bool = False
+    SPYRE_KV_DMA_BACKEND: str = "auto"
 
 _cache: dict[str, Any] = {}
 
@@ -45,6 +46,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Requires PR #2084 (specialize_int=True) applied to torch-spyre or
     # the kernel will reuse the first call's offsets.
     "SPYRE_SCATTER_USE_OVERWRITE": lambda: bool(int(os.getenv("SPYRE_SCATTER_USE_OVERWRITE", "0"))),
+    # Selects the backend SpyreKvDmaCopier uses to move KV blocks between the
+    # Spyre device and host RAM for the OffloadingConnector (SpyreOffloadingSpec).
+    #   "auto"            : prefer "spyre_from_blob" if torch_spyre._C exposes the
+    #                       DMPA accessors, else "senlib_dma" if libsenlib is
+    #                       importable, else fall back to "torch_copy".
+    #   "torch_copy"      : whole-tensor .to("cpu")/.copy_() via torch_spyre's
+    #                       copy_tensor path. The only backend that runs on a
+    #                       CPU-only host and on a dev image without senlib.
+    #   "senlib_dma"      : libsenlib DmaiQPush/DmaoQPush over flit_offset
+    #                       addresses (the prior PD-disagg prototype's path).
+    #   "spyre_from_blob" : torch_spyre._C.{get_dma_address, spyre_from_blob};
+    #                       forward-looking until those accessors land upstream.
+    "SPYRE_KV_DMA_BACKEND": lambda: os.getenv("SPYRE_KV_DMA_BACKEND", "auto"),
 }
 # --8<-- [end:env-vars-definition]
 
