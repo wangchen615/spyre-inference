@@ -59,13 +59,37 @@ and the copier ships with a CPU-testable `torch_copy` backend as the default plu
   no vLLM patch. Bridges `SpyrePagedKVCache` page-lists to handler-consumable views.
 - [ ] **Unit 3 — `SpyreCpuOffloadingHandlers`.** `kv_offload/handlers.py`. d2h/h2d
   `OffloadingHandler`s against the 0.20.1 `worker/worker.py` contract; synchronous.
-- [ ] **Unit 4 — `SpyreOffloadingSpec` + registration.** `kv_offload/spec.py`
+- [x] **Unit 4 — `SpyreOffloadingSpec` + registration.** `kv_offload/spec.py`
   (subclasses `OffloadingSpec` directly; reuses `CPUOffloadingManager`);
-  `register_spec(...)` in `spyre_inference/__init__.py`.
+  `register_spec(...)` in `spyre_inference/__init__.py`. **Includes a minimal
+  worker-side hook** (`TorchSpyreModelRunner.initialize_kv_cache`) — see deviation
+  note below.
 - [ ] **Unit 5 — Tests.** `tests/v1/kv_offload/`:
   `test_spec_registration.py` (CPU), `test_handler_dispatch.py` (CPU),
   `test_copier_round_trip.py` (Spyre-gated, skips on CPU-only).
 - [ ] **Unit 6 — Verify.** `uv run ty`, `bash format.sh`, CPU pytest green.
+
+## Deviation from RFC A1.3 (recorded)
+
+RFC A1.3 set a goal of "no source changes to `TorchSpyreWorker` or
+`TorchSpyrePlatform`" for M1. Implementation showed this is not achievable, because
+the upstream `OffloadingConnectorWorker.register_kv_caches` canonicalizes each
+layer's KV cache via `untyped_storage().set_().view(...)` *before* `get_handlers`
+runs — and that crashes on Spyre's `SpyrePagedKVCache` (a list of per-block tensors,
+not a single tensor whose storage can be reinterpreted; finding #2/#3 above).
+
+**Decision (user):** add a minimal, well-scoped hook in
+`TorchSpyreModelRunner.initialize_kv_cache` (the model runner, not the worker class
+itself). It detects a `SpyreOffloadingSpec`-backed `OffloadingConnector` and, only
+then, temporarily swaps the connector's `register_kv_caches` for a Spyre path that
+primes the spec with the raw paged dict and registers the device<->host handlers
+directly — bypassing the upstream canonicalization. Every other connector and the
+non-connector path are untouched, and the base `initialize_kv_cache` orchestration is
+otherwise reused verbatim via `super()`. `TorchSpyrePlatform` is unchanged.
+
+Cleaner long-term alternative (filed, not done): the RFC §10 Q2 upstream one-liner
+that lets `register_kv_caches` tolerate a non-tensor/paged cache would remove the need
+for this hook. Tracked under "Open follow-ups".
 
 ## Acceptance gates deferred to a Spyre dev image
 

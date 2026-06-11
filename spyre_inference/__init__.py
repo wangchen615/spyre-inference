@@ -43,6 +43,23 @@ def register_ops():
     register_all()
 
 
+def register_offloading_specs():
+    """Register Spyre KV-offloading specs with the vLLM factory.
+
+    The factory loads the module lazily (only when a deployment selects the
+    spec via `kv_connector_extra_config.spec_name`), so CUDA-only deployments
+    that import `spyre_inference` for unrelated reasons pay no cost here.
+    """
+    from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+
+    if "SpyreOffloadingSpec" not in OffloadingSpecFactory._registry:
+        OffloadingSpecFactory.register_spec(
+            "SpyreOffloadingSpec",
+            "spyre_inference.v1.kv_offload.spec",
+            "SpyreOffloadingSpec",
+        )
+
+
 def _init_logging():
     """Setup logging, extending from the vLLM logging config"""
     config: dict[str, Any] = {}
@@ -85,3 +102,4 @@ def _init_logging():
 
 
 _init_logging()
+register_offloading_specs()
