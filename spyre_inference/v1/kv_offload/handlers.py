@@ -111,9 +111,7 @@ class _SingleDirectionSpyreHandler(OffloadingHandler):
 
         return self._record(job_id, num_bytes)
 
-    def _run_transfer(
-        self, device_blocks: np.ndarray, host_blocks: np.ndarray
-    ) -> int:
+    def _run_transfer(self, device_blocks: np.ndarray, host_blocks: np.ndarray) -> int:
         """Copy every (device_block, host_block) pair, K and V, across all views.
 
         Returns the total number of bytes moved.
@@ -125,19 +123,11 @@ class _SingleDirectionSpyreHandler(OffloadingHandler):
                 d_idx = int(device_id)
                 h_idx = int(host_id)
                 if self._device_to_host:
-                    self._copier.copy_d2h(
-                        view.device_k_pages[d_idx], view.host_k_pages[h_idx]
-                    )
-                    self._copier.copy_d2h(
-                        view.device_v_pages[d_idx], view.host_v_pages[h_idx]
-                    )
+                    self._copier.copy_d2h(view.device_k_pages[d_idx], view.host_k_pages[h_idx])
+                    self._copier.copy_d2h(view.device_v_pages[d_idx], view.host_v_pages[h_idx])
                 else:
-                    self._copier.copy_h2d(
-                        view.host_k_pages[h_idx], view.device_k_pages[d_idx]
-                    )
-                    self._copier.copy_h2d(
-                        view.host_v_pages[h_idx], view.device_v_pages[d_idx]
-                    )
+                    self._copier.copy_h2d(view.host_k_pages[h_idx], view.device_k_pages[d_idx])
+                    self._copier.copy_h2d(view.host_v_pages[h_idx], view.device_v_pages[d_idx])
                 # K and V each move one page.
                 num_bytes += 2 * page_bytes
         return num_bytes

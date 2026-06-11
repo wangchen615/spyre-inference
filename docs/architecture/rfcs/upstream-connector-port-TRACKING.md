@@ -64,10 +64,22 @@ and the copier ships with a CPU-testable `torch_copy` backend as the default plu
   `register_spec(...)` in `spyre_inference/__init__.py`. **Includes a minimal
   worker-side hook** (`TorchSpyreModelRunner.initialize_kv_cache`) — see deviation
   note below.
-- [ ] **Unit 5 — Tests.** `tests/v1/kv_offload/`:
+- [x] **Unit 5 — Tests.** `tests/v1/kv_offload/`:
   `test_spec_registration.py` (CPU), `test_handler_dispatch.py` (CPU),
   `test_copier_round_trip.py` (Spyre-gated, skips on CPU-only).
-- [ ] **Unit 6 — Verify.** `uv run ty`, `bash format.sh`, CPU pytest green.
+- [x] **Unit 6 — Verify.** `ty check spyre_inference` clean, `ruff` lint + format
+  clean, `tests/v1/kv_offload/` = 7 passed / 1 skipped on this CPU-only host.
+
+### Verification note (how M1 was checked on this host)
+
+`uv`/`uvx` could not provision the dev group here (it tried to build torch-spyre
+from GitHub against a fresh `/usr/local` interpreter). Verification was instead run
+against the already-provisioned runtime env at `/opt/spyre-inference` with
+standalone `pytest`, `ruff==0.14.0`, and `ty==0.0.16` installed into it — the same
+tool versions pinned in `.pre-commit-config.yaml`. On a properly `uv sync --group
+dev`'d checkout the canonical commands (`uv run ty`, `bash format.sh`,
+`uv run pytest -m "not upstream" tests/v1/kv_offload/`) should reproduce these
+results.
 
 ## Deviation from RFC A1.3 (recorded)
 

@@ -72,9 +72,7 @@ class SpyreOffloadingSpec(OffloadingSpec):
         # block (block_size_factor == 1 in M1).
         assert kv_cache_config is not None
         if kv_cache_config.num_blocks > 0:
-            total_gpu_kv_bytes = sum(
-                t.size for t in kv_cache_config.kv_cache_tensors
-            )
+            total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
             kv_bytes_per_block = (
                 total_gpu_kv_bytes // kv_cache_config.num_blocks
             ) * vllm_config.parallel_config.world_size
@@ -111,10 +109,7 @@ class SpyreOffloadingSpec(OffloadingSpec):
     def get_manager(self) -> OffloadingManager:
         if not self._manager:
             kv_events_config = self.vllm_config.kv_events_config
-            enable_events = (
-                kv_events_config is not None
-                and kv_events_config.enable_kv_cache_events
-            )
+            enable_events = kv_events_config is not None and kv_events_config.enable_kv_cache_events
             self._manager = CPUOffloadingManager(
                 num_blocks=self.num_blocks,
                 cache_policy=self.eviction_policy,  # type: ignore[arg-type]

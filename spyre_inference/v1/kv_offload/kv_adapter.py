@@ -124,9 +124,7 @@ def build_layer_views(
 
     for layer_name, cache in kv_caches.items():
         if not _is_paged_kv_cache(cache):
-            logger.debug(
-                "kv_adapter: skipping layer %r (not a paged KV cache)", layer_name
-            )
+            logger.debug("kv_adapter: skipping layer %r (not a paged KV cache)", layer_name)
             continue
 
         cache_id = id(cache)
@@ -161,10 +159,7 @@ def _alloc_host_pages(view: KVCacheLayerView, count: int) -> list[torch.Tensor]:
     pinning (``cudaHostRegister``), so pages are unpinned — consistent with the
     rest of the plugin's device<->host transfers.
     """
-    return [
-        torch.empty(view.page_shape, dtype=view.page_dtype, device="cpu")
-        for _ in range(count)
-    ]
+    return [torch.empty(view.page_shape, dtype=view.page_dtype, device="cpu") for _ in range(count)]
 
 
 def iter_block_pages(

@@ -43,9 +43,7 @@ def _make_cache(num_blocks: int, seed: int = 0):
     torch.manual_seed(seed)
 
     def pages():
-        return [
-            torch.randn(2, 16, 64, dtype=torch.float16) for _ in range(num_blocks)
-        ]
+        return [torch.randn(2, 16, 64, dtype=torch.float16) for _ in range(num_blocks)]
 
     return _FakePagedKVCache(pages(), pages())
 
@@ -55,17 +53,13 @@ def _make_handlers(num_blocks: int, num_cpu_blocks: int | None = None):
     kv_caches = {"layer.0": cache}
     copier = SpyreKvDmaCopier(backend="torch_copy")
     views = build_layer_views(kv_caches, num_cpu_blocks or num_blocks)
-    handlers = SpyreCpuOffloadingHandlers(
-        views=views, block_size_factor=1, copier=copier
-    )
+    handlers = SpyreCpuOffloadingHandlers(views=views, block_size_factor=1, copier=copier)
     return cache, views, handlers
 
 
 def _gpu_spec(block_ids):
     # Single KV group, logical offset 0.
-    return GPULoadStoreSpec(
-        list(block_ids), group_sizes=[len(block_ids)], block_indices=[0]
-    )
+    return GPULoadStoreSpec(list(block_ids), group_sizes=[len(block_ids)], block_indices=[0])
 
 
 @pytest.mark.spyre

@@ -81,9 +81,7 @@ def _senlib_available() -> bool:
 def _resolve_backend(requested: str) -> str:
     """Resolve "auto" to a concrete backend; validate an explicit choice."""
     if requested not in _VALID_BACKENDS:
-        raise ValueError(
-            f"SPYRE_KV_DMA_BACKEND={requested!r} is not one of {_VALID_BACKENDS}"
-        )
+        raise ValueError(f"SPYRE_KV_DMA_BACKEND={requested!r} is not one of {_VALID_BACKENDS}")
     if requested != AUTO:
         return requested
 

@@ -359,11 +359,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             # just bound. Prime the spec and register handlers, bypassing the
             # upstream canonicalization that would crash on the paged layout.
             spec.prime_kv_caches(kv_caches)
-            connector_worker = connector.connector_worker  # ty: ignore[possibly-missing-attribute]
+            connector_worker = connector.connector_worker
             assert connector_worker is not None
             # CanonicalKVCaches is ignored by SpyreOffloadingSpec.get_handlers,
             # so we can pass None through the same handler-registration path.
-            for src_cls, dst_cls, handler in spec.get_handlers(None):  # ty: ignore[invalid-argument-type]
+            for src_cls, dst_cls, handler in spec.get_handlers(None):
                 connector_worker.worker.register_handler(src_cls, dst_cls, handler)
 
         connector.register_kv_caches = _spyre_register_kv_caches  # ty: ignore[invalid-assignment]
