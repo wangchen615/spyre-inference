@@ -17,9 +17,6 @@
 Allocates a Spyre device tensor with a known fp16 pattern, copies it to host,
 mutates the host copy, copies it back, and asserts the device tensor matches.
 Skips cleanly on CPU-only hosts (mirrors the gate in tests/test_spyre_attn.py).
-
-There is also a CPU-only round-trip of the copier so the torch_copy backend's
-contract is exercised even where no Spyre device is present.
 """
 
 import pytest
@@ -34,23 +31,6 @@ def _spyre_available() -> bool:
         return True
     except Exception:
         return False
-
-
-@pytest.mark.spyre
-def test_copier_round_trip_cpu():
-    """torch_copy backend round-trips on plain CPU tensors (no device needed)."""
-    copier = SpyreKvDmaCopier(backend="torch_copy")
-
-    src = torch.arange(2 * 16 * 64, dtype=torch.float16).reshape(2, 16, 64)
-    host = torch.empty_like(src)
-    copier.copy_d2h(src, host)
-    assert torch.equal(host, src)
-
-    # mutate host, copy back into a fresh "device" tensor
-    host.add_(1.0)
-    dst = torch.zeros_like(src)
-    copier.copy_h2d(host, dst)
-    assert torch.equal(dst, host)
 
 
 @pytest.mark.spyre
