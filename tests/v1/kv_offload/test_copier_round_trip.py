@@ -19,10 +19,16 @@ mutates the host copy, copies it back, and asserts the device tensor matches.
 Skips cleanly on CPU-only hosts (mirrors the gate in tests/test_spyre_attn.py).
 """
 
+import os
+
 import pytest
 import torch
+import torch_spyre
 
 from spyre_inference.v1.kv_offload.copier import SpyreKvDmaCopier
+
+# The ``spyre`` device only registers after ``torch_spyre._autoload()`` runs.
+torch_spyre._autoload()
 
 
 def _spyre_available() -> bool:
@@ -36,11 +42,16 @@ def _spyre_available() -> bool:
 @pytest.mark.spyre
 def test_copier_round_trip_spyre():
     """Device->host->mutate->device round-trip on a real Spyre tensor."""
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("LOCAL_WORLD_SIZE", "1")
+
     if not _spyre_available():
         pytest.skip("Spyre device not available")
 
     device = torch.device("spyre")
-    copier = SpyreKvDmaCopier(backend="torch_copy")
+    copier = SpyreKvDmaCopier()
 
     # Known pattern on device.
     pattern = torch.arange(2 * 16 * 64, dtype=torch.float16).reshape(2, 16, 64)
