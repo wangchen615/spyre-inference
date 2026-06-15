@@ -1,0 +1,74 @@
+Uninstalled 1 package in 88ms
+Installed 1 package in 101ms
+INFO 06-15 21:34:00 [__init__.py:44] Available plugins for group vllm.platform_plugins:
+INFO 06-15 21:34:00 [__init__.py:46] - spyre_inference -> spyre_inference:register
+INFO 06-15 21:34:00 [__init__.py:58] Loading plugin spyre_inference
+INFO 06-15 21:34:00 [__init__.py:238] Platform plugin spyre_inference is activated
+<frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyPacked has no __module__ attribute
+<frozen importlib._bootstrap>:488: DeprecationWarning: builtin type SwigPyObject has no __module__ attribute
+INFO 06-15 21:34:12 [importing.py:68] Triton not installed or not compatible; certain GPU-related functions will not be available.
+/home/yuezhu/workspace/spyre-inference/.venv/lib64/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+INFO 06-15 21:34:14 [__init__.py:32] Registering custom ops for spyre_inference
+INFO 06-15 21:34:14 [rms_norm.py:244] Registered custom op: SpyreRMSNorm
+[vllm-upstream] Using cached worktree at /home/yuezhu/.cache/vllm-upstream-tests/worktree-v0.20.1
+[vllm-upstream] Auto-derived test paths from YAML: kernels/core/test_activation.py,v1/attention/test_attention_backends.py
+[vllm-upstream] Including tests from: kernels/core/test_activation.py
+[vllm-upstream] Including tests from: v1/attention/test_attention_backends.py
+collected 360 items / 359 deselected / 1 selected
+Running 1 items in this shard
+
+tests/v1/kv_offload/test_copier_round_trip.py F                          [100%]
+
+=================================== FAILURES ===================================
+_________________________ test_copier_round_trip_spyre _________________________
+
+    @pytest.mark.spyre
+    def test_copier_round_trip_spyre():
+        """Device->host->mutate->device round-trip on a real Spyre tensor."""
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        os.environ.setdefault("LOCAL_RANK", "0")
+        os.environ.setdefault("LOCAL_WORLD_SIZE", "1")
+    
+        if not _spyre_available():
+            pytest.skip("Spyre device not available")
+    
+        device = torch.device("spyre")
+        copier = SpyreKvDmaCopier()
+    
+        # Known pattern on device.
+        pattern = torch.arange(2 * 16 * 64, dtype=torch.float16).reshape(2, 16, 64)
+        src_spyre = pattern.to(device)
+    
+        # device -> host
+        host = torch.empty(2, 16, 64, dtype=torch.float16, device="cpu")
+        copier.copy_d2h(src_spyre, host)
+>       assert torch.equal(host, pattern)
+E       assert False
+E        +  where False = <built-in method equal of type object at 0x7f1e26581e40>(tensor([[[0.0000e+00, 1.0000e+00, 2.0000e+00,  ..., 6.1000e+01,\n          6.2000e+01, 6.3000e+01],\n         [6.4000e+0...       [1.9840e+03, 1.9840e+03, 1.9860e+03,  ..., 2.0440e+03,\n          2.0460e+03, 2.0460e+03]]], dtype=torch.float16), tensor([[[0.0000e+00, 1.0000e+00, 2.0000e+00,  ..., 6.1000e+01,\n          6.2000e+01, 6.3000e+01],\n         [6.4000e+0...       [1.9840e+03, 1.9850e+03, 1.9860e+03,  ..., 2.0450e+03,\n          2.0460e+03, 2.0470e+03]]], dtype=torch.float16))
+E        +    where <built-in method equal of type object at 0x7f1e26581e40> = torch.equal
+
+tests/v1/kv_offload/test_copier_round_trip.py:63: AssertionError
+---------------------------- Captured stdout setup -----------------------------
+INFO 06-15 21:34:16 [model.py:555] Resolved architecture: Qwen3ForCausalLM
+WARNING 06-15 21:34:16 [model.py:2018] Casting torch.bfloat16 to torch.float16.
+INFO 06-15 21:34:16 [model.py:1680] Using max model len 40960
+INFO 06-15 21:34:16 [scheduler.py:239] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 06-15 21:34:16 [vllm.py:840] Asynchronous scheduling is enabled.
+INFO 06-15 21:34:16 [kernel.py:205] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'])
+INFO 06-15 21:34:16 [vllm.py:978] Cudagraph mode FULL_AND_PIECEWISE is not compatible with compilation mode 0.Overriding to NONE.
+
+    [91m▄█▀▀█▄[0m  [38;5;208m█▀▀▀█▄[0m  [93m█   █[0m  [92m█▀▀▀█▄[0m  [94m█▀▀▀▀[0m    [97;1m█  █▄   █  █▀▀▀▀ █▀▀▀▀  █▀▀▀█▄ █▀▀▀▀  █▄   █  ▄█▀▀█▄ █▀▀▀▀[0m
+    [91m▀▀▄▄▄[0m   [38;5;208m█▄▄▄█▀[0m  [93m▀▄ ▄▀[0m  [92m█▄▄▄█▀[0m  [94m█▄▄▄[0m     [97;1m█  █ █  █  █▄▄▄  █▄▄▄   █▄▄▄█▀ █▄▄▄   █ █  █  █      █▄▄▄[0m
+         [91m█[0m  [38;5;208m█[0m        [93m▀█▀[0m   [92m█ ▀█▄[0m   [94m█[0m        [97;1m█  █  █ █  █     █      █ ▀█▄  █      █  █ █  █      █[0m
+    [91m▀▄▄▄█▀[0m  [38;5;208m█[0m         [93m█[0m    [92m█   ▀█[0m  [94m█▄▄▄▄[0m    [97;1m█  █   ▀█  █     █▄▄▄▄  █   ▀█ █▄▄▄▄  █   ▀█  ▀█▄▄█▀ █▄▄▄▄[0m
+
+    version [97;1m0.1.dev100[0m    model [97;1mQwen/Qwen3-0.6B[0m
+
+INFO 06-15 21:34:16 [platform.py:196] Loading worker from: spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker
+INFO 06-15 21:34:16 [platform.py:205] Loading scheduler from: vllm.v1.core.sched.scheduler.Scheduler
+INFO 06-15 21:34:16 [compilation.py:303] Enabled custom fusions: norm_quant, act_quant
+=========================== short test summary info ============================
+FAILED tests/v1/kv_offload/test_copier_round_trip.py::test_copier_round_trip_spyre
+====================== 1 failed, 359 deselected in 8.24s =======================
