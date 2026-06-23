@@ -1,0 +1,133 @@
+diff --git a/spyre_inference/custom_ops/rms_norm.py b/spyre_inference/custom_ops/rms_norm.py
+index a2d40b5..e1ef006 100644
+--- a/spyre_inference/custom_ops/rms_norm.py
++++ b/spyre_inference/custom_ops/rms_norm.py
+@@ -55,6 +55,15 @@ from .utils import convert, register_layer, get_layer, _fake_impl
+ 
+ logger = init_logger(__name__)
+ 
++# Token-dim alignment: forward_spyre's elementwise ops dispatch to torch-spyre
++# kernels compiled with dynamic=False (torch_spyre/ops/eager.py), so each distinct
++# num_tokens (row count of x) recompiles them. Across prompt lengths and decode steps
++# these recompiles accumulate against dynamo's accumulated_recompile_limit (256) and
++# trip a self-dispatch recursion -> RecursionError. Padding the row dimension up to a
++# fixed multiple buckets token counts so each bucket compiles once, then cache-hits.
++# Matches the query-axis alignment the attention backend uses (QUERY_CHUNK_SIZE).
++TOKEN_DIM_ALIGNMENT = 32
++
+ 
+ @RMSNorm.register_oot(name="RMSNorm")
+ class SpyreRMSNorm(RMSNorm):
+@@ -172,7 +181,9 @@ class SpyreRMSNorm(RMSNorm):
+         """Spyre device execution with padding, device transfer, and dtype conversion.
+ 
+         Handles Spyre-specific constraints:
+-            1. Minimum batch size: Pads to 64 if needed
++            1. Token-dim padding: rows padded up to a multiple of TOKEN_DIM_ALIGNMENT
++               so the compiled kernels reuse one shape per bucket instead of
++               recompiling per distinct num_tokens (see TOKEN_DIM_ALIGNMENT).
+             2. Device transfer: CPU -> Spyre convert to float16
+             3. Kernel execution: Calls compiled maybe_compiled_forward_spyre
+             4. Result transfer: Spyre -> CPU, trim padding, convert to input dtype
+@@ -193,6 +204,18 @@ class SpyreRMSNorm(RMSNorm):
+         if self.variance_size_override is not None:
+             raise NotImplementedError("TODO: variance_size_override not yet implemented")
+ 
++        # Pad the token (row) dimension up to a fixed bucket so the compiled
++        # kernels reuse one shape per bucket instead of recompiling per num_tokens.
++        # Must happen here, outside the compiled kernel, so the kernel never sees
++        # a varying row count. RMSNorm normalizes each row independently, so the
++        # appended zero-rows do not affect the real rows and are trimmed off below.
++        num_tokens = x.shape[0]
++        pad_rows = (-num_tokens) % TOKEN_DIM_ALIGNMENT
++        if pad_rows:
++            x = torch.nn.functional.pad(x, (0, 0, 0, pad_rows))
++            if residual is not None:
++                residual = torch.nn.functional.pad(residual, (0, 0, 0, pad_rows))
++
+         # Execute compiled kernel on Spyre device
+         outs = self.maybe_compiled_forward_spyre(
+             convert(x, self._target_device, self._target_dtype),
+@@ -206,9 +229,9 @@ class SpyreRMSNorm(RMSNorm):
+             else None,
+         )
+ 
+-        # Transfer back to original device/dtype
++        # Trim the padding rows, then transfer back to original device/dtype.
+         return pytree.tree_map(
+-            lambda el: convert(el, dtype=x_dtype, device=x_device),
++            lambda el: convert(el[:num_tokens], dtype=x_dtype, device=x_device),
+             outs,
+         )
+ 
+diff --git a/tests/test_rms_norm.py b/tests/test_rms_norm.py
+index 6b6a85d..34a27b7 100644
+--- a/tests/test_rms_norm.py
++++ b/tests/test_rms_norm.py
+@@ -78,6 +78,66 @@ def test_spyre_rmsnorm_matches_reference(batch_size, hidden_size, use_residual):
+         torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+ 
+ 
++@pytest.mark.rmsnorm
++@pytest.mark.parametrize("num_tokens", [1, 31, 33, 45, 64, 65])
++@pytest.mark.parametrize("use_residual", [False, True])
++def test_spyre_rmsnorm_pads_token_dim_to_alignment(num_tokens, use_residual):
++    """_forward_spyre_impl pads the token dim to a multiple of TOKEN_DIM_ALIGNMENT
++    before calling the compiled kernel, then trims back to the original row count.
++
++    Padding the row dimension to a fixed bucket means each bucket compiles the
++    torch-spyre kernels once instead of recompiling per distinct num_tokens
++    (which otherwise accumulates against dynamo's recompile limit -> RecursionError).
++    The dummy rows must not change the real rows' output and must be trimmed off.
++    """
++    from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm, TOKEN_DIM_ALIGNMENT
++
++    eps = 1e-6
++    hidden_size = 128
++    torch.manual_seed(42)
++
++    x = torch.randn(num_tokens, hidden_size, dtype=torch.float16)
++    layer = SpyreRMSNorm(hidden_size, eps=eps)
++    residual = (
++        torch.randn(num_tokens, hidden_size, dtype=torch.float32) if use_residual else None
++    )
++
++    expected = reference_rms_norm(x, layer.weight.data, eps, residual)
++
++    # Spy on the compiled kernel to capture the row count it actually receives.
++    seen_rows = []
++    original_kernel = layer.maybe_compiled_forward_spyre
++
++    def spy_kernel(x_arg, *args, **kwargs):
++        seen_rows.append(x_arg.shape[0])
++        return original_kernel(x_arg, *args, **kwargs)
++
++    layer.maybe_compiled_forward_spyre = spy_kernel
++
++    actual = layer.forward_oot(x, residual)
++
++    # Kernel must see a row count aligned to the bucket.
++    aligned = ((num_tokens + TOKEN_DIM_ALIGNMENT - 1) // TOKEN_DIM_ALIGNMENT) * TOKEN_DIM_ALIGNMENT
++    assert seen_rows, "compiled kernel was never called"
++    assert seen_rows[0] == aligned, (
++        f"kernel saw {seen_rows[0]} rows, expected padded {aligned} for num_tokens={num_tokens}"
++    )
++
++    # Output must keep the original (unpadded) row count and match the reference.
++    if use_residual:
++        actual_norm, actual_resid = actual
++        assert actual_norm.shape[0] == num_tokens
++        assert actual_resid.shape[0] == num_tokens
++        expected_norm, expected_resid = expected
++        torch.testing.assert_close(actual_norm.float(), expected_norm.float(), atol=1e-2, rtol=1e-2)
++        torch.testing.assert_close(
++            actual_resid.float(), expected_resid.float(), atol=1e-2, rtol=1e-2
++        )
++    else:
++        assert actual.shape[0] == num_tokens
++        torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
++
++
+ @pytest.fixture
+ def dummy_tensor():
+     return torch.randn(4, 128, dtype=torch.float32)
