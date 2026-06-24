@@ -112,9 +112,13 @@ def build_layer_views(
     Args:
         kv_caches: the bound ``{layer_name: SpyrePagedKVCache}`` dict from the
             model runner. Entries that are not paged caches are skipped.
-        num_cpu_blocks: number of host blocks to stage per layer. Host pages are
-            allocated up to ``min(num_cpu_blocks, num_device_blocks)`` — the host
-            tier never needs more blocks than exist on device for a single layer.
+        num_cpu_blocks: size of the host offload pool, in blocks, derived from
+            ``cpu_bytes_to_use`` by ``SpyreOffloadingSpec``. This is the full pool
+            size and is independent of the device block count — it is expected to
+            exceed it, since the host tier exists to hold blocks evicted from
+            device. Exactly ``num_cpu_blocks`` host pages are allocated per layer
+            (eager, hard reservation), matching the ``block_id`` range the
+            ``CPUOffloadingManager`` allocates over.
 
     Returns:
         A list of views, one per unique physical cache, in first-seen order.
@@ -142,9 +146,17 @@ def build_layer_views(
             device_v_pages=v_pages,
         )
 
-        n_host = min(num_cpu_blocks, view.num_blocks)
-        view.host_k_pages = _alloc_host_pages(view, n_host)
-        view.host_v_pages = _alloc_host_pages(view, n_host)
+        # The host pool is sized purely by cpu_bytes_to_use (computed into
+        # num_cpu_blocks by SpyreOffloadingSpec) and is intentionally independent
+        # of — and expected to exceed — the device block count. That excess
+        # capacity is the whole point of an offload tier: it stages blocks
+        # evicted from device so they can be fetched back later. Allocate the full
+        # pool eagerly so every block_id the CPUOffloadingManager can emit
+        # (in [0, num_cpu_blocks)) has backing storage; sizing host pages to the
+        # device block count instead would IndexError as soon as the manager
+        # hands out a slot beyond device capacity.
+        view.host_k_pages = _alloc_host_pages(view, num_cpu_blocks)
+        view.host_v_pages = _alloc_host_pages(view, num_cpu_blocks)
 
         seen_ids[cache_id] = view
         views.append(view)
