@@ -66,6 +66,27 @@ class TorchSpyreWorker(CPUWorker):
 
         torch_spyre._autoload()
 
+        # Raise Dynamo limits so long eviction/decode runs don't exhaust the
+        # graph cache or the recompile budget. torch_spyre's __init__ sets
+        # cache_size_limit=1024; PyTorch's default accumulated_recompile_limit
+        # is 256. Override both here -- in the worker process that actually
+        # traces the model -- so the values take effect even when vLLM runs
+        # the worker in a separate process from the test/engine.
+        import torch._dynamo.config
+
+        _prev_cache = torch._dynamo.config.cache_size_limit
+        _prev_recompile = torch._dynamo.config.accumulated_recompile_limit
+        torch._dynamo.config.cache_size_limit = 4096
+        torch._dynamo.config.accumulated_recompile_limit = 4096
+        logger.info(
+            "Dynamo limits set in worker: cache_size_limit %s -> %s, "
+            "accumulated_recompile_limit %s -> %s",
+            _prev_cache,
+            torch._dynamo.config.cache_size_limit,
+            _prev_recompile,
+            torch._dynamo.config.accumulated_recompile_limit,
+        )
+
         # Pin this worker to its assigned card before the spyreccl
         # backend is constructed in `init_process_group`.
         torch.spyre.set_device(self.local_rank)
