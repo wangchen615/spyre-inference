@@ -15,6 +15,8 @@
 """Verify KV cache eviction happens under memory pressure with prefix caching."""
 
 import os
+import sys
+import time
 
 import pytest
 
@@ -24,13 +26,13 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 MODEL = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
 
-# Five distinct prompts, each ~150 tokens. Block size on Spyre is 128 tokens and
+# Six distinct prompts, each ~150 tokens. Block size on Spyre is 128 tokens and
 # the offloading scheduler only stores COMPLETE blocks (num_tokens // 128), so a
 # prompt MUST exceed 128 committed tokens to produce a single offloadable block.
 # Short (~40-token) prompts never fill a block and are never offloaded -- hence
-# the deliberately long text below. With prefix caching disabled, each distinct
-# prompt allocates fresh blocks, so the 4 GPU blocks (512 tokens) cannot hold all
-# five, forcing the scheduler to offload device->host (GPU->CPU).
+# the deliberately long text below. Each distinct prompt occupies a fresh block,
+# so the 4 GPU blocks (512 tokens) cannot hold all six, forcing the scheduler to
+# offload device->host (GPU->CPU) and evict earlier prompts from the device.
 PROMPTS = {
     "A": "Paris is the capital and most populous city of France, situated on the banks of "
          "the river Seine in the north of the country. For centuries it has been a global "
@@ -72,6 +74,14 @@ PROMPTS = {
          "fountains and piazzas that fill the historic center. Surrounding the independent "
          "enclave of Vatican City, Rome remains a profound center of religion, history, "
          "architecture, and Renaissance art.",
+    "F": "Madrid is the capital and most populous city of Spain, set on the elevated plains of "
+         "the Iberian peninsula near the geographic center of the country. It grew from a modest "
+         "Moorish fortress into the seat of the Spanish court and today serves as the political, "
+         "economic, and cultural hub of the nation. The city is celebrated for its grand "
+         "boulevards, its royal palace, and its world-class art museums such as the Prado and the "
+         "Reina Sofia. Lively plazas, late-night dining, and football passion give Madrid a "
+         "distinctive energy that draws travellers and residents alike throughout every season "
+         "of the year.",
 }
 
 
@@ -97,11 +107,17 @@ def test_kv_eviction_under_memory_pressure_with_prefix_caching(capfd):
 
     Setup: max_num_seqs=1 and num_gpu_blocks_override=4 (4 * 128 = 512 tokens).
     Block size is 128 tokens and the scheduler offloads only complete blocks, so
-    each prompt is ~150 tokens (>128) to produce one offloadable block. Prefix
-    caching is disabled so each distinct prompt allocates fresh blocks; the five
-    distinct sequences cannot all fit in 4 blocks, forcing GPU->CPU eviction.
-    Re-requesting Prompt A after the others have evicted it must trigger a
-    CPU->GPU reload from host.
+    each prompt is ~150 tokens (>128) to produce one offloadable block. Six
+    distinct sequences (A..F) cannot all fit in 4 blocks, forcing GPU->CPU
+    eviction. Prompt A is a warmup; the prompt under test is B. The sequence
+    A -> B -> C -> D -> E -> F -> B runs five distinct prompts after the first B,
+    which evicts B's block from the 4 GPU blocks, so re-requesting B must reload
+    from host (CPU->GPU) rather than recompute.
+
+    Prefix caching is ENABLED, but a GPU prefix-cache hit and a host reload are
+    mutually exclusive per block: the connector's get_num_new_matched_tokens only
+    looks up the host tier for tokens NOT already covered by the GPU cache, so the
+    reload fires precisely because B was evicted from the device first.
 
     The SpyreOffloadingHandler "GPU->CPU" / "CPU->GPU" transfer lines are emitted
     in the worker subprocess, so they are NOT visible to caplog (which only hooks
@@ -127,7 +143,7 @@ def test_kv_eviction_under_memory_pressure_with_prefix_caching(capfd):
         max_model_len=512,
         max_num_seqs=1,  # one seq at a time -> sequential, forces eviction
         num_gpu_blocks_override=4,  # minimum required; 4 * 128 = 512 tokens
-        enable_prefix_caching=False,  # each request allocates fresh blocks
+        enable_prefix_caching=True,  # reissued B may hit GPU cache or host tier
         attention_config=AttentionConfig(backend=AttentionBackendEnum["CUSTOM"]),
         kv_transfer_config=kv_config,
     )
@@ -138,25 +154,40 @@ def test_kv_eviction_under_memory_pressure_with_prefix_caching(capfd):
     # run_step only sees lines from its own generate() call.
     capfd.readouterr()
 
-    def run_step(prompt):
+    def run_step(label, prompt):
+        start = time.perf_counter()
         out = model.generate(prompts=prompt, sampling_params=sampling_params)
+        elapsed = time.perf_counter() - start
         # readouterr() returns everything written to fd 1/2 since the last call
         # and drains the buffer, so each step sees only its own transfer lines.
         captured = capfd.readouterr()
         text = captured.out + captured.err
+        # Echo captured output past pytest's capture so it's eyeball-able without -s.
+        with capfd.disabled():
+            sys.stderr.write(text)
+            sys.stderr.write(f"[timing] prompt {label}: {elapsed:.3f}s\n")
         evict = [ln for ln in text.splitlines() if "GPU->CPU" in ln]
         reload = [ln for ln in text.splitlines() if "CPU->GPU" in ln]
-        return out, evict, reload
+        return out, evict, reload, elapsed
 
-    # A -> B -> C -> D -> E overflows the 4 GPU blocks, then A again reloads.
-    steps = [PROMPTS[k] for k in ("A", "B", "C", "D", "E", "A")]
-    results = [run_step(p) for p in steps]
+    # A (warmup) -> B -> C -> D -> E -> F overflows the 4 GPU blocks and evicts B,
+    # then B is reissued and must reload from host.
+    step_labels = ("A", "B", "C", "D", "E", "F", "B")
+    results = [run_step(k, PROMPTS[k]) for k in step_labels]
 
-    total_evictions = sum(len(evict) for _, evict, _ in results)
-    total_reloads = sum(len(reload) for _, _, reload in results)
+    # Summary table of time spent per prompt.
+    with capfd.disabled():
+        sys.stderr.write("[timing] per-prompt summary:\n")
+        for label, (_, _, _, elapsed) in zip(step_labels, results):
+            sys.stderr.write(f"[timing]   prompt {label}: {elapsed:.3f}s\n")
+        total = sum(elapsed for _, _, _, elapsed in results)
+        sys.stderr.write(f"[timing]   total: {total:.3f}s\n")
+
+    total_evictions = sum(len(evict) for _, evict, _, _ in results)
+    total_reloads = sum(len(reload) for _, _, reload, _ in results)
 
     # Sanity: all requests produced output.
-    for i, (out, _, _) in enumerate(results, start=1):
+    for i, (out, _, _, _) in enumerate(results, start=1):
         assert out[0].outputs[0].text is not None, f"Request {i} failed"
 
     assert total_evictions > 0, (
@@ -168,13 +199,17 @@ def test_kv_eviction_under_memory_pressure_with_prefix_caching(capfd):
     )
 
     assert total_reloads > 0, (
-        "CPU->GPU reload NOT detected when reusing Prompt A after evictions. "
+        "CPU->GPU reload NOT detected when reissuing Prompt B after evictions. "
         "Possible causes:\n"
         "  1. Evicted cache was not saved to host\n"
         "  2. Reload handler not triggered or not logging\n"
-        "  3. Prompt A was recomputed instead of reloaded from host"
+        "  3. Prompt B was still GPU-resident (not evicted) -> GPU prefix-cache "
+        "hit instead of host reload\n"
+        "  4. Prompt B was recomputed instead of reloaded from host"
     )
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s", "-m", "not upstream"])
+    # No -s: capfd must stay active for the assertions; run_step echoes the
+    # transfer lines to the terminal anyway.
+    pytest.main([__file__, "-v", "-m", "not upstream"])

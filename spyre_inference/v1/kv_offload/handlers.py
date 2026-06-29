@@ -91,6 +91,8 @@ class _SingleDirectionSpyreHandler(OffloadingHandler):
         # in-process host-hit signal (e.g. host->device blocks_transferred > 0
         # means the host tier was read back) without depending on vLLM's
         # stat-logging, which LLM(...) disables by default. Used by the e2e test.
+        # blocks_transferred counts logical blocks (128-token slots), not the
+        # per-layer page copies -- see transfer_async for the distinction.
         self.transfer_count: int = 0
         self.blocks_transferred: int = 0
         self.bytes_transferred: int = 0
@@ -117,23 +119,30 @@ class _SingleDirectionSpyreHandler(OffloadingHandler):
 
         num_bytes = self._run_transfer(device_blocks, host_blocks)
 
-        # Each (device, host) pair moves one logical block (its K and V pages),
-        # counted once per layer view.
-        n_blocks = len(device_blocks) * len(self._views)
+        # A logical block is one 128-token KV slot. Offloading it physically
+        # copies that slot out of every layer (K and V pages), so the number of
+        # page copies is num_blocks * num_layers -- this is why a single >128
+        # token prompt logs num_blocks=1 but page_copies=num_layers.
+        num_blocks = len(device_blocks)
+        num_layers = len(self._views)
+        page_copies = num_blocks * num_layers
         self.transfer_count += 1
-        self.blocks_transferred += n_blocks
+        self.blocks_transferred += num_blocks
         self.bytes_transferred += num_bytes
 
         # One line per transfer so host hits are observable in the worker log
         # even when vLLM stat-logging is disabled (the default under LLM(...)).
-        # "CPU->GPU" lines with n_blocks > 0 are host-tier loads (host hits).
+        # "CPU->GPU" lines with num_blocks > 0 are host-tier loads (host hits).
         logger.info(
-            "SpyreOffloadingHandler %s->%s: job=%d blocks=%d bytes=%d "
+            "SpyreOffloadingHandler %s->%s: job=%d num_blocks=%d "
+            "page_copies=%d (=%d layers) bytes=%d "
             "(cumulative: transfers=%d blocks=%d bytes=%d)",
             self._transfer_type[0],
             self._transfer_type[1],
             job_id,
-            n_blocks,
+            num_blocks,
+            page_copies,
+            num_layers,
             num_bytes,
             self.transfer_count,
             self.blocks_transferred,
