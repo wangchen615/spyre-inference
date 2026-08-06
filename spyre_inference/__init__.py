@@ -40,6 +40,24 @@ def register_ops():
     register_all()
 
 
+def register_offloading_specs():
+    """Register Spyre KV-offloading specs with the vLLM factory.
+
+    The factory loads the module lazily (only when a deployment selects the spec via
+    `kv_connector_extra_config.spec_name`), so deployments that import
+    `spyre_inference` for unrelated reasons pay no cost here. The membership check
+    matters: `register_spec` raises on a duplicate name.
+    """
+    from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+
+    if "SpyreOffloadingSpec" not in OffloadingSpecFactory._registry:
+        OffloadingSpecFactory.register_spec(
+            "SpyreOffloadingSpec",
+            "spyre_inference.v1.kv_offload.spec",
+            "SpyreOffloadingSpec",
+        )
+
+
 def register_hf_adapters():
     # Override the Transformers backend model class so that
     # ``model_impl="transformers"`` uses hf-adapters'
