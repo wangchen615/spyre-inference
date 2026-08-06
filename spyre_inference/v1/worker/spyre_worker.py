@@ -15,6 +15,7 @@
 """A Torch Spyre worker class."""
 
 import os
+import sys
 from contextlib import AbstractContextManager, nullcontext
 
 import torch
@@ -58,6 +59,41 @@ class TorchSpyreWorker(Worker):
         return nullcontext()
 
     def init_device(self) -> None:
+        # torch_spyre's eager op-dispatch re-enters torch.compile per aten op
+        # (ops/eager.py: dispatch_to_torch_compile), so a large prefill recurses
+        # deeper than Python 3.12's default recursion limit (1000) AND the
+        # separate C-level Dynamo recursion limit. Raise both here -- this is the
+        # worker process where the RecursionError is actually thrown, out of reach
+        # of any setrecursionlimit in the driver.
+        #
+        # The required depth scales with prefill length: limit 4096 clears 8192
+        # tokens but 16384 still overflowed (~2k+ eager frames). We set the limit
+        # high enough for the full 131072 window; ttft_sweep.sh raises `ulimit -s`
+        # (the worker main-thread stack) to back it, since a large recursion limit
+        # without a matching stack segfaults instead of running (torch docs warn
+        # of exactly this).
+        _recursion_limit = int(os.environ.get("SPYRE_WORKER_RECURSION_LIMIT", "100000"))
+        sys.setrecursionlimit(_recursion_limit)
+        torch._dynamo.set_recursion_limit(_recursion_limit)
+
+        # The CUSTOM (list-based) attention backend passes page_indices as a
+        # Python list, and Dynamo recompiles the eager op wrapper on EACH unique
+        # block-index value (see tests/test_spyre_attn.py:68-70, which raises this
+        # same limit for exactly this reason). A prefill of L tokens touches
+        # ceil(L/block_size) blocks, so past ~1024 tokens the default
+        # accumulated_recompile_limit (256) is exhausted and Dynamo falls back
+        # into the deep-recursing dispatch -> RecursionError. This is the actual
+        # ceiling with prefix caching on (1024 passes, 2048 hit the 256 cap even
+        # at recursion limit 50000). Raise it high enough for the full 131072
+        # window (1024-block granularity -> a few thousand recompiles).
+        _recompile_limit = int(os.environ.get("SPYRE_WORKER_RECOMPILE_LIMIT", "100000"))
+        torch._dynamo.config.accumulated_recompile_limit = _recompile_limit
+        # Also lift the per-code-object cache_size_limit so a single frame with
+        # many block-index specializations isn't independently capped.
+        torch._dynamo.config.cache_size_limit = max(
+            torch._dynamo.config.cache_size_limit, _recompile_limit
+        )
+
         # Populate the env vars that `libspyre_comms.so` reads at dlopen
         # time. `setdefault` leaves torchrun-supplied values intact.
         # DP>1 is rejected in TorchSpyrePlatform.check_and_update_config,
