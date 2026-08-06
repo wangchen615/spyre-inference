@@ -530,6 +530,78 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     # --- KV cache allocation ---
 
+    def initialize_kv_cache(self, kv_cache_config, is_profiling: bool = False) -> None:
+        """Initialize the KV cache, with a Spyre-aware offloading-connector hook.
+
+        Upstream ``OffloadingConnectorWorker.register_kv_caches`` canonicalizes each
+        layer's KV cache into a flat ``(num_blocks, page_size_bytes)`` int8 view via
+        ``untyped_storage()`` + ``torch.as_strided``, and asserts the layer cache is a
+        single ``torch.Tensor``. Neither holds on Spyre: a layer is a
+        ``SpyrePagedKVCache`` (two lists of per-block tensors), and storage
+        reinterpretation is not viable on Spyre device memory.
+
+        There is no hook inside that method, so when the active connector is backed by
+        a ``SpyreOffloadingSpec`` we temporarily swap ``register_kv_caches`` for a path
+        that builds the worker from the raw paged dict (primed in
+        ``initialize_kv_cache_tensors``). Any other connector is left untouched.
+
+        Verified against vLLM v0.26.0. This patches upstream internals and should be
+        re-checked on every vLLM bump -- the asserts below are deliberately loud so a
+        changed upstream shape fails here at startup rather than silently misbehaving.
+        """
+        from vllm.distributed.kv_transfer.kv_transfer_state import get_kv_transfer_group
+
+        spec = self._spyre_offloading_spec_if_active()
+        if spec is None or is_profiling:
+            super().initialize_kv_cache(kv_cache_config, is_profiling=is_profiling)
+            return
+
+        connector = get_kv_transfer_group()
+        connector_worker = connector.connector_worker
+        assert connector_worker is not None
+        assert spec is connector_worker.spec, (
+            "the primed SpyreOffloadingSpec is not the connector worker's spec; "
+            "upstream OffloadingConnectorWorker construction has changed"
+        )
+        assert hasattr(connector_worker, "_init_worker"), (
+            "OffloadingConnectorWorker._init_worker is missing; the upstream "
+            "offloading worker API has changed and this hook needs updating"
+        )
+
+        original_register = connector.register_kv_caches
+
+        def _spyre_register_kv_caches(kv_caches: dict) -> None:
+            # The spec was primed with the raw paged dict by
+            # initialize_kv_cache_tensors, and its get_worker ignores the
+            # CanonicalKVCaches argument, so skip canonicalization entirely.
+            connector_worker._init_worker(None)
+
+        connector.register_kv_caches = _spyre_register_kv_caches  # ty: ignore[invalid-assignment]
+        try:
+            super().initialize_kv_cache(kv_cache_config, is_profiling=is_profiling)
+        finally:
+            connector.register_kv_caches = original_register  # ty: ignore[invalid-assignment]
+
+    def _spyre_offloading_spec_if_active(self):
+        """Return the active SpyreOffloadingSpec, or None if not in use.
+
+        None covers every non-Spyre-offload case: no connector group at all, a
+        scheduler-side-only connector, or some other connector implementation.
+        """
+        from vllm.distributed.kv_transfer.kv_transfer_state import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+        from spyre_inference.v1.kv_offload.spec import SpyreOffloadingSpec
+
+        if not has_kv_transfer_group():
+            return None
+        connector_worker = getattr(get_kv_transfer_group(), "connector_worker", None)
+        if connector_worker is None:
+            return None
+        spec = getattr(connector_worker, "spec", None)
+        return spec if isinstance(spec, SpyreOffloadingSpec) else None
+
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
         """Allocate KV cache as lists of individual page tensors on Spyre.
 
@@ -593,6 +665,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.compilation_config.static_forward_context,
             self.kv_caches,
         )
+
+        # Hand the raw paged caches to the offloading spec, which cannot get them
+        # through upstream canonicalization (see initialize_kv_cache).
+        spec = self._spyre_offloading_spec_if_active()
+        if spec is not None:
+            spec.prime_kv_caches(kv_caches)
+
         return kv_caches
 
     # --- Stubs copied from CPUModelRunner ---
