@@ -58,6 +58,17 @@ class TorchSpyreWorker(Worker):
         return nullcontext()
 
     def init_device(self) -> None:
+        # EXPERIMENT (revert if it does not help): the Spyre attention kernel can
+        # re-enter torch-spyre's compiled-op dispatch, which unwinds only at the
+        # recursion limit. The Python and C limits are independent -- Dynamo
+        # consumes the C eval-frame depth, which sys.setrecursionlimit cannot
+        # reach -- so both are raised. Needs `ulimit -s` headroom or a limit this
+        # high segfaults instead of raising.
+        import sys
+
+        sys.setrecursionlimit(4096)
+        torch._dynamo.set_recursion_limit(4096)
+
         # Populate the env vars that `libspyre_comms.so` reads at dlopen
         # time. `setdefault` leaves torchrun-supplied values intact.
         # DP>1 is rejected in TorchSpyrePlatform.check_and_update_config,
