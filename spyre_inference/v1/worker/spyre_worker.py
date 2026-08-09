@@ -155,6 +155,19 @@ class TorchSpyreWorker(Worker):
             encoder=self.compilation_config.encoder_compilation_time,
         )
 
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        # Worker.profile hardcodes activities=["CPU", "CUDA"] and looks them up in
+        # TorchProfilerActivityMap, which has no Spyre entry. Registering "CUDA" ->
+        # the Spyre activity redirects that hardcoded request onto the device we
+        # actually have; capturing device events needs the kineto-spyre torch wheel
+        # (build-torch-spyre.sh --spyre-profiler), otherwise only CPU spans appear.
+        from vllm.profiler import wrapper as _profiler_wrapper
+
+        _profiler_wrapper.TorchProfilerActivityMap["CUDA"] = (
+            torch.profiler.ProfilerActivity.PrivateUse1
+        )
+        return super().profile(is_start=is_start, profile_prefix=profile_prefix)
+
     def sleep(self, level: int = 1) -> None:
         pass
 

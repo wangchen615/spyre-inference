@@ -151,6 +151,17 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--block-size",
+        type=int,
+        default=BLOCK_SIZE,
+        help=(
+            f"KV block size in tokens (default: {BLOCK_SIZE}). Spyre requires a multiple "
+            "of 64. Controls the warm-run query length: the local prefix cache caps its "
+            "hit at num_tokens-1 and must return whole blocks, so the warm run "
+            "re-prefills num_tokens - ((num_tokens-1)//block_size)*block_size tokens."
+        ),
+    )
+    parser.add_argument(
         "--gpu-blocks",
         type=int,
         default=None,
@@ -188,13 +199,14 @@ def main() -> int:
     if "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS" not in os.environ:
         os.environ["VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"] = str(args.exec_timeout)
 
-    blocks_per_prompt = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
+    block_size = args.block_size
+    blocks_per_prompt = (n + block_size - 1) // block_size
     num_gpu_blocks = (
         args.gpu_blocks if args.gpu_blocks is not None else blocks_per_prompt + SLACK_BLOCKS
     )
 
     if blocks_per_prompt < 1:
-        log(f"[fatal] length {n} is shorter than one block ({BLOCK_SIZE} tokens)")
+        log(f"[fatal] length {n} is shorter than one block ({block_size} tokens)")
         return 2
     if num_gpu_blocks < blocks_per_prompt:
         log(
@@ -204,10 +216,10 @@ def main() -> int:
         return 2
 
     # max_model_len must cover the prompt plus the generated token.
-    max_model_len = ((n + gen_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    max_model_len = ((n + gen_tokens + block_size - 1) // block_size) * block_size
 
     log(
-        f"[config] length={n} block_size={BLOCK_SIZE} "
+        f"[config] length={n} block_size={block_size} "
         f"blocks_per_prompt={blocks_per_prompt} "
         f"num_gpu_blocks_override={num_gpu_blocks} "
         f"(= 1 prompt + {num_gpu_blocks - blocks_per_prompt} slack) "
@@ -249,6 +261,7 @@ def main() -> int:
         MODEL,
         max_model_len=max_model_len,
         max_num_seqs=1,  # sequential: each run competes for the same blocks
+        block_size=block_size,
         num_gpu_blocks_override=num_gpu_blocks,
         enable_prefix_caching=args.prefix_caching,
         attention_config=AttentionConfig(backend=AttentionBackendEnum["CUSTOM"]),

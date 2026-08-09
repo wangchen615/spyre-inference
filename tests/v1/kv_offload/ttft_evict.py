@@ -288,6 +288,40 @@ def main() -> int:
             "~233s). Default 7200 (2h)."
         ),
     )
+    parser.add_argument(
+        "--profile",
+        metavar="DIR",
+        default=None,
+        help=(
+            "Capture a torch profiler trace of the steady-state runs into DIR. Requires "
+            "the kineto-spyre torch wheel (build-torch-spyre.sh --spyre-profiler) for "
+            "device events; without it only CPU spans are captured. Profiling is started "
+            "after the plateau is reached (see --profile-after) so compile and cold-miss "
+            "runs stay out of the trace."
+        ),
+    )
+    parser.add_argument(
+        "--profile-after",
+        type=int,
+        default=4,
+        help=(
+            "Number of runs to complete before starting the profiler (default: 4). run1 "
+            "is the cold miss and run2 pays a one-time compile, so the default puts only "
+            "steady-state runs in the trace."
+        ),
+    )
+    parser.add_argument(
+        "--profile-iters",
+        type=int,
+        default=1,
+        help=(
+            "Engine iterations to profile before the profiler auto-stops (default: 1). "
+            "Recording costs real time on paths with many ops, so keeping this at 1 "
+            "leaves every later run in the same process unprofiled -- comparing the "
+            "profiled run against those is what measures the profiler's own overhead "
+            "instead of assuming it. 0 means no limit."
+        ),
+    )
     args = parser.parse_args()
 
     n = args.length
@@ -297,6 +331,15 @@ def main() -> int:
     # vllm.envs snapshots it at import time.
     if "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS" not in os.environ:
         os.environ["VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"] = str(args.exec_timeout)
+
+    # gpu_model_runner wraps preprocess/forward/postprocess/sample/bookkeep in
+    # record_function spans gated on this env var. Without it a trace shows attention
+    # ops but no phase breakdown, so time spent outside the model forward is invisible.
+    # Must be set before vllm is imported: record_function_or_nullcontext caches the
+    # resolved function in a module global on first call (vllm/v1/utils.py:747), and the
+    # value has to be in os.environ to be inherited by the worker subprocess.
+    if args.profile:
+        os.environ["VLLM_CUSTOM_SCOPES_FOR_PROFILING"] = "1"
 
     blocks_per_prompt = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
     num_gpu_blocks = (
@@ -346,6 +389,27 @@ def main() -> int:
     from vllm import LLM, SamplingParams
     from vllm.config import AttentionConfig
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    profiler_config = None
+    if args.profile:
+        from vllm.config import ProfilerConfig
+
+        # torch_profiler_dir must be absolute (ProfilerConfig validates this).
+        profile_dir = os.path.abspath(os.path.expanduser(args.profile))
+        os.makedirs(profile_dir, exist_ok=True)
+        profiler_config = ProfilerConfig(
+            profiler="torch",
+            torch_profiler_dir=profile_dir,
+            torch_profiler_record_shapes=True,
+            # with_stack inflates the trace enough to slow the run it is measuring.
+            torch_profiler_with_stack=False,
+            max_iterations=args.profile_iters,
+            ignore_frontend=True,
+        )
+        log(
+            f"[profile] torch profiler -> {profile_dir} "
+            f"(start after run{args.profile_after}, {args.profile_iters} iter(s), phase scopes on)"
+        )
 
     kv_transfer_config = None
     if args.kv_offload:
@@ -400,6 +464,7 @@ def main() -> int:
         enable_prefix_caching=args.prefix_caching,
         attention_config=AttentionConfig(backend=AttentionBackendEnum["CUSTOM"]),
         kv_transfer_config=kv_transfer_config,
+        **({"profiler_config": profiler_config} if profiler_config is not None else {}),
     )
     log(f"[engine] LLM ready in {time.perf_counter() - t_engine:.1f}s")
 
@@ -448,6 +513,10 @@ def main() -> int:
         prompt = prompt_b if label == "B" else prompt_a
         tag = f"run{i + 1}-{label}"
 
+        if args.profile and i == args.profile_after:
+            log(f"[profile] starting profiler at {tag} (plateau reached)")
+            model.start_profile()
+
         log(f"[run] {tag}: sending prompt {label}...")
         start = time.perf_counter()
         try:
@@ -483,6 +552,12 @@ def main() -> int:
                 f"(jobs: {d_sj} store, {d_lj} load; cumulative blocks "
                 f"stored={counter.total_stored} loaded={counter.total_loaded})"
             )
+
+    # Stop before the fd capture is torn down: stop() is what writes the trace, and
+    # its "Saving trace..." lines belong in the captured log with everything else.
+    if args.profile and len(rows) > args.profile_after:
+        log("[profile] stopping profiler (writes trace)")
+        model.stop_profile()
 
     # Restore the real stdout/stderr BEFORE printing the summary: while capture is
     # active every log() lands in the temp file, so a summary written here would be
