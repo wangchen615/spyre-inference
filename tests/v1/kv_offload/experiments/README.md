@@ -58,19 +58,34 @@ assumptions and can be run directly with `uv run --no-sync python <script>`.
 
 ## Build note (not committed here)
 
-Yue's `pyproject.toml` pins torch-spyre to `88964c010ac8eb9586ba5deac938ae4624c2f5a1`,
-which is correct — it carries the DeepTools header-relocation fix needed against
-`ibm-deeptools 2.0.0-0.main.1+1861.3bb8422` in the pod base image. However
-`uv.lock` resolves to an **older** revision predating that fix, so a plain `uv sync`
-builds a torch-spyre that will not compile.
-
-Workaround used (intentionally **not** committed, as it is environment-specific):
-point the dependency at a local checkout already at the right commit.
+**No code change was needed to run these experiments.** The offload implementation
+is exactly as Yue wrote it. The only local deviation is build metadata, and it is
+environment-specific rather than a fix:
 
 ```toml
-torch-spyre = { path = "../torch-spyre", editable = true }
+# pyproject.toml
+-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "88964c0..." }
++torch-spyre = { path = "../torch-spyre", editable = true }
 ```
 
+Both `pyproject.toml` and `uv.lock` pin torch-spyre to
+`88964c010ac8eb9586ba5deac938ae4624c2f5a1`, which is correct — it carries the
+DeepTools header-relocation fix needed against the `ibm-deeptools
+2.0.0-0.main.1+1861.3bb8422` in the pod base image. The repoint exists only so
+`uv` reuses the torch-spyre already built at that commit in
+`/tmp/work-kvoffload/torch-spyre` instead of re-cloning and recompiling it
+(~25 min on this pod). It is deliberately **not** committed.
+
 Consequences: `--frozen` is no longer possible and numpy resolves to 2.3.5, outside
-the declared `<2.3` bound (no failures observed). The proper fix is to regenerate
-`uv.lock` against the pinned revision.
+the declared `<2.3` bound (no failures observed).
+
+## Relationship to `dev/kv-offload-m1-yzhu`
+
+These scripts target **`dev/0807-kv-offload-yzhu`** (`75fb119`) and do **not** work
+against `dev/kv-offload-m1-yzhu`, which is a separate later rewrite rather than a
+descendant (`75fb119` is not an ancestor of it; the diff is 142 files,
++21121/−16730). In particular `m1-yzhu` deletes `kv_offload/worker.py` in favour of
+`kv_offload/handlers.py`, so the `SpyreOffloadingWorker device->host/host->device`
+log lines that the block accounting scrapes do not exist there — every step would
+silently report `loaded=0`. Porting requires finding the equivalent counters in
+`handlers.py` and updating the regex in `traffic_three_way.py`.
