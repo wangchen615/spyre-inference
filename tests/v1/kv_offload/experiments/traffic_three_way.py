@@ -39,9 +39,15 @@ PARTIAL reload. Measured with junk == prompt and pool = 1.5*blk+1:
 i.e. unloaded == slack == pool - blk, exactly. The fix is NOT a different block
 size or a tighter pool -- it is a BIGGER JUNK:
 
-    junk_blocks = pool     ->  the junk alone fills the whole pool
-                          ->  every one of P1's blk blocks must go to host
-                          ->  step 3 reloads ~blk blocks: a FULL reload
+    junk_blocks = pool - 1 ->  the junk alone sweeps all but one pool slot
+                           ->  every one of P1's blk blocks must go to host
+                           ->  step 3 reloads ~blk blocks: a FULL reload
+
+Why pool-1 and not pool: the engine reserves room for generated tokens, so booting
+requires ceil((max(n, jn) + max_tokens) / BLOCK_SIZE) <= pool. At junk == pool blocks
+that rounds to pool+1 and the engine refuses to start. pool-1 makes the requirement
+exactly pool -- the largest junk that still boots. It costs nothing: pool-1 > blk for
+any pool_mult >= 1.5, so eviction is still total.
 
 Pool stays at 1.5*blk+1 so step 4 remains a genuine device-resident hit. Making the
 pool tighter instead (blk+1, the minimum that boots) would risk degrading step 4 too.

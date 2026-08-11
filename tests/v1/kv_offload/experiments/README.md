@@ -19,9 +19,110 @@ Full write-up, results, and build instructions:
 | `run_length_sweep.sh` | offload on vs off across lengths (the headline speedup curve) |
 | `traffic_three_way.py` | recompute / host-reload / HBM-reuse in **one** engine, paths selected by request order |
 | `run_traffic_sweep.sh` | driver: fresh engine per length, N cycles each |
+| `run_full_sweep_detached.sh` | all six long lengths in one go, `setsid nohup`-safe so it survives SSH disconnection (~5 h) |
+| `plot_three_way.py` | renders the two figures below; **needs only matplotlib** — no Spyre, no venv, no pod |
 | `three_way.py` | earlier 3-engine variant; superseded (it had to vary the pool between cases) |
 | `run_tight_hbm.sh` | tightest-legal device pool, roomy host pool |
 | `run_matrix.sh` | prefix-caching × offload matrix |
+
+## Results
+
+Measured on the `torch-aiu-runtime-dev` dev pod against this branch's PoC code:
+`micro-g3.3-8b-instruct-1b`, one AIU, `block_size=128`, `pool_mult=1.5`,
+`host_gb=64`, `OMP_NUM_THREADS=8`. Medians over 6–10 cycles.
+
+The three paths come from **request order inside a single engine** — one pool, one
+config, one process — so nothing differs between the cases except what the engine had
+cached. That is the point of `traffic_three_way.py`; an earlier 3-engine variant had to
+vary the pool between cases and produced an artifact (see below).
+
+| length | recompute | host reload | HBM reuse | rec/reload | reload/reuse | blocks loaded (want `L/128`) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 5.846 s | 0.432 s | 0.352 s | **13.5×** | 1.23× | 8 / 8 ✓ |
+| 2048 ¹ | 12.147 s | 0.743 s | 0.589 s | **16.3×** | 1.26× | 16 / 16 ✓ |
+| 4096 | 24.995 s | 1.358 s | 1.045 s | **18.4×** | 1.30× | 32 / 32 ✓ |
+| 8192 | 55.169 s | 2.361 s | 1.991 s | **23.4×** | 1.19× | 64 / 64 ✓ |
+| 16384 | 119.755 s | 4.657 s | 3.912 s | **25.7×** | 1.19× | 128 / 128 ✓ |
+| 32768 | 274.012 s | 9.496 s | 8.150 s | **28.9×** | 1.17× | 256 / 256 ✓ |
+| 65536 | 714.463 s | 19.435 s | 17.201 s | **36.8×** | 1.13× | 512 / 512 ✓ |
+
+¹ Measured later in a **separate process**, same host and configuration, to even out the
+x-axis (1024→4096 is a 4× gap where every other step is 2×). Its own three ratios are
+single-process like every other row, but 2048-vs-neighbours is a cross-process
+comparison. It interpolates cleanly on all three paths, which is the check that it
+belongs on the curve.
+
+![latency vs context length](figures/latency_vs_length.png)
+
+![speedup and blocks reloaded](figures/speedup_and_blocks.png)
+
+Two trends, opposite directions:
+
+- **`rec/reload` climbs 13.5 → 36.8×** over a 64× range. Fitting the measured curves
+  gives recompute ∝ `L^1.14` against transfer ∝ `L^0.91` — superlinear computation
+  against near-linear data movement, so the gap must widen. Offload's advantage is
+  structural rather than a constant factor.
+- **`reload/reuse` peaks at 4096 and then decays, 1.30 → 1.13×.** The DRAM round-trip
+  becomes a *smaller* relative penalty as prompts grow. If transfer were the
+  bottleneck, moving 64× more bytes would make the penalty grow. At 65536, 512 blocks
+  is 1.08 GB in 19.4 s — under 0.06 GB/s, orders of magnitude below the PCIe 32 GT/s ×16
+  link.
+
+The `reload/reuse` series is **not monotonic**: it rises 1.23 → 1.26 → 1.30 before
+falling. The decay from the peak is the load-bearing claim and holds across the four
+longest lengths. The run-up sits where this measurement's known bias is worst — `reuse`
+carries one spurious decode-block load, which is 12.5% of reuse traffic at 1024, 6.3% at
+2048, 3.1% at 4096 and 0.2% at 65536 — so `reload/reuse` is a **lower bound**, and
+unevenly so. Read its direction, not its slope.
+
+Both exponents are averages over 1024–65536, **not asymptotic**: recompute's local slope
+rises ~1.06 → 1.38 across the sweep while the copy's converges to ~1.03. `L^1.14`
+therefore understates recompute past 65536 and should not be extrapolated. The mechanism
+claim is stronger locally (1.38 vs 1.03) than in the global fit.
+
+**Two things the block accounting caught, which timing alone could not:**
+
+- `loaded == L/128` on every row above is the check that each "reload" moved the prompt's
+  **entire** prefix from host DRAM. A first pass sized the junk equal to the prompt, which
+  displaces only `pool − blk` blocks, so half of each "reload" was silently a device hit —
+  and that flattered `reload/reuse` by ~5× in penalty terms (4–6% instead of 23–30%).
+  A mislabelled fast path is indistinguishable from a genuine win on a latency plot.
+- Ordering is **reuse ≤ reload ≤ recompute at all seven lengths**. An earlier
+  cross-configuration comparison had suggested a DRAM reload beating an HBM hit, which is
+  physically impossible; it was an artifact of varying `block_size`, pool, `max_model_len`
+  and code base at once, and does not reproduce here.
+
+Correctness is checked before any timing claim: all P1 responses are token-identical
+across recompute, reload and reuse at every length.
+
+**Scope caveat:** the pool is derived from the prompt (`pool = 1.5 × blk + 1`) so that one
+prompt roughly fills the device and eviction is guaranteed. That is what makes the three
+paths separable, and it is *not* a realistic deployment — the pool is a different absolute
+size at every point, there is no batching or concurrency, and `max_model_len` follows the
+junk rather than the prompt. Read these as **the cost of each path in isolation**, not as
+an expected end-to-end serving speedup. Full limitations in
+`hillock-vmem@experiments/kvc-offload-evict/docs/LIMITATIONS.md`.
+
+### Regenerating the figures
+
+`plot_three_way.py` carries the measured sweep inline, so the figures rebuild anywhere
+matplotlib is installed:
+
+```bash
+python3 plot_three_way.py                       # -> figures/
+python3 plot_three_way.py --from-progress PROGRESS   # or re-parse a driver's own output
+```
+
+Note `run_full_sweep_detached.sh`'s `PLAN` still lists the original six lengths, so
+reproducing the 2048 point is a separate one-length invocation:
+
+```bash
+LENGTHS="2048" CYCLES=10 HOST_GB=64 ./run_traffic_sweep.sh
+```
+
+`HOST_GB=64` matters — the driver's own default is smaller, and an undersized host tier
+silently produces pessimistic numbers rather than an error (see the `--cpu-bytes` finding
+below).
 
 ## Portability
 
