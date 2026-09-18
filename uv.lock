@@ -4812,7 +4812,7 @@ dev = [
 requires-dist = [
     { name = "torch", marker = "platform_machine != 'ppc64le'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "platform_machine == 'ppc64le'", git = "https://github.com/pytorch/pytorch?tag=v2.13.0" },
-    { name = "torch-spyre", extras = ["cpsat"], editable = "/home/yzhu/dt-inductor/torch-spyre" },
+    { name = "torch-spyre", extras = ["cpsat"], editable = "../dt-inductor/torch-spyre" },
     { name = "torchvision", marker = "platform_machine not in 's390x, ppc64le'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "transformers", specifier = "<5.17" },
     { name = "vllm", git = "https://github.com/vllm-project/vllm?rev=v0.28.0" },
@@ -5195,7 +5195,7 @@ wheels = [
 
 [[package]]
 name = "torch-spyre"
-source = { editable = "/home/yzhu/dt-inductor/torch-spyre" }
+source = { editable = "../dt-inductor/torch-spyre" }
 dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
