@@ -1,0 +1,365 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>debug: compiled-decode-empty-output</title>
+<style>
+  body { font: 14px/1.55 -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0 auto; max-width: 1100px; padding: 24px 20px 64px; color: #1a1a1a; background: #fafaf8; }
+  h1 { font-size: 21px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 30px 0 10px; padding-bottom: 5px; border-bottom: 1px solid #ddd; }
+  .sub { color: #666; font-size: 13px; margin-bottom: 18px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; margin: 8px 0; }
+  th, td { border: 1px solid #ddd; padding: 6px 9px; text-align: left; vertical-align: top; }
+  th { background: #f0f0ec; font-weight: 600; }
+  pre { background: #f5f5f1; border: 1px solid #e2e2dc; border-radius: 4px; padding: 9px 11px; overflow-x: auto; font-size: 12px; line-height: 1.45; }
+  code { background: #f0f0ec; padding: 1px 4px; border-radius: 3px; font-size: 12.5px; }
+  .s { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+  .confirmed, .resolved { background: #d7efd9; color: #17501f; }
+  .ruled-out { background: #fadcda; color: #6d1a14; }
+  .in-progress, .investigating { background: #fdecc8; color: #6b4a06; }
+  .queued { background: #e6e6e2; color: #4a4a46; }
+  .inconclusive { background: #e2e6f0; color: #2b3a5c; }
+  .blocked { background: #f3dcf5; color: #5c1a63; }
+  .exp { border-left: 3px solid #ccc; padding: 2px 0 2px 13px; margin: 18px 0; }
+  .exp h3 { font-size: 13.5px; margin: 0 0 5px; }
+  .ts { color: #888; font-size: 11.5px; font-weight: 400; }
+  .key { background: #fffce8; border: 1px solid #e8e0a8; border-radius: 4px; padding: 10px 13px; margin: 12px 0; }
+</style>
+
+<h1>compiled-decode-empty-output</h1>
+<div class="sub">
+  Session started 2026-09-22 05:37:26 &middot; status
+  <span class="s blocked">blocked</span> &mdash; escalate to torch-spyre<br>
+  Compiled path generates zero tokens; eager path on the same stack is exact.
+</div>
+
+<h2>Cluster</h2>
+<table>
+  <tr><th>Test / repro</th><th>Role</th><th>Symptom</th></tr>
+  <tr>
+    <td><code>tests/e2e/test_compile.py::test_basic_llm_inference[model_ref_output0]</code><br>
+        (on <code>origin/main</code>: <code>[micro-g3.3]</code>)</td>
+    <td>cluster member</td>
+    <td>Worker dies on first request; <code>output[0].outputs[0].text == ''</code> &rarr; AssertionError</td>
+  </tr>
+  <tr>
+    <td><code>EAGER=0 python scripts/probes/basic_llm_inference.py</code></td>
+    <td><strong>baseline probe</strong></td>
+    <td>Same empty output, but exits cleanly (no worker SIGKILL) &mdash; cheapest oracle</td>
+  </tr>
+  <tr>
+    <td><code>EAGER=1 python scripts/probes/basic_llm_inference.py</code></td>
+    <td>negative control</td>
+    <td>PASSES &mdash; exact reference match, 0 RAS errors</td>
+  </tr>
+</table>
+
+<h2>Session summary</h2>
+<p>
+  The compiled (<code>STOCK_TORCH_COMPILE</code>) path completes model load, warmup
+  (~48&nbsp;s) and records all 8 attention graphs, then produces <strong>zero tokens</strong>
+  as soon as the first real request arrives. The eager path, same model/prompt/params on the
+  same stack, returns the exact reference string. So the fault is specific to the compiled
+  submission path, not the model, device, or numerics.
+</p>
+<p>
+  On <code>origin/main</code> the worker survives long enough to log the cause:
+</p>
+<pre>RAS::RUNTIMESCHEDULER::ComputeHardwareError  code 0x7b1b  severity ERROR
+"A hardware error was detected in the compute control block response."
+&rarr; RuntimeError: StreamInErrorState: cannot launch HostCallback</pre>
+<p>
+  On this branch the worker is SIGKILLed before it can flush that log, so only a bare
+  <code>Executor failed.</code> appears &mdash; same event, less evidence. Observed 4/4 runs
+  on main.
+</p>
+<div class="key">
+  <strong>Prior sessions already eliminated:</strong> senlib version skew (now matches
+  <code>spyre-rpms.lock</code> at <code>280.3869e2e</code>), stale torch-spyre build, stale
+  flex build, stale libaiupti build (bumped to <code>ef4e622</code>), and torch-spyre
+  build-isolation differences (83&nbsp;MB vs 77&nbsp;MB <code>_C.so</code> &mdash; fails
+  identically both ways). Device numerics verified healthy throughout
+  (fp32 add 2.4e-07, fp16 matmul 0.055).
+</div>
+<div class="key">
+  <strong>ROOT CAUSE FOUND (05:49):</strong> the compiled path's logits are <strong>all
+  <code>NaN</code></strong>. The sampler therefore argmaxes to the lowest-index token
+  (id&nbsp;6 = <code>&lt;gh_stars&gt;</code>), 16&times;, which decodes to the empty string.
+  <code>finish_reason: length</code>. Eager logits on the same stack are healthy
+  (top logprob &minus;0.104). So this is <em>numerical corruption in the compiled forward
+  pass</em> &mdash; not a hardware fault, not a scheduling failure, and not a silent CPU
+  fallback (0 FallbackWarnings).
+</div>
+<p><strong>The 0x7b1b RAS error is a red herring / downstream artifact.</strong> The probe
+  reproduces the empty output with <em>no</em> RAS error and a clean exit; the RAS line only
+  appears in the pytest/multiproc path where the worker is torn down mid-flight. Chasing the
+  "compute control block hardware error" through four RPM/library rebuilds was wasted effort
+  &mdash; the real signal was the token ids all being identical.</p>
+
+<h2>Hypothesis / fix queue</h2>
+<table>
+  <tr><th>#</th><th>Hypothesis</th><th>How to test</th><th>Status</th><th>Outcome</th></tr>
+  <tr>
+    <td>1</td>
+    <td>A <code>FallbackWarning</code> op in the compiled graph silently routes to CPU and
+        breaks the device submission</td>
+    <td>Run probe with <code>-W error::torch_spyre.ops.fallbacks.FallbackWarning</code></td>
+    <td><span class="s ruled-out">ruled out</span></td>
+    <td><strong>0 FallbackWarnings.</strong> No CPU fallback involved.</td>
+  </tr>
+  <tr>
+    <td>2</td>
+    <td>Verbose torch-spyre / deeprt logging localises the failing op or jobplan submission</td>
+    <td><code>TORCH_SENDNN_LOG=INFO DT_DEEPRT_VERBOSE=1 DTLOG_LEVEL=info</code></td>
+    <td><span class="s queued">queued</span></td><td>&mdash;</td>
+  </tr>
+  <tr>
+    <td>3</td>
+    <td>Failure is in attention specifically (recorded graphs), not the transformer blocks</td>
+    <td><code>SPYRE_ATTN_RECORD=0</code> to restore lazy attention compile</td>
+    <td><span class="s ruled-out">ruled out</span></td><td><code>SPYRE_ATTN_RECORD=0</code>: still all NaN.</td>
+  </tr>
+  <tr>
+    <td>4</td>
+    <td>Per-block compile granularity is the trigger; whole-model graph may avoid it</td>
+    <td><code>SPYRE_COMPILE_GRANULARITY=model</code></td>
+    <td><span class="s ruled-out">ruled out</span></td><td><code>SPYRE_COMPILE_GRANULARITY=model</code>: still all NaN.</td>
+  </tr>
+  <tr>
+    <td>5</td>
+    <td>The pinned <code>compile_sizes=[1,8]</code> / tiny
+        <code>max_num_batched_tokens=8</code> bucket is the trigger</td>
+    <td>Re-run probe with default bucketing and larger token budget</td>
+    <td><span class="s ruled-out">ruled out</span></td>
+    <td><code>MAX_NUM_BATCHED_TOKENS=512</code> still empty.</td>
+  </tr>
+  <tr>
+    <td>6</td>
+    <td>Decode-phase submission only (prefill is fine) &mdash; consistent with dying on
+        first generated token</td>
+    <td><code>MAX_TOKENS=1</code> vs 16; check whether prefill alone succeeds</td>
+    <td><span class="s confirmed">confirmed</span></td><td><strong>NaN on the FIRST token</strong> (<code>max_tokens=1</code>) &rarr; corruption is in compiled <em>prefill</em>, not decode/KV.</td>
+  </tr>
+  <tr>
+    <td>7</td>
+    <td>Stale inductor compile cache from the pre-rebuild stack (CLAUDE.md flags this as a
+        red-herring source after a bump)</td>
+    <td>Clear torchinductor cache, re-run probe</td>
+    <td><span class="s ruled-out">ruled out</span></td><td>Cleared 454&nbsp;MB <code>/tmp/torchinductor_chenw615</code> + <code>~/.cache/vllm</code>: still all NaN.</td>
+  </tr>
+  <tr>
+    <td>8</td>
+    <td>torch-spyre at <code>27081f24</code> is ahead of the rev main pins
+        (<code>b7c32231</code>); a regression landed in between</td>
+    <td>Rebuild at <code>27081f24~1</code> and at <code>b7c32231</code>, re-run probe</td>
+    <td><span class="s ruled-out">ruled out</span></td>
+    <td>NaN at <strong>both</strong> <code>27081f24~1</code> (drops #4667, the only
+        compiled-path commit in the delta) and <code>b7c32231</code> (main's pin). Not a
+        regression in that window.</td>
+  </tr>
+  <tr>
+    <td>9</td>
+    <td><strong>Compiled logits are NaN</strong> &rarr; sampler degenerates to token 6</td>
+    <td><code>SamplingParams(logprobs=5)</code>, compare compiled vs eager</td>
+    <td><span class="s confirmed">confirmed</span></td>
+    <td><strong>ROOT CAUSE.</strong> compiled: all <code>nan</code>; eager: valid logprobs.</td>
+  </tr>
+  <tr>
+    <td>10</td>
+    <td>NaN originates in attention (recorded graphs) rather than the block bodies</td>
+    <td><code>SPYRE_ATTN_RECORD=0</code>; then per-layer output inspection</td>
+    <td><span class="s queued">queued</span></td><td>&mdash;</td>
+  </tr>
+  <tr>
+    <td>11</td>
+    <td>NaN comes from the lm_head / logits path only (hidden states fine)</td>
+    <td>Compare final hidden state vs logits, compiled vs eager</td>
+    <td><span class="s queued">queued</span></td><td>&mdash;</td>
+  </tr>
+  <tr>
+    <td>12</td>
+    <td>Minimal standalone repro (pure torch + torch_spyre, RMSNorm + gated MLP,
+        fp16, <code>fullgraph=True</code>)</td>
+    <td><code>repro.py</code>, eager vs compiled</td>
+    <td><span class="s inconclusive">does not reproduce</span></td>
+    <td>Both clean (max diff 0.0039, 0 NaN). Bug needs more than a generic compiled
+        block &mdash; not a blanket <code>torch.compile</code> failure on this host.</td>
+  </tr>
+</table>
+
+<h2>Experiment log</h2>
+<p class="sub">Most recent first.</p>
+
+<div class="exp">
+  <h3>H12 &mdash; minimal standalone repro <span class="ts">06:10</span></h3>
+  <pre># logs/&lt;slug&gt;/repro.py — pure torch + torch_spyre, no vLLM
+EAGER=1: has_nan: False  max_abs_diff_vs_cpu: 0.00390625
+EAGER=0: has_nan: False  max_abs_diff_vs_cpu: 0.00390625</pre>
+  <p><strong>Negative result, recorded deliberately.</strong> A generic compiled fp16
+  RMSNorm+gated-MLP block is clean on this host, so the NaN is not a blanket
+  <code>torch.compile</code> breakage. Minimisation past the vLLM pipeline has not
+  succeeded yet &mdash; escalation should use the probe
+  (<code>scripts/probes/basic_llm_inference.py</code>) as the repro.</p>
+</div>
+
+<div class="exp">
+  <h3>H8 &mdash; torch-spyre rev bisect <span class="ts">06:04&ndash;06:09</span></h3>
+  <pre>27081f24 (branch)   -> all NaN
+27081f24~1          -> all NaN   # drops #4667 "Defer restickify barrier to the solver"
+b7c32231 (main pin) -> all NaN   # the rev origin/main pins today</pre>
+  <p>Ruled out. #4667 was the prime suspect because it is the <em>only</em> commit in the
+  <code>b7c32231..27081f24</code> delta touching compiled-path code
+  (<code>torch_spyre/_inductor/scratchpad/allocator.py</code>) &mdash; eager never runs it,
+  which matched the eager/compiled split perfectly. But NaN persists without it, and at
+  main's own pin. torch-spyre rebuilt at each rev via
+  <code>build-torch-spyre.sh</code>; branch state restored afterwards.</p>
+</div>
+
+<div class="exp">
+  <h3>H6 &mdash; prefill vs decode <span class="ts">06:03</span></h3>
+  <pre>EAGER=0, SamplingParams(max_tokens=1, logprobs=5)
+=== PREFILL-ONLY DIAG ===
+token_ids: [6]
+step 0: 6=nan, 3=nan, 4=nan, 1=nan, 0=nan</pre>
+  <p><strong>CONFIRMED and highly narrowing.</strong> The NaN is present on the very first
+  sampled token, with no decode step executed. The corruption is in the compiled
+  <em>prefill</em> forward pass &mdash; the KV-cache/decode path is not implicated.
+  Artifact: <code>h6-prefill-only.txt</code>.</p>
+</div>
+
+<div class="exp">
+  <h3>H3 / H4 / H7 &mdash; graph shape and cache <span class="ts">05:55&ndash;06:00</span></h3>
+  <pre>SPYRE_ATTN_RECORD=0            -> all NaN   (lazy attention compile)
+SPYRE_COMPILE_GRANULARITY=model -> all NaN   (one whole-model graph)
+rm -rf /tmp/torchinductor_chenw615 (454 MB) + ~/.cache/vllm -> all NaN</pre>
+  <p>All three ruled out. The NaN is invariant to how the graph is split and to a cold
+  compile cache, so it is not a stale-artifact or graph-partitioning effect. Artifacts:
+  <code>h3-attn-record-off.txt</code>, <code>h4-granularity-model.txt</code>,
+  <code>h7-cache-cleared.txt</code>.</p>
+</div>
+
+<div class="exp">
+  <h3>H9 &mdash; logits distribution, compiled vs eager <span class="ts">05:49&ndash;05:52</span></h3>
+  <pre>EAGER=0 python /tmp/logits_probe.py   # SamplingParams(..., logprobs=5)
+=== LOGITS DIAG ===   mode: compiled
+token_ids: [6, 6, 6, 6]
+step 0: 6=nan, 3=nan, 4=nan, 1=nan, 0=nan
+step 1: 6=nan, 3=nan, 4=nan, 1=nan, 0=nan
+
+EAGER=1 python /tmp/logits_probe.py
+=== LOGITS DIAG ===   mode: eager
+token_ids: [203, 203, 3057, 11071]
+step 0: 203=-0.104, 6180=-4.166, 4971=-4.510, 886=-5.111, 23551=-5.619
+step 2: 3057=-1.230, 1318=-1.934, 8197=-3.090, 51=-3.168, 52=-3.418</pre>
+  <p><strong>CONFIRMED root cause.</strong> Every compiled logprob is <code>nan</code>;
+  eager is healthy. Artifacts: <code>h9-logits-compiled.txt</code>,
+  <code>h9-logits-eager.txt</code>.</p>
+</div>
+
+<div class="exp">
+  <h3>H6 &mdash; inspect the output object <span class="ts">05:46</span></h3>
+  <pre>=== DIAG ===
+n_outputs: 1
+text: ''
+token_ids: [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6]
+finish_reason: length
+prompt_token_ids len: 8
+
+# token 6 -> '&lt;gh_stars&gt;'  (decodes to empty in output text)</pre>
+  <p>The model <em>does</em> generate 16 tokens &mdash; all identical, all token&nbsp;6.
+  So the empty string is a decode artifact of a degenerate sample, not a missing generation.
+  This is what redirected the whole investigation. Artifact:
+  <code>h6-output-diag.txt</code>.</p>
+</div>
+
+<div class="exp">
+  <h3>H5 &mdash; larger batched-token budget <span class="ts">05:41</span></h3>
+  <pre>EAGER=0 MAX_NUM_BATCHED_TOKENS=512 python scripts/probes/basic_llm_inference.py
+text: ''   matches_ref: False</pre>
+  <p>Ruled out. Prompt is exactly 8 tokens (== the default budget), so the tight bucket was
+  a plausible trigger; raising it to 512 changes nothing. Artifact:
+  <code>h5-bigger-budget.txt</code>.</p>
+</div>
+
+<div class="exp">
+  <h3>H1 + baseline &mdash; FallbackWarning as error <span class="ts">05:38</span></h3>
+  <pre>EAGER=0 python -W "error::torch_spyre.ops.fallbacks.FallbackWarning" \
+    scripts/probes/basic_llm_inference.py
+exit=1   mode: compiled   text: ''   matches_ref: False
+FallbackWarning hits: 0</pre>
+  <p>Ruled out &mdash; no silent CPU fallback. Also notable: the run contains
+  <strong>no error of any kind</strong> and exits cleanly. Init completes, then SIGTERM
+  shutdown 1&nbsp;s later. That is what first suggested the RAS error was not the cause.
+  Artifact: <code>baseline-fallback-error.txt</code>.</p>
+</div>
+
+<h2>Cluster validation</h2>
+<p class="sub">No fix found, so no post-fix column. Status is <span class="s blocked">blocked</span>
+pending torch-spyre escalation.</p>
+<table>
+  <tr><th>Node id / repro</th><th>Pre-fix</th><th>Post-fix</th><th>Notes</th></tr>
+  <tr><td><code>test_basic_llm_inference[model_ref_output0]</code></td>
+      <td>FAIL</td><td>&mdash;</td>
+      <td>Empty text; worker SIGKILLed during teardown on this branch</td></tr>
+  <tr><td><code>EAGER=0 basic_llm_inference.py</code> (probe)</td>
+      <td>FAIL</td><td>&mdash;</td>
+      <td>All logits NaN &rarr; token 6 &times;16; clean exit</td></tr>
+  <tr><td><code>EAGER=1 basic_llm_inference.py</code> (control)</td>
+      <td>PASS</td><td>PASS</td>
+      <td>Unaffected throughout the session</td></tr>
+</table>
+
+<h2>Key findings / artifacts</h2>
+<ul>
+  <li><strong>The bug:</strong> compiled-path logits are entirely <code>NaN</code> on the
+      first (prefill) token. The sampler argmaxes to the lowest index, token&nbsp;6
+      (<code>&lt;gh_stars&gt;</code>), which decodes to <code>''</code> &mdash; so the
+      surface symptom "empty output" is two steps removed from the cause.</li>
+  <li><strong>The 0x7b1b RAS "hardware error" was a red herring.</strong> It appears only in
+      the pytest/multiproc teardown path; the standalone probe reproduces the NaN with no RAS
+      error and a clean exit. Four library/RPM rebuild cycles were spent on it.</li>
+  <li><strong>Invariant to:</strong> CPU fallbacks (zero), attention recording, compile
+      granularity, compile-cache state, batched-token budget, torch-spyre rev across
+      <code>b7c32231..27081f24</code>.</li>
+  <li><strong>Localised to:</strong> compiled prefill forward pass. Eager identical inputs
+      are exact.</li>
+  <li><code>scripts/probes/basic_llm_inference.py</code> &mdash; env-driven repro
+      (<code>EAGER=0|1</code>), committed <code>2dd7769</code></li>
+  <li><code>repro.py</code> &mdash; minimal standalone attempt; does <em>not</em> reproduce
+      (negative result)</li>
+  <li>Per-hypothesis output: <code>baseline-fallback-error.txt</code>,
+      <code>h5-bigger-budget.txt</code>, <code>h6-output-diag.txt</code>,
+      <code>h6-prefill-only.txt</code>, <code>h7-cache-cleared.txt</code>,
+      <code>h3-attn-record-off.txt</code>, <code>h4-granularity-model.txt</code>,
+      <code>h8-revert-4667.txt</code>, <code>h8b-pinned-rev.txt</code>,
+      <code>h9-logits-compiled.txt</code>, <code>h9-logits-eager.txt</code></li>
+</ul>
+
+<h2>Escalation package (torch-spyre)</h2>
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td>Symptom</td><td>Compiled fp16 prefill yields all-NaN logits; eager is exact</td></tr>
+  <tr><td>Repro</td><td><code>EAGER=0 python scripts/probes/basic_llm_inference.py</code>
+      (spyre-inference <code>2dd7769</code>)</td></tr>
+  <tr><td>torch-spyre revs tried</td>
+      <td><code>27081f24</code>, <code>27081f24~1</code>, <code>b7c32231</code> &mdash; all NaN</td></tr>
+  <tr><td>torch</td><td>2.13.0+cpu</td></tr>
+  <tr><td>ibm-senlib-*</td><td><code>2.0.0-0.main.1+280.3869e2e_0</code> (matches lock)</td></tr>
+  <tr><td>ibm-flex*</td><td><code>2.0.0-0.main.1+576.402f9b2_0</code> (newer than lock's <code>570.c11584a_408</code>)</td></tr>
+  <tr><td>ibm-deeptools*</td><td><code>2.0.0-0.main.1+2457.d868b05_0</code> (older than lock's <code>2470.fb2446d_354</code>)</td></tr>
+  <tr><td>ibm-libaiupti</td><td><code>2.0.0-0.main.1+30.ef4e622_0</code></td></tr>
+  <tr><td>Device health</td><td>fp32 add 2.4e-07, fp16 add 0.00195, fp16 matmul 0.055 &mdash; normal</td></tr>
+</table>
+
+<h2>Next actions</h2>
+<ol>
+  <li><strong>Escalate to torch-spyre</strong> with the package above. The compiled prefill
+      produces NaN at main's own pinned rev, so either CI does not cover this path on this
+      library combination, or the trigger is the <code>ibm-deeptools</code> /
+      <code>ibm-flex</code> mismatch against <code>spyre-rpms.lock</code> (see below).</li>
+  <li><strong>Try the exact locked RPM set.</strong> <code>ibm-deeptools</code> is
+      <em>older</em> than the lock and <code>ibm-flex</code> is <em>newer</em>; deeptools owns
+      the compiler/jobplan path that only the compiled route exercises. This is the strongest
+      remaining untested variable and needs artifactory credentials to install.</li>
+  <li>H11 (not yet run): instrument per-layer hidden states to find the first NaN layer
+      &mdash; needs a forward hook on the compiled module, cheaper than further bisecting.</li>
+  <li>Keep <code>EAGER=1</code> as the working e2e path meanwhile.</li>
+</ol>
