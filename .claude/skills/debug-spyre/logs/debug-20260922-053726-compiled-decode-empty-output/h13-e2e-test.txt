@@ -1,0 +1,25 @@
+INFO 09-22 20:05:43 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 09-22 20:05:43 [__init__.py:54] - spyre_inference -> spyre_inference:register
+INFO 09-22 20:05:43 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 09-22 20:05:43 [__init__.py:254] Platform plugin spyre_inference is activated
+INFO 09-22 20:05:57 [importing.py:88] Triton not installed or not compatible; certain GPU-related functions will not be available.
+INFO 09-22 20:05:58 [__init__.py:41] Registering custom ops for spyre_inference
+INFO 09-22 20:05:58 [fp8_linear_kernel.py:322] Registered SpyreFp8LinearKernel for PlatformEnum.OOT (aten._scaled_mm)
+[vllm-upstream] no `upstream` in the -m expression, skipping upstream test collection (use -m upstream, or --upstream to add them to another marker expression)
+============================= test session starts ==============================
+platform linux -- Python 3.12.13, pytest-9.1.1, pluggy-1.6.0 -- /home/chenw615/dt-inductor/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/chenw615/spyre-inference
+configfile: pyproject.toml
+plugins: shard-0.1.2, asyncio-1.4.0, forked-1.7.5, timeout-2.4.0, anyio-4.15.1, rerunfailures-16.7, xdist-3.8.0, cov-7.1.0, buildkite-test-collector-0.1.9
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=function, asyncio_default_test_loop_scope=function
+timeout: 1800.0s
+timeout method: thread
+timeout func_only: False
+collecting ... collected 1 item
+Running 1 items in this shard: tests/e2e/test_compile.py::test_basic_llm_inference[model_ref_output0]
+
+tests/e2e/test_compile.py::test_basic_llm_inference[model_ref_output0] PASSED [100%]Spyre host: hard-exiting (code 0) past finalization to skip the senlib teardown abort
+
+
+========================= 1 passed in 93.06s (0:01:33) =========================

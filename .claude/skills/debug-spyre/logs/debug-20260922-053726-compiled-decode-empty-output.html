@@ -27,7 +27,7 @@
 <h1>compiled-decode-empty-output</h1>
 <div class="sub">
   Session started 2026-09-22 05:37:26 &middot; status
-  <span class="s blocked">blocked</span> &mdash; escalate to torch-spyre<br>
+  <span class="s resolved">RESOLVED</span> &mdash; deeptools was 129 commits stale<br>
   Compiled path generates zero tokens; eager path on the same stack is exact.
 </div>
 
@@ -51,6 +51,25 @@
     <td>PASSES &mdash; exact reference match, 0 RAS errors</td>
   </tr>
 </table>
+
+<div class="key">
+  <strong>RESOLVED 2026-09-22 20:04.</strong> The compiled path's NaN logits were caused by a
+  <strong>stale <code>deeptools</code> source checkout</strong>, 129 commits behind
+  (<code>85f9432623</code> 2026-08-19 &rarr; <code>22617c9191</code> 2026-08-28). A teammate
+  running the same container image had the newer rev and no failure, which is what identified
+  it. After rebuilding deeptools &rarr; flex &rarr; libaiupti &rarr; torch-spyre, compiled
+  logits match eager (<code>203=-0.1036</code> vs <code>-0.104</code>) and
+  <code>test_basic_llm_inference[model_ref_output0]</code> <strong>PASSES</strong>.
+  <br><br>
+  Why it was missed: the RPM set was scrutinised repeatedly, but <code>deeptools</code>,
+  <code>flex</code>, <code>libaiupti</code> and <code>spyre-comms</code> are built
+  <em>from source</em> and take precedence over <code>/opt/ibm/spyre</code> via
+  <code>SENTIENT_BASE_INSTALL_DIR</code>. Only senlib is consumed from the image. Every
+  hypothesis targeted RPMs or torch-spyre; the stale source dependency was never enumerated.
+  The delta is pure compiler backend &mdash; arithmetic templates, operand ordering, register
+  allocation, fp32 range-reduction constants &mdash; which explains NaN in a compiled graph
+  with eager untouched.
+</div>
 
 <h2>Session summary</h2>
 <p>
@@ -183,10 +202,42 @@
     <td>Both clean (max diff 0.0039, 0 NaN). Bug needs more than a generic compiled
         block &mdash; not a blanket <code>torch.compile</code> failure on this host.</td>
   </tr>
+  <tr>
+    <td>13</td>
+    <td><strong>A source dependency outside torch-spyre is stale</strong> &mdash; teammate on
+        the same image has <code>deeptools</code> 129 commits newer and no failure</td>
+    <td>Bump <code>deeptools</code> <code>85f9432623</code>&rarr;<code>22617c9191</code> and
+        <code>spyre-comms</code> <code>71d161e</code>&rarr;<code>217f6cb</code>, rebuild the
+        whole chain</td>
+    <td><span class="s confirmed">CONFIRMED &mdash; FIX</span></td>
+    <td><strong>Compiled logits healthy; e2e test passes.</strong></td>
+  </tr>
 </table>
 
 <h2>Experiment log</h2>
 <p class="sub">Most recent first.</p>
+
+<div class="exp">
+  <h3>H13 &mdash; bump stale deeptools / spyre-comms <span class="ts">19:45&ndash;20:04</span></h3>
+  <pre>deeptools    85f9432623 (2026-08-19) -> 22617c9191 (2026-08-28)   # 129 commits
+spyre-comms  71d161e    (2026-08-28) -> 217f6cb    (2026-08-31)
++ dataflow-scheduler submodule -> 9a9d290
+
+build-deeptools.sh -> build-flex.sh -> build-libaiupti.sh -> build-torch-spyre.sh
+
+=== LOGITS DIAG ===   mode: compiled
+token_ids: [203, 203, 3057, 11071]      text: '\n\nIBMs'
+step 0: 203=-0.1036, 6180=-4.1661, 4971=-4.5099   # eager was 203=-0.104
+
+tests/e2e/test_compile.py::test_basic_llm_inference[model_ref_output0] PASSED
+1 passed in 93.06s</pre>
+  <p><strong>THE FIX.</strong> Compiled logits now match eager to 4 decimal places. The delta
+  is entirely compiler backend (arithmetic templates, operand ordering, register allocation,
+  <code>idx32toaddr</code>, fp32 range-reduction constants) &mdash; consistent with NaN in a
+  compiled graph while eager is untouched. Artifacts:
+  <code>h13-deeptools-bumped.txt</code>, <code>h13-probe-compiled.txt</code>,
+  <code>h13-e2e-test.txt</code>.</p>
+</div>
 
 <div class="exp">
   <h3>H12 &mdash; minimal standalone repro <span class="ts">06:10</span></h3>
@@ -292,16 +343,15 @@ FallbackWarning hits: 0</pre>
 </div>
 
 <h2>Cluster validation</h2>
-<p class="sub">No fix found, so no post-fix column. Status is <span class="s blocked">blocked</span>
-pending torch-spyre escalation.</p>
+<p class="sub">After the deeptools bump + full rebuild chain.</p>
 <table>
   <tr><th>Node id / repro</th><th>Pre-fix</th><th>Post-fix</th><th>Notes</th></tr>
   <tr><td><code>test_basic_llm_inference[model_ref_output0]</code></td>
-      <td>FAIL</td><td>&mdash;</td>
-      <td>Empty text; worker SIGKILLed during teardown on this branch</td></tr>
+      <td>FAIL</td><td><strong>PASS</strong></td>
+      <td>1 passed in 93.06s</td></tr>
   <tr><td><code>EAGER=0 basic_llm_inference.py</code> (probe)</td>
-      <td>FAIL</td><td>&mdash;</td>
-      <td>All logits NaN &rarr; token 6 &times;16; clean exit</td></tr>
+      <td>FAIL</td><td><strong>PASS</strong></td>
+      <td>Exact reference match; logits match eager</td></tr>
   <tr><td><code>EAGER=1 basic_llm_inference.py</code> (control)</td>
       <td>PASS</td><td>PASS</td>
       <td>Unaffected throughout the session</td></tr>
@@ -349,17 +399,27 @@ pending torch-spyre escalation.</p>
   <tr><td>Device health</td><td>fp32 add 2.4e-07, fp16 add 0.00195, fp16 matmul 0.055 &mdash; normal</td></tr>
 </table>
 
-<h2>Next actions</h2>
-<ol>
-  <li><strong>Escalate to torch-spyre</strong> with the package above. The compiled prefill
-      produces NaN at main's own pinned rev, so either CI does not cover this path on this
-      library combination, or the trigger is the <code>ibm-deeptools</code> /
-      <code>ibm-flex</code> mismatch against <code>spyre-rpms.lock</code> (see below).</li>
-  <li><strong>Try the exact locked RPM set.</strong> <code>ibm-deeptools</code> is
-      <em>older</em> than the lock and <code>ibm-flex</code> is <em>newer</em>; deeptools owns
-      the compiler/jobplan path that only the compiled route exercises. This is the strongest
-      remaining untested variable and needs artifactory credentials to install.</li>
-  <li>H11 (not yet run): instrument per-layer hidden states to find the first NaN layer
-      &mdash; needs a forward hook on the compiled module, cheaper than further bisecting.</li>
-  <li>Keep <code>EAGER=1</code> as the working e2e path meanwhile.</li>
-</ol>
+<h2>Retrospective</h2>
+<ul>
+  <li><strong>The real signal was the token ids.</strong> One look at
+      <code>token_ids: [6, 6, 6, ...]</code> reframed "worker crashed" into "degenerate
+      sample", and <code>logprobs=5</code> then gave NaN immediately. That should have been
+      the first probe, before any library rebuild.</li>
+  <li><strong>Wasted effort: the <code>0x7b1b</code> RAS "hardware error".</strong> It reads
+      as authoritative (<code>severity ERROR</code>, <code>step "Open ticket"</code>) but is a
+      teardown artifact. Four RPM/library rebuild cycles went into it. The tell was there
+      early &mdash; the standalone probe reproduced the bug with no RAS line and a clean exit.</li>
+  <li><strong>Blind spot: source dependencies were never enumerated.</strong> Hypotheses
+      covered RPMs, torch-spyre revs, caches, graph shape and bucketing &mdash; but not
+      "is one of the four from-source libraries stale?" A
+      <code>git log -1</code> across <code>~/dt-inductor/*</code> at the start costs seconds
+      and would have shown deeptools 129 commits behind.</li>
+  <li><strong>What broke the deadlock:</strong> comparing against a teammate running the same
+      image successfully. When an environment-shaped bug resists every local hypothesis, diff
+      against a working peer's revisions rather than bisecting further.</li>
+  <li><strong>Also fixed en route:</strong> <code>libaiupti</code> at <code>932bdf5</code>
+      could not compile against senlib <code>280.3869e2e</code> (removed
+      <code>senlib_config.hpp</code>); moved to <code>ef4e622</code>, which carries the
+      upstream workaround (#139).</li>
+  <li>Environment recorded in <code>docs/dev/working-env-0922.md</code>.</li>
+</ul>
