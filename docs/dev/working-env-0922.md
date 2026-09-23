@@ -22,7 +22,16 @@ here. `spyre-comms` was moved forward at the same time (`71d161e` → `217f6cb`)
 
 ## Container image
 
-Pinned image, RPMs installed 2026-09-16. Contents per `/opt/ibm/spyre/components.txt`:
+```
+image-registry.openshift-image-registry.svc:5000/a6-quantization/torch-spyre-sshd:2026-09-19-kvc-c81130bd
+```
+
+RHEL 10.2, Python 3.12.13, torch 2.13.0+cpu. RPMs installed 2026-09-16.
+
+The image tag is pinned, so pulling it again gives this same RPM set. A pod *restart*
+reuses the running image; to pick up a different tag the pod must be recreated.
+
+`/opt/ibm/spyre/components.txt` (the image's own manifest):
 
 ```
 ibm-deeptools:2.0.0-0.main.1+2457.d868b05_0.el10
@@ -32,11 +41,22 @@ ibm-flex:2.0.0-0.main.1+576.402f9b2_0.el10
 ibm-aiu-toolbox-e2e:2.0.0-0.main.1+29.0826a00_0.el10
 ```
 
-Also installed: `ibm-libaiupti-2.0.0-0.main.1+30.ef4e622_0`,
-`ibm-spyre-comms{,-devel,-test}-1.0.0-0.main.1+156.906a4e6_0`,
-plus the `-devel`/`-headers` subpackages of deeptools, flex and senlib.
+Full installed set (`rpm -qa | grep ^ibm-`):
 
-RHEL 10.2, Python 3.12.13, torch 2.13.0+cpu.
+```
+ibm-aiu-toolbox-e2e-2.0.0-0.main.1+29.0826a00_0.el10
+ibm-deeptools-2.0.0-0.main.1+2457.d868b05_0.el10
+ibm-deeptools-devel-2.0.0-0.main.1+2457.d868b05_0.el10
+ibm-flex-2.0.0-0.main.1+576.402f9b2_0.el10
+ibm-flex-devel-2.0.0-0.main.1+576.402f9b2_0.el10
+ibm-libaiupti-2.0.0-0.main.1+30.ef4e622_0.el10
+ibm-senlib-core-2.0.0-0.main.1+280.3869e2e_0.el10
+ibm-senlib-dd2-2.0.0-0.main.1+280.3869e2e_0.el10
+ibm-senlib-headers-2.0.0-0.main.1+280.3869e2e_0.el10
+ibm-spyre-comms-1.0.0-0.main.1+156.906a4e6_0.el10
+ibm-spyre-comms-devel-1.0.0-0.main.1+156.906a4e6_0.el10
+ibm-spyre-comms-test-1.0.0-0.main.1+156.906a4e6_0.el10
+```
 
 Note these do **not** all match `spyre-rpms.lock`: `ibm-deeptools` is older
 (`2457.d868b05` vs `2470.fb2446d`), `ibm-flex` newer (`576.402f9b2` vs `570.c11584a`),
@@ -141,9 +161,14 @@ source $DTI_PROJECT_ROOT/torch-spyre-docs/scripts/dev-env.sh
 EAGER=1 python scripts/probes/basic_llm_inference.py   # eager
 EAGER=0 python scripts/probes/basic_llm_inference.py   # compiled
 
-python -m pytest 'tests/e2e/test_compile.py::test_basic_llm_inference[model_ref_output0]' \
+uv run --no-sync pytest \
+  'tests/e2e/test_compile.py::test_basic_llm_inference[model_ref_output0]' \
   -m "not upstream" -v
 ```
 
 Expected on this stack: both probes print `matches_ref: True`, and the test passes.
 Device smoke numbers: fp32 add 1.2e-07, fp16 matmul 0.0625, 1 device.
+
+Last verified 2026-09-23 on the image above: `1 passed in 97.96s`. The test passes with
+either the 83 MB (`build-torch-spyre.sh`) or 77 MB (`uv sync`) `_C.so`, so the build-isolation
+difference is an inconsistency to be aware of rather than a correctness problem.
