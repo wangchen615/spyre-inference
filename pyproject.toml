@@ -128,6 +128,9 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.28.0" },
 ]
+# Relative, so it resolves to $DTI_PROJECT_ROOT/torch-spyre for anyone whose
+# spyre-inference sits beside dt-inductor. uv URL-encodes `${VAR}` in a source path
+# rather than expanding it, so the env var cannot be used here directly.
 torch-spyre = { path = "../dt-inductor/torch-spyre", editable = true }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
