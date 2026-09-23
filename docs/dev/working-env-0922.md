@@ -46,28 +46,45 @@ flex, deeptools, libaiupti and spyre-comms are built from source and take preced
 
 ## Source revisions (`$DTI_PROJECT_ROOT` = `~/dt-inductor`)
 
-| Repo | Branch | Commit | Date |
+All commits below are reachable from their upstream remote by SHA (verified by fetching
+each into a fresh clone), so none of this depends on a local branch or this pod.
+
+| Repo | Commit | Date | Remote |
 |---|---|---|---|
-| `deeptools` | `spyre-inference-base-0918` | `22617c9191374219ad7c8773b514c42211290bd3` | 2026-08-28 |
-| `flex` | `spyre-inference-base-0918` | `eeafb3d8a1bd6f15f40691b2df14a2734d746f2f` | 2026-09-18 |
-| `libaiupti` | `spyre-inference-base-0918` | `ef4e6226d0642f16e6a3687d0bf5b81c3dd79e4d` | 2026-09-14 |
-| `spyre-comms` | `spyre-inference-base-0918` | `217f6cb0a0cdaaca3ae3a6f2831e0738b0bf7243` | 2026-08-31 |
-| `torch-spyre` | `spyre-inference-base-0918` | `27081f241dbd5cc5292b9cf4e4f834bdc6b19ff1` | 2026-09-18 |
-| `torch-spyre-docs` | `main` | `3095d566dd9cf84b4ca2a4b35e517c4091008f1c` | 2026-08-25 |
-| `llvm-project` | `llvmorg-22.1.3` (detached) | `e9846648fd6183ee6d8cbdb4502213fcf902a211` | 2026-04-06 |
-| `pytorch` | `release/2.10` | `911aa98c48b7a80a708dc168b1c418c7ae0bb9de` | 2026-02-10 |
-| `sendnn` | `main` | `8cc4fe436f161f72e9bb4b76b8252d9bea981da6` | 2026-06-29 |
-| `senbfcc` | `main` | `93c60dff46d933378c7833a6132690f4af3b94dc` | 2026-02-11 |
+| `deeptools` | `22617c9191374219ad7c8773b514c42211290bd3` | 2026-08-28 | `git@github.ibm.com:ai-chip-toolchain/deeptools.git` |
+| `flex` | `eeafb3d8a1bd6f15f40691b2df14a2734d746f2f` | 2026-09-18 | `git@github.ibm.com:ai-chip-toolchain/flex.git` |
+| `libaiupti` | `ef4e6226d0642f16e6a3687d0bf5b81c3dd79e4d` | 2026-09-14 | `git@github.ibm.com:ai-chip-toolchain/libaiupti.git` |
+| `spyre-comms` | `217f6cb0a0cdaaca3ae3a6f2831e0738b0bf7243` | 2026-08-31 | `git@github.ibm.com:ai-chip-toolchain/spyre-comms.git` |
+| `torch-spyre` | `27081f241dbd5cc5292b9cf4e4f834bdc6b19ff1` | 2026-09-18 | `https://github.com/torch-spyre/torch-spyre` |
+| `torch-spyre-docs` | `3095d566dd9cf84b4ca2a4b35e517c4091008f1c` | 2026-08-25 | `git@github.ibm.com:ai-foundation/torch-spyre-docs.git` |
+| `llvm-project` | `e9846648fd6183ee6d8cbdb4502213fcf902a211` (`llvmorg-22.1.3`) | 2026-04-06 | `https://github.com/llvm/llvm-project` |
+| `pytorch` | `911aa98c48b7a80a708dc168b1c418c7ae0bb9de` (`release/2.10`) | 2026-02-10 | `git@github.com:pytorch/pytorch.git` |
+| `sendnn` | `8cc4fe436f161f72e9bb4b76b8252d9bea981da6` | 2026-06-29 | `git@github.ibm.com:ai-chip-toolchain/sendnn.git` |
+| `senbfcc` | `93c60dff46d933378c7833a6132690f4af3b94dc` | 2026-02-11 | `git@github.ibm.com:ai-chip-toolchain/senbfcc.git` |
+
+On this pod every repo except `llvm-project` (detached), `pytorch`, `sendnn`, `senbfcc` and
+`torch-spyre-docs` sits on a local branch named `spyre-inference-base-0918`. Those branches
+are labels only — they carry no commits of their own, so checking out the SHA is equivalent.
+`torch-spyre`'s local `origin` is a personal fork; the upstream URL above serves the same
+commit.
 
 `deeptools` submodules (set by `git submodule update --init --recursive`):
 
-| Submodule | Commit |
-|---|---|
-| `dataflow-scheduler` | `9a9d29095cad7cca4970628686d189144b34a812` |
-| `dataflow-scheduler/external/dataflow-scheduler-dialects` | `4d66ebb3253de0e112a206e00e6e46e413cf5b33` |
-| `dataflow-scheduler/external/ktir-mlir-frontend` | `fc21b6c2fa380172d43bc38fa296fcb9bcdaa83a` |
+| Submodule path | Commit | URL |
+|---|---|---|
+| `dataflow-scheduler` | `9a9d29095cad7cca4970628686d189144b34a812` | `https://github.com/torch-spyre/dataflow-scheduler.git` |
+| `dataflow-scheduler/external/dataflow-scheduler-dialects` | `4d66ebb3253de0e112a206e00e6e46e413cf5b33` | `https://github.com/torch-spyre/dataflow-scheduler-mlir-dialects.git` |
+| `dataflow-scheduler/external/ktir-mlir-frontend` | `fc21b6c2fa380172d43bc38fa296fcb9bcdaa83a` | `https://github.com/torch-spyre/ktir-mlir-frontend.git` |
 
-`libaiupti` submodule `src/aiupti/common` → `9962b3b9ba195e77c168b24249dcd44de3d820da`.
+`libaiupti` submodule:
+
+| Submodule path | Commit | URL |
+|---|---|---|
+| `src/aiupti/common` | `9962b3b9ba195e77c168b24249dcd44de3d820da` | `git@github.ibm.com:ai-chip-toolchain/spyre_common_headers` |
+
+Note the dialects submodule's path and repo name differ (`dataflow-scheduler-dialects`
+vs `dataflow-scheduler-mlir-dialects`). `git submodule update --init --recursive` reads
+all of these from `.gitmodules`, so the URLs are only needed to fetch a pin by hand.
 
 `spyre-inference`: branch `spyre-inference-base-0918`, vLLM pinned `v0.28.0`,
 `torch-spyre` sourced from `../dt-inductor/torch-spyre` (editable).
