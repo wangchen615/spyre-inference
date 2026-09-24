@@ -29,7 +29,7 @@ flattened views, which `copy_kv_page_raw` rejects), so the connector hands the
 original caches over via `bind_physical_caches` before `get_worker` is called.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
@@ -42,6 +42,10 @@ from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+        OffloadingMetricMetadata,
+    )
+
     from spyre_inference.v1.kv_offload.connector import SpyrePhysicalCaches
 
 logger = init_logger(__name__)
@@ -49,6 +53,35 @@ logger = init_logger(__name__)
 
 class SpyreOffloadingSpec(OffloadingSpec):
     """Spyre host-memory offloading: upstream manager, Spyre worker."""
+
+    @classmethod
+    def build_metric_definitions(
+        cls, extra_config: dict[str, Any]
+    ) -> dict[str, "OffloadingMetricMetadata"]:
+        """Declare the metrics `CPUOffloadingManager` emits.
+
+        Prometheus builds its metric set from the *spec* class
+        (`offloading/metrics.py:327`) but the values are reported by the
+        *manager*. Since `get_manager` reuses `CPUOffloadingManager` verbatim, the
+        metrics it emits are the CPU ones, and the base class's empty default made
+        upstream's `observe()` assert on the first request:
+
+            File "offloading/metrics.py", line 489, in observe
+                assert key in self._offloading_metric_defs
+            AssertionError
+
+        Delegating to `CPUOffloadingSpec`'s classmethod rather than copying its
+        four definitions keeps the declaration tied to the manager actually in
+        use: if upstream adds a metric to the manager it adds it here too, where a
+        copy would silently fall behind and assert again. The classmethod is pure
+        -- it reads only `extra_config`, which is what it is handed -- so this
+        borrows no CPU-spec instance behaviour. `CPUOffloadingSpec` is still not a
+        base class: its `__init__` sizes pinned host tensors via
+        `SharedOffloadRegion`, which does not apply here.
+        """
+        from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+        return CPUOffloadingSpec.build_metric_definitions(extra_config)
 
     def __init__(self, config: OffloadingConfig) -> None:
         super().__init__(config)
