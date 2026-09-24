@@ -200,3 +200,53 @@ def test_resolvable_through_the_upstream_spec_factory():
     spec = OffloadingSpecFactory.create_spec(config)
     assert isinstance(spec, SpyreOffloadingSpec)
     assert spec.num_blocks == 32
+
+
+def test_declares_every_metric_the_reused_manager_emits() -> None:
+    """The spec must declare what `CPUOffloadingManager` reports.
+
+    Prometheus builds its metric set from the spec class but the values come from
+    the manager, and upstream asserts the key was declared
+    (`offloading/metrics.py`, `assert key in self._offloading_metric_defs`). With
+    the base class's empty default this crashed the output handler on the *first
+    served request* and shut the server down -- invisible to every other test
+    here, because none of them touch the Prometheus path.
+
+    Rather than hand-listing the keys, read them out of the manager's own source:
+    a metric added to the manager upstream then fails here instead of at serve
+    time. `STORES_SKIPPED` is conditional on `store_threshold >= 2` in both the
+    manager and the definitions, so it is checked under a config that enables it.
+    """
+    import inspect
+    import re
+
+    from vllm.v1.kv_offload.cpu import manager as manager_mod
+    from vllm.v1.kv_offload.cpu.manager import CPUOffloadingMetrics
+
+    # The manager names members (`CPUOffloadingMetrics.STORES_SKIPPED`) but the
+    # definitions dict is keyed by the metric-name *string* those members hold
+    # ("vllm:kv_offload_stores_skipped"), which is also what `observe()` looks up.
+    # Resolve through the class so the two sides are compared in one namespace.
+    members = set(
+        re.findall(r"CPUOffloadingMetrics\.([A-Z_]+)", inspect.getsource(manager_mod))
+    )
+    assert members, "found no CPUOffloadingMetrics references; upstream changed shape"
+    emitted = {getattr(CPUOffloadingMetrics, name) for name in members}
+
+    config = _config(extra={"store_threshold": 2})
+    declared = set(SpyreOffloadingSpec.build_metric_definitions(config.extra_config))
+
+    assert emitted <= declared, (
+        f"manager emits metrics the spec never declares: {sorted(emitted - declared)}"
+    )
+
+
+def test_stores_skipped_declared_only_when_filtering_is_on() -> None:
+    """Mirror the manager: it only emits STORES_SKIPPED when the threshold is set."""
+    from vllm.v1.kv_offload.cpu.manager import CPUOffloadingMetrics
+
+    off = SpyreOffloadingSpec.build_metric_definitions(_config().extra_config)
+    on = SpyreOffloadingSpec.build_metric_definitions(
+        _config(extra={"store_threshold": 2}).extra_config
+    )
+    assert set(on) - set(off) == {CPUOffloadingMetrics.STORES_SKIPPED}
