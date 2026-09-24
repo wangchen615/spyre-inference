@@ -66,6 +66,18 @@ means "slot `h` of every tensor". Per-cache pools also keep one `PageSignature`
 per pool, which a single shared pool would collapse -- wrong the moment two
 layers differ in `head_size`.
 
+## Why `_transfer` fences first
+
+Every transfer is issued from `start_kv_transfers`, called by the connector's
+`start_load_kv` before the forward pass. Loads are therefore safe by construction:
+they write pages before anything reads them.
+
+Stores are not, because they are deferred one step -- `get_finished` calls
+`prepare_store_kv`, which queues them for the *next* step's `start_load_kv`. The
+pages being read were written by the previous forward, and a blocking
+`copy_kv_page_raw` waits only on its own DMA. So `_transfer` calls
+`torch.spyre.synchronize()` once per job before issuing anything.
+
 ## Single KV cache group only
 
 `GPULoadStoreSpec.block_ids` is a *concatenation* ordered by KV group, with
@@ -79,6 +91,7 @@ rather than silently offloading a hybrid model's layers against the wrong blocks
 
 import time
 
+import torch
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
@@ -160,6 +173,17 @@ class SpyreOffloadingWorker(OffloadingWorker):
                 f"Spyre KV offloading supports a single KV cache group; got "
                 f"{len(group_sizes)} (hybrid/HMA models are out of scope for M1)"
             )
+
+        # Fence before reading device pages. Stores are deferred a step:
+        # get_finished() -> prepare_store_kv() queues them, and they are issued
+        # from the *next* step's start_load_kv, so the bytes being offloaded were
+        # written by the previous forward with nothing in between. A blocking
+        # copy_kv_page_raw waits on its own DMA, not on prior compute, so without
+        # this a store can read pages that still have async work pending. The
+        # symptom would be stale bytes offloaded -- wrong tokens on a later cache
+        # hit, no error raised, and unit tests unaffected because they never have
+        # pending compute. One synchronize per job, not per page.
+        torch.spyre.synchronize()
 
         device_blocks = list(gpu_spec.block_ids)
         host_blocks = list(host_spec.block_ids)
