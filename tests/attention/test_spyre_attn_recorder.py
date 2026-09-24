@@ -436,8 +436,14 @@ class TestRecordGraphs:
         assert _record(impl, kv_cache, builder) == 0
         assert compiles() == snapshot
 
-    def test_a_failing_variant_does_not_abort_the_pass(self, impl, kv_cache, builder, monkeypatch):
-        """One bad variant must not take down engine startup."""
+    def test_a_transient_failure_is_retried_and_recovered(
+        self, impl, kv_cache, builder, monkeypatch
+    ):
+        """A variant that fails once is retried, so the pass loses nothing.
+
+        A timed-out compile writes no cache entry, so a dropped shape is re-paid by
+        every later layer. Recovering it here is worth one extra attempt.
+        """
         bucketer = builder._attn_bucketer = make_bucketer()
         calls = {"n": 0}
         real = impl._record_one
@@ -451,7 +457,55 @@ class TestRecordGraphs:
         monkeypatch.setattr(impl, "_record_one", flaky)
         recorded = _record(impl, kv_cache, builder)
 
-        assert recorded == calls["n"] - 1 == len(_recordable(bucketer)) - 1
+        # One extra call for the retry, and no variant lost.
+        assert recorded == len(_recordable(bucketer))
+        assert calls["n"] == len(_recordable(bucketer)) + 1
+
+    def test_a_variant_failing_both_attempts_does_not_abort_the_pass(
+        self, impl, kv_cache, builder, monkeypatch
+    ):
+        """One incurably bad variant must not take down engine startup."""
+        bucketer = builder._attn_bucketer = make_bucketer()
+        doomed = _recordable(bucketer)[0]
+        calls = {"n": 0}
+        real = impl._record_one
+
+        def flaky(bucket, *args, **kwargs):
+            calls["n"] += 1
+            if bucket == doomed:
+                raise RuntimeError("synthetic lowering failure")
+            return real(bucket, *args, **kwargs)
+
+        monkeypatch.setattr(impl, "_record_one", flaky)
+        recorded = _record(impl, kv_cache, builder)
+
+        # The doomed variant is attempted twice and dropped; the rest still record.
+        assert recorded == len(_recordable(bucketer)) - 1
+        assert calls["n"] == len(_recordable(bucketer)) + 1
+
+    def test_a_dropped_prefill_variant_is_logged_at_error(
+        self, impl, kv_cache, builder, monkeypatch, caplog
+    ):
+        """A dropped prefill shape is certain to be requested; do not log it as benign."""
+        bucketer = builder._attn_bucketer = make_bucketer()
+        prefills = [v for v in _recordable(bucketer) if v.padded_query_len > 1]
+        assert prefills, "bucketer produced no prefill variants to drop"
+        doomed = prefills[0]
+        real = impl._record_one
+
+        def flaky(bucket, *args, **kwargs):
+            if bucket == doomed:
+                raise RuntimeError("synthetic lowering failure")
+            return real(bucket, *args, **kwargs)
+
+        monkeypatch.setattr(impl, "_record_one", flaky)
+        with caplog.at_level(logging.INFO):
+            _record(impl, kv_cache, builder)
+
+        assert "retrying" in caplog.text
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, "a dropped prefill variant must be logged at ERROR"
+        assert "may kill the engine" in errors[0].getMessage()
 
     def test_recording_nothing_warns(self, impl, kv_cache, builder, monkeypatch, caplog):
         """A pass that records nothing degrades to first-use compiles; say so loudly."""

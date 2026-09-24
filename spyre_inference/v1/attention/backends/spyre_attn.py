@@ -1365,15 +1365,39 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 # allocates fewer pages than that many distinct blocks to gather.
                 continue
             t0 = time.time()
-            try:
-                realized = self._record_one(bucket, layer, kv_cache, builder, recorded)
-            except Exception:
-                logger.warning(
-                    "Attention variant %s failed to record; it will compile on first use instead.",
-                    bucket,
-                    exc_info=True,
-                )
-                continue
+            realized = None
+            for attempt in (1, 2):
+                try:
+                    realized = self._record_one(bucket, layer, kv_cache, builder, recorded)
+                    break
+                except Exception:
+                    # A timed-out compile writes no cache entry, so every later layer pays
+                    # for this shape again from cold. One retry is cheap next to that, and
+                    # often succeeds on the partially warmed state the first attempt left.
+                    exhausted = attempt == 2
+                    if not exhausted:
+                        logger.info(
+                            "Attention variant %s failed to record (attempt %d/2); retrying.",
+                            bucket,
+                            attempt,
+                        )
+                    elif bucket.padded_query_len > 1:
+                        # A dropped prefill shape is not a safe deferral: it is certain to
+                        # be requested, and the serving path does not catch a compile
+                        # failure the way this loop does.
+                        logger.exception(
+                            "Attention prefill variant %s failed to record after 2 attempts; "
+                            "it must compile on first use, which may kill the engine if it "
+                            "times out again.",
+                            bucket,
+                        )
+                    else:
+                        logger.warning(
+                            "Attention variant %s failed to record after 2 attempts; "
+                            "it will compile on first use instead.",
+                            bucket,
+                            exc_info=True,
+                        )
             if realized is None:
                 continue
             recorded.add(realized)
