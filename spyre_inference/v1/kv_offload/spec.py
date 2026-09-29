@@ -42,6 +42,7 @@ from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
         OffloadingMetricMetadata,
     )
@@ -101,9 +102,7 @@ class SpyreOffloadingSpec(OffloadingSpec):
 
         cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
         if not cpu_bytes_to_use:
-            raise ValueError(
-                "cpu_bytes_to_use must be specified in kv_connector_extra_config"
-            )
+            raise ValueError("cpu_bytes_to_use must be specified in kv_connector_extra_config")
 
         # Mirrors CPUOffloadingSpec's sizing so the scheduler's host block ids
         # stay in step with upstream's accounting. Note this is *logical* KV
@@ -131,18 +130,15 @@ class SpyreOffloadingSpec(OffloadingSpec):
 
         # Pool names are per engine and per rank: two ranks on one host must not
         # collide on a POSIX shared-memory name.
-        self._pool_prefix = (
-            f"spyre_kv_{config.engine_id}_r{config.parallel.rank}"
-        )
+        self._pool_prefix = f"spyre_kv_{config.engine_id}_r{config.parallel.rank}"
 
         # scheduler-side
         self._manager: OffloadingManager | None = None
         # worker-side, bound by the connector before get_worker()
-        self._physical: "SpyrePhysicalCaches | None" = None
+        self._physical: SpyrePhysicalCaches | None = None
 
         logger.info(
-            "SpyreOffloadingSpec: %d host block(s) of %d logical KV bytes, "
-            "pool prefix %s",
+            "SpyreOffloadingSpec: %d host block(s) of %d logical KV bytes, pool prefix %s",
             self.num_blocks,
             kv_bytes_per_block,
             self._pool_prefix,
@@ -157,21 +153,32 @@ class SpyreOffloadingSpec(OffloadingSpec):
         """
         self._physical = physical
 
+    def bind_vllm_config(self, vllm_config: "VllmConfig") -> None:
+        """Bind full engine configuration required only by derived specs."""
+
+    def _create_manager(self) -> OffloadingManager:
+        return CPUOffloadingManager(
+            num_blocks=self.num_blocks,
+            cache_policy=self.eviction_policy,
+            cache_policy_module_path=self.cache_policy_module_path,
+            enable_events=self.kv_events_config.enable_kv_cache_events,
+            store_threshold=int(self.extra_config.get("store_threshold", 0)),
+            max_tracker_size=int(self.extra_config.get("max_tracker_size", 64_000)),
+        )
+
     def get_manager(self) -> OffloadingManager:
-        if not self._manager:
-            # store_threshold: how many times a block must appear in lookup()
-            # before it is eligible for offloading. Values < 2 disable filtering.
-            store_threshold = int(self.extra_config.get("store_threshold", 0))
-            max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
-            self._manager = CPUOffloadingManager(
-                num_blocks=self.num_blocks,
-                cache_policy=self.eviction_policy,
-                cache_policy_module_path=self.cache_policy_module_path,
-                enable_events=self.kv_events_config.enable_kv_cache_events,
-                store_threshold=store_threshold,
-                max_tracker_size=max_tracker_size,
-            )
+        if self._manager is None:
+            self._manager = self._create_manager()
         return self._manager
+
+    def _create_worker(self, physical: "SpyrePhysicalCaches") -> OffloadingWorker:
+        from spyre_inference.v1.kv_offload.worker import SpyreOffloadingWorker
+
+        return SpyreOffloadingWorker(
+            physical=physical,
+            num_host_blocks=self.num_blocks,
+            pool_prefix=self._pool_prefix,
+        )
 
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
         """Build the Spyre worker from the *physical* caches.
@@ -179,10 +186,6 @@ class SpyreOffloadingSpec(OffloadingSpec):
         `kv_caches` is accepted to satisfy the upstream signature and is used
         only to cross-check that canonicalization and the physical binding agree.
         """
-        # Imported here: this module is resolved by OffloadingSpecFactory on the
-        # scheduler side too, where the connector module need not be loaded.
-        from spyre_inference.v1.kv_offload.worker import SpyreOffloadingWorker
-
         if self._physical is None:
             raise RuntimeError(
                 "bind_physical_caches() must be called before get_worker(); the "
@@ -197,11 +200,7 @@ class SpyreOffloadingSpec(OffloadingSpec):
                 f"the {expected_tensors} recorded during canonicalization"
             )
 
-        worker = SpyreOffloadingWorker(
-            physical=self._physical,
-            num_host_blocks=self.num_blocks,
-            pool_prefix=self._pool_prefix,
-        )
+        worker = self._create_worker(self._physical)
 
         # The manager hands out host block ids from logical-byte math, while the
         # pools are sized from the physical page size (which includes stick

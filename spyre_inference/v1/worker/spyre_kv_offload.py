@@ -75,6 +75,23 @@ def v_slot(slot: int) -> int:
     return 2 * slot + 1
 
 
+def copy_kv_page_pair(
+    copy_fn,
+    cache: SpyrePagedKVCache,
+    block_id: int,
+    k_pool,
+    k_slot_id: int,
+    v_pool,
+    v_slot_id: int,
+    to_device: bool,
+    non_blocking: bool = False,
+) -> None:
+    """Copy one K/V page pair through explicit pool and slot routing."""
+    k_pages, v_pages = cache
+    copy_fn(k_pages, block_id, k_pool, k_slot_id, to_device, non_blocking)
+    copy_fn(v_pages, block_id, v_pool, v_slot_id, to_device, non_blocking)
+
+
 def page_bytes(cache: SpyrePagedKVCache) -> int:
     """Bytes in one K (or V) page of `cache`, including device stick padding.
 
@@ -146,9 +163,7 @@ def page_signature(cache: SpyrePagedKVCache, layout_kind: str) -> PageSignature:
     but reported as nonsense.
     """
     if layout_kind not in ("token-major", "head-major"):
-        raise ValueError(
-            f"layout_kind must be 'token-major' or 'head-major', got {layout_kind!r}"
-        )
+        raise ValueError(f"layout_kind must be 'token-major' or 'head-major', got {layout_kind!r}")
 
     k_pages = cache[0]
     num_blocks, dim1, dim2, head_size = (int(d) for d in k_pages.shape)
@@ -234,9 +249,17 @@ class SpyreKvPageOffloader:
     def offload(self, block_id: int, slot: int, non_blocking: bool = False) -> None:
         """Copy device page `block_id` (K and V) out to host slot `slot`."""
         self._check_slot(slot)
-        k_pages, v_pages = self._cache
-        self._copy(k_pages, block_id, self._pool, k_slot(slot), False, non_blocking)
-        self._copy(v_pages, block_id, self._pool, v_slot(slot), False, non_blocking)
+        copy_kv_page_pair(
+            self._copy,
+            self._cache,
+            block_id,
+            self._pool,
+            k_slot(slot),
+            self._pool,
+            v_slot(slot),
+            False,
+            non_blocking,
+        )
 
     def reload(self, slot: int, block_id: int, non_blocking: bool = False) -> None:
         """Copy host slot `slot` back into device page `block_id`.
@@ -245,9 +268,17 @@ class SpyreKvPageOffloader:
         position-independent, so a restore may relocate it.
         """
         self._check_slot(slot)
-        k_pages, v_pages = self._cache
-        self._copy(k_pages, block_id, self._pool, k_slot(slot), True, non_blocking)
-        self._copy(v_pages, block_id, self._pool, v_slot(slot), True, non_blocking)
+        copy_kv_page_pair(
+            self._copy,
+            self._cache,
+            block_id,
+            self._pool,
+            k_slot(slot),
+            self._pool,
+            v_slot(slot),
+            True,
+            non_blocking,
+        )
 
     def offload_many(self, pairs: list[tuple[int, int]], non_blocking: bool = False) -> None:
         """Offload several `(block_id, slot)` pairs.

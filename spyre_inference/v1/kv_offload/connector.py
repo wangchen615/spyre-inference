@@ -166,8 +166,7 @@ def spyre_paged_to_canonical(
         cache_id = id(cache)
         if cache_id not in indices_by_cache:
             indices_by_cache[cache_id] = [
-                _append_flat_tensor(tensors, pages, half_page)
-                for pages in (k_pages, v_pages)
+                _append_flat_tensor(tensors, pages, half_page) for pages in (k_pages, v_pages)
             ]
             cache_index[cache_id] = len(physical)
             first_layer[cache_id] = layer_name
@@ -209,12 +208,10 @@ def spyre_paged_to_canonical(
     return canonical, physical_caches
 
 
-def _layout_kind_by_layer(
-    vllm_config: VllmConfig, layer_names: Iterable[str]
-) -> dict[str, str]:
+def _layout_kind_by_layer(vllm_config: VllmConfig, layer_names: Iterable[str]) -> dict[str, str]:
     """Resolve each layer's KV layout from its attention impl.
 
-    The layout is *not* inferrable from the tensor: both layouts fold logical
+    The layout is *not* inferable from the tensor: both layouts fold logical
     dim 1 into device dim 0, so `device_size[0] // num_blocks == size(1)` either
     way (see `spyre_kv_offload.page_signature`). Only the allocating backend
     knows, so read the same `static_forward_context[layer].impl` the model runner
@@ -231,9 +228,7 @@ def _layout_kind_by_layer(
                 f"static_forward_context; cannot determine KV layout"
             )
         kinds[layer_name] = (
-            HEAD_MAJOR
-            if type(impl).__name__ == "SpyreHeadMajorAttentionImpl"
-            else TOKEN_MAJOR
+            HEAD_MAJOR if type(impl).__name__ == "SpyreHeadMajorAttentionImpl" else TOKEN_MAJOR
         )
     return kinds
 
@@ -243,18 +238,14 @@ def _specs_by_layer(kv_cache_config: KVCacheConfig) -> dict[str, object]:
     for group in kv_cache_config.kv_cache_groups:
         group_spec = group.kv_cache_spec
         per_layer = (
-            group_spec.kv_cache_specs
-            if isinstance(group_spec, UniformTypeKVCacheSpecs)
-            else {}
+            group_spec.kv_cache_specs if isinstance(group_spec, UniformTypeKVCacheSpecs) else {}
         )
         for layer_name in group.layer_names:
             specs[layer_name] = per_layer.get(layer_name, group_spec)
     return specs
 
 
-def _unpack_paged_cache(
-    layer_name: str, cache: object
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _unpack_paged_cache(layer_name: str, cache: object) -> tuple[torch.Tensor, torch.Tensor]:
     """Duck-type SpyrePagedKVCache without importing the attention stack."""
     if not (isinstance(cache, tuple) and len(cache) == 2):
         raise TypeError(
@@ -346,6 +337,7 @@ class SpyreOffloadingConnectorWorker(OffloadingConnectorWorker):
             len(physical.caches),
             ",".join(physical.layout_kinds),
         )
+        self.spec.bind_vllm_config(self.vllm_config)
         self.spec.bind_physical_caches(physical)
         self._init_worker(canonical)
 

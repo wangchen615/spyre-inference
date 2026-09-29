@@ -23,9 +23,9 @@ not assert byte fidelity after a round trip -- that needs a card and lives with
 the hardware cases in the M1 plan.
 """
 
-import pytest
 import dataclasses
 
+import pytest
 import torch
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -34,6 +34,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
 from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
     SpyreHeadMajorAttentionImpl,
 )
+from spyre_inference.v1.worker import spyre_kv_offload as offload_mod
 from spyre_inference.v1.worker.spyre_kv_offload import (
     PageSignature,
     SpyreKvPageOffloader,
@@ -82,6 +83,32 @@ def test_k_and_v_slots_are_disjoint():
     assert [v_slot(s) for s in range(4)] == [1, 3, 5, 7]
     used = [k_slot(s) for s in range(32)] + [v_slot(s) for s in range(32)]
     assert len(set(used)) == 64, "K/V host slots collide"
+
+
+def test_page_pair_copy_preserves_m1_k_then_v_slot_routing():
+    """A refactor must retain K-before-V and the paired M1 slot indices."""
+    calls = []
+    cache = (object(), object())
+    pool = object()
+
+    def copy_fn(*args):
+        calls.append(args)
+
+    offload_mod.copy_kv_page_pair(
+        copy_fn,
+        cache,
+        7,
+        pool,
+        k_slot(3),
+        pool,
+        v_slot(3),
+        False,
+    )
+
+    assert calls == [
+        (cache[0], 7, pool, 6, False, False),
+        (cache[1], 7, pool, 7, False, False),
+    ]
 
 
 # --- everything below drives real device allocations -----------------------
@@ -176,9 +203,7 @@ def test_rejects_page_view_instead_of_cache():
     from torch_spyre._C import copy_kv_page_raw  # ty: ignore[unresolved-import]
 
     cache = _cache(SpyreAttentionImpl)
-    off = SpyreKvPageOffloader(
-        cache, "reject_view", num_slots=1, layout_kind="token-major"
-    )
+    off = SpyreKvPageOffloader(cache, "reject_view", num_slots=1, layout_kind="token-major")
     for lo, hi in ((0, 4), (2, 6)):
         with pytest.raises(RuntimeError, match="is not num_blocks"):
             copy_kv_page_raw(cache.k_pages[lo:hi], 0, off.pool, 0, False, False)
@@ -190,9 +215,7 @@ def test_rejects_generic_layout():
     from torch_spyre._C import copy_kv_page_raw  # ty: ignore[unresolved-import]
 
     cache = _cache(SpyreAttentionImpl)
-    off = SpyreKvPageOffloader(
-        cache, "reject_generic", num_slots=1, layout_kind="token-major"
-    )
+    off = SpyreKvPageOffloader(cache, "reject_generic", num_slots=1, layout_kind="token-major")
     shape = (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
     generic = torch.zeros(shape, dtype=DTYPE).to("spyre")
     with pytest.raises(RuntimeError, match="rank-4 device layout"):
@@ -232,9 +255,7 @@ def test_layouts_differ_despite_identical_page_bytes():
 def test_matching_signature_accepted(impl_cls, request):
     cache = _cache(impl_cls)
     kind = LAYOUT_KIND[impl_cls]
-    first = SpyreKvPageOffloader(
-        cache, request.node.name, num_slots=2, layout_kind=kind
-    )
+    first = SpyreKvPageOffloader(cache, request.node.name, num_slots=2, layout_kind=kind)
     second = SpyreKvPageOffloader(
         cache,
         request.node.name,

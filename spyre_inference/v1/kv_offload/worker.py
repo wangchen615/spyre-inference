@@ -37,13 +37,13 @@ hardware, with a rank-4 cache and a 4-slot pool:
 | input | `copy_tensor_raw` | `copy_kv_page_raw` |
 | --- | --- | --- |
 | block id past the end | **accepted silently** | `block_id 99 out of range [0, 8)` |
-| flattened `(N,-1)` view | **accepted silently** | `expected a rank-4 KV cache [N,X,Y,D], got rank 2` |
+| flattened `(N,-1)` view | **accepted silently** | `expected rank-4 KV cache, got rank 2` |
 | slot past the end | rejected | rejected |
 
 Both silent acceptances matter here. The connector hands vLLM *flattened*
 canonical tensors (`connector.py`), so a wiring mistake that reaches the DMA path
 with a canonical tensor instead of the physical one is exactly the rank-2 case --
-caught by `copy_kv_page_raw`, silently mis-transferred by `copy_tensor_raw`. And
+caught by `copy_kv_page_raw`, silently mistransferred by `copy_tensor_raw`. And
 device block ids arrive from the scheduler's block table, so an off-by-one there
 should fail loudly rather than move an arbitrary page.
 
@@ -140,9 +140,7 @@ class SpyreOffloadingWorker(OffloadingWorker):
             )
         ]
         # K + V per logical page.
-        self._bytes_per_block = 2 * sum(
-            offloader.page_size_bytes for offloader in self._offloaders
-        )
+        self._bytes_per_block = 2 * sum(offloader.page_size_bytes for offloader in self._offloaders)
         logger.info(
             "Spyre offloading worker: %d cache(s), %d host block(s), "
             "%d bytes per block, pools %s_c0..%s_c%d",
@@ -153,6 +151,14 @@ class SpyreOffloadingWorker(OffloadingWorker):
             pool_prefix,
             len(self._offloaders) - 1,
         )
+
+    def _validate_gpu_spec(self, gpu_spec: GPULoadStoreSpec) -> None:
+        group_sizes = getattr(gpu_spec, "group_sizes", None)
+        if group_sizes is not None and len(group_sizes) != 1:
+            raise NotImplementedError(
+                f"Spyre KV offloading supports a single KV cache group; got "
+                f"{len(group_sizes)} (hybrid/HMA models are out of scope for M1)"
+            )
 
     def _transfer(
         self, host_spec: LoadStoreSpec, gpu_spec: GPULoadStoreSpec, to_device: bool
@@ -167,12 +173,7 @@ class SpyreOffloadingWorker(OffloadingWorker):
         # this model's layers share, which is what the loop below assumes. With
         # several groups each group's slice applies to only its own layers, and
         # pairing them flat would offload the wrong pages -- silently.
-        group_sizes = getattr(gpu_spec, "group_sizes", None)
-        if group_sizes is not None and len(group_sizes) != 1:
-            raise NotImplementedError(
-                f"Spyre KV offloading supports a single KV cache group; got "
-                f"{len(group_sizes)} (hybrid/HMA models are out of scope for M1)"
-            )
+        self._validate_gpu_spec(gpu_spec)
 
         # Fence before reading device pages. Stores are deferred a step:
         # get_finished() -> prepare_store_kv() queues them, and they are issued
@@ -196,8 +197,7 @@ class SpyreOffloadingWorker(OffloadingWorker):
         for host_block in host_blocks:
             if not 0 <= host_block < self._num_host_blocks:
                 raise IndexError(
-                    f"host block {host_block} out of range "
-                    f"[0, {self._num_host_blocks})"
+                    f"host block {host_block} out of range [0, {self._num_host_blocks})"
                 )
 
         for offloader in self._offloaders:
@@ -247,9 +247,7 @@ class SpyreOffloadingWorker(OffloadingWorker):
         """Device -> host."""
         return self._run(job_id, dst_spec, src_spec, to_device=False)
 
-    def submit_load(
-        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
-    ) -> bool:
+    def submit_load(self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec) -> bool:
         """Host -> device."""
         return self._run(job_id, src_spec, dst_spec, to_device=True)
 

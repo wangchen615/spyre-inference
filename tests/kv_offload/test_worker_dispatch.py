@@ -93,9 +93,7 @@ def _worker(num_caches: int = NUM_CACHES) -> worker_mod.SpyreOffloadingWorker:
 
 
 def _gpu_spec(block_ids: list[int]) -> GPULoadStoreSpec:
-    return GPULoadStoreSpec(
-        block_ids, group_sizes=[len(block_ids)], block_indices=[0]
-    )
+    return GPULoadStoreSpec(block_ids, group_sizes=[len(block_ids)], block_indices=[0])
 
 
 def test_one_offloader_per_cache_named_by_cache_index(calls):
@@ -120,9 +118,7 @@ def test_store_issues_one_copy_per_cache_per_block_not_per_tensor(calls):
 
     assert len(calls) == 8
     assert {(name, blk, slot) for _, name, blk, slot in calls} == {
-        (f"{PREFIX}_c{c}", blk, slot)
-        for c in range(NUM_CACHES)
-        for blk, slot in ((1, 0), (2, 3))
+        (f"{PREFIX}_c{c}", blk, slot) for c in range(NUM_CACHES) for blk, slot in ((1, 0), (2, 3))
     }
     assert {kind for kind, *_ in calls} == {"offload"}
 
@@ -152,10 +148,7 @@ def test_block_count_mismatch_is_reported_as_a_failed_job(calls):
 
 def test_out_of_range_host_block_fails_before_issuing_any_copy(calls):
     worker = _worker()
-    assert (
-        worker.submit_store(4, _gpu_spec([0]), CPULoadStoreSpec([NUM_HOST_BLOCKS]))
-        is True
-    )
+    assert worker.submit_store(4, _gpu_spec([0]), CPULoadStoreSpec([NUM_HOST_BLOCKS])) is True
 
     assert calls == []
     (result,) = worker.get_finished()
@@ -223,6 +216,17 @@ def test_multiple_kv_groups_are_rejected(calls):
     assert calls == []
     (result,) = worker.get_finished()
     assert result.success is False
+
+
+def test_gpu_spec_validation_is_available_to_shared_workers(calls):
+    """The M2 subclass must reuse the exact M1 single-group validation."""
+    worker = _worker()
+    worker._validate_gpu_spec(_gpu_spec([1]))
+
+    with pytest.raises(NotImplementedError, match="single KV cache group"):
+        worker._validate_gpu_spec(
+            GPULoadStoreSpec([1, 2], group_sizes=[1, 1], block_indices=[0, 1])
+        )
 
 
 def test_zero_host_blocks_is_rejected_at_construction(calls):
