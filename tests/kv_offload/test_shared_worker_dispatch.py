@@ -199,6 +199,12 @@ class FakeDirectory:
 
     def publish(self, reservation, chunks):
         self.events.append(("publish", reservation.key.block_hash))
+        registered = next(
+            pool for pool in self.registered.values() if pool.pool_ref == reservation.slot.pool
+        )
+        slot_bytes = self.configs_by_name[registered.name].slot_bytes
+        if sum(chunk.size for chunk in chunks) > slot_bytes:
+            raise ValueError("chunk descriptor exceeds the claimed pool slot")
         entry = FakeLookupEntry(reservation.key, reservation.slot, tuple(chunks))
         self.entries[reservation.key.block_hash] = entry
 
@@ -404,7 +410,7 @@ def test_load_routes_only_through_the_selected_family(worker_directory_events):
     ]
 
 
-def test_store_synchronizes_all_copies_before_publishing_each_block(
+def test_store_synchronizes_complete_bundle_before_publishing_anchor_descriptor(
     worker_directory_events,
 ):
     worker, directory, events, _ = worker_directory_events
@@ -435,12 +441,7 @@ def test_store_synchronizes_all_copies_before_publishing_each_block(
         ("publish", 101),
         ("publish", 102),
     ]
-    assert directory.entries[101].chunks == (
-        FakeChunkDescriptorEntry(1, 100),
-        FakeChunkDescriptorEntry(2, 120),
-        FakeChunkDescriptorEntry(3, 200),
-        FakeChunkDescriptorEntry(4, 240),
-    )
+    assert directory.entries[101].chunks == (FakeChunkDescriptorEntry(1, 100),)
     [result] = worker.get_finished()
     assert result.success is True
     assert result.transfer_size == 2 * sum(PAGE_BYTES)

@@ -144,6 +144,12 @@ independently claimed. The anchor slot's read pin protects reuse of the whole
 family slot because every conforming writer obtains that slot exclusively
 through the anchor claim.
 
+The published Flex chunk descriptor describes only the claimed `c0.k` anchor
+slot, as required by `SharedMetadata`'s per-data-pool slot contract. The
+complete bundle geometry lives in the compatibility descriptor. Publication
+still gates the whole logical block: the worker copies and synchronizes every
+sibling K/V component before publishing the anchor reservation.
+
 The compatibility descriptor covers every fact needed to interpret the
 bundle:
 

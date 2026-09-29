@@ -626,6 +626,8 @@ git commit -s -m "Test shared offload miss recomputation"
 
 **Files:**
 - Create: `tests/kv_offload/test_shared_pool_round_trip.py`
+- Modify if the real integration exposes a shared-worker contract defect: `spyre_inference/v1/kv_offload/shared_worker.py`
+- Modify its mock-safe regression if needed: `tests/kv_offload/test_shared_worker_dispatch.py`
 - Modify only if the gate proves it necessary: `/home/yzhu/dt-inductor/flex/include/flex/runtime_stream/runtime_stream.hpp`
 - Modify only if the gate proves it necessary: `/home/yzhu/dt-inductor/flex/src/runtime_stream/runtime_stream.cpp`
 - Modify only if the gate proves it necessary: `/home/yzhu/dt-inductor/flex/tests/runtime_stream/stream/runtime_stream_copy_raw_test.cpp`
@@ -664,6 +666,12 @@ In torch-spyre `kvc-offload-m2`, preserve both public copy signatures. Add a spa
 - [ ] **Step 3: Write the shared-worker round-trip test**
 
 Create a unique metadata name and two-family configuration. Store a known nonzero device block through `SpyreSharedOffloadingWorker`, drain a successful result, attach a second shared worker to the same names, overwrite its destination device block, lookup and pin through a second manager, reload into that block, drain completion, release the pin, and compare every K/V component with `_assert_bit_exact`. Repeat for token-major and head-major layouts. Assert the stored and loaded `TransferResult.transfer_size` equals the complete logical block size and both times are positive.
+
+Flex's published chunk descriptor describes the claimed `c0.k` anchor slot,
+not the aggregate bytes in its sibling component pools. The worker must publish
+that anchor descriptor only after all K/V component copies synchronize; add a
+mock-safe regression that rejects an aggregate descriptor larger than the
+anchor slot.
 
 - [ ] **Step 4: Run the round trip serially**
 

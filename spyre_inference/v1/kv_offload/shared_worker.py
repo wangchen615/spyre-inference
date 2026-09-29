@@ -118,10 +118,11 @@ class SpyreSharedOffloadingWorker(SpyreOffloadingWorker):
                 family.slot_count, tuple(pools)
             )
 
-        self._chunk_descriptors = tuple(
-            self._runtime.ChunkDescriptorEntry(domain_id, page_bytes)
-            for cache_components in components
-            for _, page_bytes, domain_id in cache_components
+        # Flex's descriptor describes the claimed c0.k slot. Publishing it
+        # after the bundle-wide fence makes every sibling component visible.
+        _, anchor_page_bytes, anchor_domain_id = components[0][0]
+        self._anchor_chunk_descriptor = (
+            self._runtime.ChunkDescriptorEntry(anchor_domain_id, anchor_page_bytes),
         )
         self._bytes_per_block = sum(
             page_bytes for cache_components in components for _, page_bytes, _ in cache_components
@@ -190,7 +191,7 @@ class SpyreSharedOffloadingWorker(SpyreOffloadingWorker):
             if not to_device:
                 for transfer in transfers:
                     reservation = transfer.reservation
-                    self._directory.publish(reservation, self._chunk_descriptors)
+                    self._directory.publish(reservation, self._anchor_chunk_descriptor)
                     unpublished.remove(reservation)
                     published.append(reservation)
         except Exception:
