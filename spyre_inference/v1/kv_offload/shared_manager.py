@@ -318,6 +318,10 @@ class SpyreSharedOffloadingManager(CPUOffloadingManager):
 
     @override
     def reset_cache(self) -> None:
+        for state in self._request_states:
+            state.pending_pins.clear()
+            state.active_pins.clear()
+        self._request_states.clear()
         if self._directory is not None:
             for entry in self._owned_entries.values():
                 self._directory.evict(entry)
@@ -325,8 +329,4 @@ class SpyreSharedOffloadingManager(CPUOffloadingManager):
                 self._directory.abort(reservation)
         self._owned_entries.clear()
         self._pending_reservations.clear()
-        for state in self._request_states:
-            state.pending_pins.clear()
-            state.active_pins.clear()
-        self._request_states.clear()
         super().reset_cache()

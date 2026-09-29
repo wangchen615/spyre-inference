@@ -520,3 +520,28 @@ def test_reset_releases_only_state_owned_by_this_manager():
     assert directory.entries[peer_entry.key.block_hash] is peer_entry
     assert peer_entry.pin.released is True
     assert manager._policy.get(OFFLOAD_KEY) is None
+
+
+def test_reset_releases_active_pin_before_evicting_owned_entry():
+    manager, directory, _ = _manager_directory_runtime()
+    ctx = ReqContext("request-1")
+    store = manager.prepare_store([OFFLOAD_KEY], ctx)
+    assert store is not None
+    _publish_store(directory, store)
+    owned_entry = directory.entries[shared_block_hash(OFFLOAD_KEY)]
+    manager.complete_store(store.keys_to_store, ctx)
+    assert manager.lookup(OFFLOAD_KEY, ctx) is LookupResult.HIT
+    manager.prepare_load([OFFLOAD_KEY], ctx)
+    assert owned_entry.pin.released is False
+
+    evict = directory.evict
+
+    def evict_after_pin_release(entry):
+        assert entry.pin.released is True
+        return evict(entry)
+
+    directory.evict = evict_after_pin_release
+
+    manager.reset_cache()
+
+    assert manager._request_states == []
