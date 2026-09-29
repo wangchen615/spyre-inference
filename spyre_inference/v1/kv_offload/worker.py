@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OffloadingWorker that moves Spyre KV pages to and from shared host memory.
+"""OffloadingWorker that moves Spyre KV pages to and from a shared slot pool.
+
+The pool is host memory or a Marvell BAR2 window, chosen by the spec's
+`pool_backend` and handed in as one pool factory per cache; this worker and
+the offloaders below it are otherwise identical for both tiers.
 
 The job/result skeleton (`submit_store`/`submit_load`/`_run`/`get_finished`/
 `wait`, synchronous completion, per-job exception capture) follows the draft in
@@ -53,7 +57,9 @@ correct if a future layout makes logical page order differ from physical.
 
 ## Slot indexing
 
-One `SpyreKvPageOffloader` -- hence one `SharedHostPool` -- per physical cache:
+One `SpyreKvPageOffloader` -- hence one pool (`SharedHostPool` or, for the
+Marvell tier, `SharedMarvellPool` over that cache's own BAR2 window) -- per
+physical cache:
 
     (cache c, host block h) -> offloaders[c].offload(block_id=dev_blk, slot=h)
                                 -> pool "{prefix}_c{c}", slot 2h   (K)
@@ -90,6 +96,7 @@ rather than silently offloading a hybrid model's layers against the wrong blocks
 """
 
 import time
+from collections.abc import Sequence
 
 import torch
 from vllm.logger import init_logger
@@ -101,7 +108,10 @@ from vllm.v1.kv_offload.base import (
 )
 
 from spyre_inference.v1.kv_offload.connector import SpyrePhysicalCaches
-from spyre_inference.v1.worker.spyre_kv_offload import SpyreKvPageOffloader
+from spyre_inference.v1.worker.spyre_kv_offload import (
+    PoolFactory,
+    SpyreKvPageOffloader,
+)
 
 logger = init_logger(__name__)
 
@@ -118,37 +128,51 @@ class SpyreOffloadingWorker(OffloadingWorker):
         physical: SpyrePhysicalCaches,
         num_host_blocks: int,
         pool_prefix: str,
+        pool_factories: Sequence[PoolFactory | None] | None = None,
     ) -> None:
         if num_host_blocks <= 0:
             raise ValueError(f"num_host_blocks must be positive, got {num_host_blocks}")
+        num_caches = len(physical.caches)
+        if pool_factories is None:
+            # None per cache -> SpyreKvPageOffloader's default, the host pool.
+            pool_factories = [None] * num_caches
+        if len(pool_factories) != num_caches:
+            raise ValueError(f"{len(pool_factories)} pool factories for {num_caches} cache(s)")
 
         self._finished_jobs: list[TransferResult] = []
         self._physical = physical
         self._num_host_blocks = num_host_blocks
 
         # One offloader per physical cache. Constructed eagerly so a geometry or
-        # shared-memory problem surfaces at registration, not mid-serve.
-        self._offloaders: list[SpyreKvPageOffloader] = [
-            SpyreKvPageOffloader(
-                cache=cache,
-                pool_name=f"{pool_prefix}_c{cache_idx}",
-                num_slots=num_host_blocks,
-                layout_kind=layout_kind,
-            )
-            for cache_idx, (cache, layout_kind) in enumerate(
-                zip(physical.caches, physical.layout_kinds, strict=True)
-            )
-        ]
+        # shared-memory problem surfaces at registration, not mid-serve. If one
+        # fails, the pools already created are released so a failed start does
+        # not leave segments behind.
+        self._offloaders: list[SpyreKvPageOffloader] = []
+        try:
+            for cache_idx, (cache, layout_kind, factory) in enumerate(
+                zip(physical.caches, physical.layout_kinds, pool_factories, strict=True)
+            ):
+                self._offloaders.append(
+                    SpyreKvPageOffloader(
+                        cache=cache,
+                        pool_name=f"{pool_prefix}_c{cache_idx}",
+                        num_slots=num_host_blocks,
+                        layout_kind=layout_kind,
+                        pool_factory=factory,
+                    )
+                )
+        except BaseException:
+            self.shutdown()
+            raise
         # K + V per logical page.
-        self._bytes_per_block = 2 * sum(
-            offloader.page_size_bytes for offloader in self._offloaders
-        )
+        self._bytes_per_block = 2 * sum(offloader.page_size_bytes for offloader in self._offloaders)
         logger.info(
-            "Spyre offloading worker: %d cache(s), %d host block(s), "
-            "%d bytes per block, pools %s_c0..%s_c%d",
+            "Spyre offloading worker: %d cache(s), %d offload block(s), "
+            "%d bytes per block, %s pools %s_c0..%s_c%d",
             len(self._offloaders),
             num_host_blocks,
             self._bytes_per_block,
+            getattr(self._offloaders[0], "backend", "?") if self._offloaders else "?",
             pool_prefix,
             pool_prefix,
             len(self._offloaders) - 1,
@@ -196,8 +220,7 @@ class SpyreOffloadingWorker(OffloadingWorker):
         for host_block in host_blocks:
             if not 0 <= host_block < self._num_host_blocks:
                 raise IndexError(
-                    f"host block {host_block} out of range "
-                    f"[0, {self._num_host_blocks})"
+                    f"host block {host_block} out of range [0, {self._num_host_blocks})"
                 )
 
         for offloader in self._offloaders:
@@ -247,9 +270,7 @@ class SpyreOffloadingWorker(OffloadingWorker):
         """Device -> host."""
         return self._run(job_id, dst_spec, src_spec, to_device=False)
 
-    def submit_load(
-        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
-    ) -> bool:
+    def submit_load(self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec) -> bool:
         """Host -> device."""
         return self._run(job_id, src_spec, dst_spec, to_device=True)
 
@@ -261,3 +282,25 @@ class SpyreOffloadingWorker(OffloadingWorker):
 
     def wait(self, job_ids: set[int]) -> None:
         """No-op: transfers complete synchronously before `submit_*` returns."""
+
+    def shutdown(self) -> None:
+        """Release every pool this worker attached. Idempotent.
+
+        Reached from vLLM's orderly shutdown (`OffloadingConnector.shutdown` ->
+        `OffloadingConnectorWorker.shutdown` -> here). Dropping the last flex
+        handle for a name unlinks it: the whole segment for a host pool, the
+        `.ctl` control segment for a Marvell pool. A crash or SIGKILL skips
+        this, and the attach refcount is stranded exactly as in M1; see
+        `reclaim_shm_pools.sh`.
+        """
+        for offloader in getattr(self, "_offloaders", []):
+            release = getattr(offloader, "release", None)
+            if release is None:
+                continue
+            try:
+                release()
+            except Exception:  # noqa: BLE001 - release the rest regardless
+                logger.exception(
+                    "Spyre KV offload: releasing pool %s failed",
+                    getattr(offloader, "pool_name", "?"),
+                )

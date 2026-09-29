@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre-specific KV page offload between device pages and shared host memory.
+"""Spyre-specific KV page offload between device pages and a shared slot pool.
+
+The pool is either host memory (`SharedHostPool`, POSIX shared memory pinned
+through the IOMMU) or a window of a Marvell card's BAR2 (`SharedMarvellPool`,
+peer-to-peer DMA that never touches host DRAM). Both are `flex::SharedPool`s and
+`copy_kv_page_raw` takes either, so nothing below the pool factory knows which
+tier it is driving.
 
 Why this is Spyre-specific rather than the generic vLLM offload path:
 
@@ -40,7 +46,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -57,12 +64,97 @@ def _import_runtime():
     hosts without a built torch_spyre extension.
     """
     from torch_spyre._C import (  # ty: ignore[unresolved-import]
-        SharedHostPool,
         copy_kv_page_raw,
         get_composite_address,
     )
 
-    return SharedHostPool, copy_kv_page_raw, get_composite_address
+    return copy_kv_page_raw, get_composite_address
+
+
+def _synchronize() -> None:
+    torch.spyre.synchronize()
+
+
+def _pool_class(name: str):
+    """`torch_spyre._C.<name>` (SharedHostPool / SharedMarvellPool), lazily."""
+    import torch_spyre._C as _C  # ty: ignore[unresolved-import]
+
+    return getattr(_C, name)
+
+
+# flex's DEVICE_ALIGNMENT (device_memory_addressing.hpp). SharedMarvellPool
+# rounds each slot up to it and requires bar_offset to be a multiple of it.
+DEVICE_ALIGNMENT = 128
+
+
+# (name, num_slots, slot_bytes) -> a flex SharedPool handle. `num_slots` is the
+# *physical* slot count (K and V each take one); the offloader doubles it.
+PoolFactory = Callable[[str, int, int], Any]
+
+
+class HostPoolFactory:
+    """Creates (or attaches to) a `SharedHostPool` -- the M1 host-DRAM tier."""
+
+    backend = "host"
+
+    def __call__(self, name: str, num_slots: int, slot_bytes: int):
+        return _pool_class("SharedHostPool").create_or_attach(
+            name, num_slots=num_slots, slot_bytes=slot_bytes
+        )
+
+    @staticmethod
+    def unlink_by_name(name: str) -> None:
+        _pool_class("SharedHostPool").unlink_by_name(name)
+
+    def __repr__(self) -> str:
+        return "HostPoolFactory()"
+
+
+@dataclasses.dataclass(frozen=True)
+class MarvellPoolFactory:
+    """Creates (or attaches to) a `SharedMarvellPool` over one BAR2 window.
+
+    flex does not detect overlapping windows of two differently named pools --
+    they silently share bytes -- so the window is assigned by the caller
+    (`SpyreOffloadingSpec`) and checked here once more against what flex
+    actually allocated: if flex's slot rounding ever diverges from the spec's
+    `marvell_window_bytes`, the pool would spill into the next cache's window,
+    and that is refused rather than served.
+    """
+
+    pci_bdf: str
+    bar_offset: int
+    # Bytes reserved for this pool starting at bar_offset; 0 means unchecked.
+    window_bytes: int = 0
+
+    backend = "marvell"
+
+    def __post_init__(self) -> None:
+        if not self.pci_bdf:
+            raise ValueError("MarvellPoolFactory needs a PCI BDF")
+        if self.bar_offset < 0 or self.bar_offset % DEVICE_ALIGNMENT:
+            raise ValueError(
+                f"bar_offset {self.bar_offset} must be a non-negative multiple of "
+                f"{DEVICE_ALIGNMENT}"
+            )
+
+    def __call__(self, name: str, num_slots: int, slot_bytes: int):
+        pool = _pool_class("SharedMarvellPool").create_or_attach(
+            name, self.pci_bdf, num_slots, slot_bytes, self.bar_offset
+        )
+        total = int(pool.total_bytes())
+        if self.window_bytes and total > self.window_bytes:
+            del pool
+            raise ValueError(
+                f"SharedMarvellPool {name!r} occupies {total} B but its BAR2 window "
+                f"at offset {self.bar_offset} is only {self.window_bytes} B; it "
+                f"would overlap the next window"
+            )
+        return pool
+
+    @staticmethod
+    def unlink_by_name(name: str) -> None:
+        _pool_class("SharedMarvellPool").unlink_by_name(name)
 
 
 def k_slot(slot: int) -> int:
@@ -81,7 +173,7 @@ def page_bytes(cache: SpyrePagedKVCache) -> int:
     Read from the device allocation rather than computed from the logical
     shape: the two differ whenever `head_size` is not a whole number of sticks.
     """
-    _, _, get_composite_address = _import_runtime()
+    _, get_composite_address = _import_runtime()
     k_pages = cache[0]
     num_blocks = k_pages.shape[0]
     total = get_composite_address(k_pages).total_size
@@ -146,9 +238,7 @@ def page_signature(cache: SpyrePagedKVCache, layout_kind: str) -> PageSignature:
     but reported as nonsense.
     """
     if layout_kind not in ("token-major", "head-major"):
-        raise ValueError(
-            f"layout_kind must be 'token-major' or 'head-major', got {layout_kind!r}"
-        )
+        raise ValueError(f"layout_kind must be 'token-major' or 'head-major', got {layout_kind!r}")
 
     k_pages = cache[0]
     num_blocks, dim1, dim2, head_size = (int(d) for d in k_pages.shape)
@@ -168,11 +258,14 @@ def page_signature(cache: SpyrePagedKVCache, layout_kind: str) -> PageSignature:
 
 
 class SpyreKvPageOffloader:
-    """Moves whole K/V page pairs between Spyre pages and one shared host pool.
+    """Moves whole K/V page pairs between Spyre pages and one shared slot pool.
 
     One offloader serves one layer's cache. `num_slots` is the number of
     *logical* pages the pool holds; the pool itself is created with twice that
     many slots so K and V each get their own.
+
+    The pool comes from `pool_factory` (default: host memory, as in M1), which
+    is how the Marvell tier is selected without this class knowing about it.
     """
 
     def __init__(
@@ -182,8 +275,9 @@ class SpyreKvPageOffloader:
         num_slots: int,
         layout_kind: str,
         expect_signature: PageSignature | None = None,
+        pool_factory: PoolFactory | None = None,
     ) -> None:
-        SharedHostPool, copy_kv_page_raw, _ = _import_runtime()
+        copy_kv_page_raw, _ = _import_runtime()
         self._copy = copy_kv_page_raw
         self._cache = cache
         self._signature = page_signature(cache, layout_kind)
@@ -199,20 +293,60 @@ class SpyreKvPageOffloader:
             )
         self._page_bytes = self._signature.page_bytes
         self._num_slots = num_slots
+        self._pool_name = pool_name
+        self._pool_factory = pool_factory or HostPoolFactory()
         # Two host slots per logical page: one for K, one for V.
-        self._pool = SharedHostPool.create_or_attach(
-            pool_name, num_slots=2 * num_slots, slot_bytes=self._page_bytes
-        )
+        self._pool = self._pool_factory(pool_name, 2 * num_slots, self._page_bytes)
+        # A pool attached by name keeps the geometry its creator chose; flex
+        # rejects a mismatch, but pin it here too so a factory that ignored its
+        # arguments cannot hand back a pool whose slots are too small.
+        if int(self._pool.slot_count()) != 2 * num_slots or (
+            int(self._pool.slot_bytes()) < self._page_bytes
+        ):
+            got = (int(self._pool.slot_count()), int(self._pool.slot_bytes()))
+            self._pool = None
+            raise ValueError(
+                f"pool {pool_name!r} has {got[0]} slots of {got[1]} B; this cache "
+                f"needs {2 * num_slots} slots of >= {self._page_bytes} B"
+            )
         logger.debug(
-            "SpyreKvPageOffloader(%s): %d logical slots, %s",
+            "SpyreKvPageOffloader(%s, %r): %d logical slots, %s",
             pool_name,
+            self._pool_factory,
             num_slots,
             self._signature.describe(),
         )
 
     @property
     def pool(self):
+        if self._pool is None:
+            raise RuntimeError(f"pool {self._pool_name!r} has been released")
         return self._pool
+
+    @property
+    def pool_name(self) -> str:
+        return self._pool_name
+
+    @property
+    def backend(self) -> str:
+        return getattr(self._pool_factory, "backend", "custom")
+
+    def release(self) -> None:
+        """Drop this process's attach on the pool.
+
+        Destroying the last flex handle for a name unlinks it (the whole host
+        segment for SharedHostPool, the `.ctl` control segment for
+        SharedMarvellPool). Doing it explicitly on shutdown, rather than relying
+        on interpreter teardown to run the pybind destructor, is what makes an
+        orderly exit leave nothing behind in /dev/shm. This releases the attach
+        refcount rather than calling `unlink_by_name`, which would ignore other
+        processes still attached. Idempotent.
+        """
+        if self._pool is None:
+            return
+        # Nothing may still be in flight against the slots being released.
+        _synchronize()
+        self._pool = None
 
     @property
     def page_size_bytes(self) -> int:
@@ -234,9 +368,10 @@ class SpyreKvPageOffloader:
     def offload(self, block_id: int, slot: int, non_blocking: bool = False) -> None:
         """Copy device page `block_id` (K and V) out to host slot `slot`."""
         self._check_slot(slot)
+        pool = self.pool
         k_pages, v_pages = self._cache
-        self._copy(k_pages, block_id, self._pool, k_slot(slot), False, non_blocking)
-        self._copy(v_pages, block_id, self._pool, v_slot(slot), False, non_blocking)
+        self._copy(k_pages, block_id, pool, k_slot(slot), False, non_blocking)
+        self._copy(v_pages, block_id, pool, v_slot(slot), False, non_blocking)
 
     def reload(self, slot: int, block_id: int, non_blocking: bool = False) -> None:
         """Copy host slot `slot` back into device page `block_id`.
@@ -245,9 +380,10 @@ class SpyreKvPageOffloader:
         position-independent, so a restore may relocate it.
         """
         self._check_slot(slot)
+        pool = self.pool
         k_pages, v_pages = self._cache
-        self._copy(k_pages, block_id, self._pool, k_slot(slot), True, non_blocking)
-        self._copy(v_pages, block_id, self._pool, v_slot(slot), True, non_blocking)
+        self._copy(k_pages, block_id, pool, k_slot(slot), True, non_blocking)
+        self._copy(v_pages, block_id, pool, v_slot(slot), True, non_blocking)
 
     def offload_many(self, pairs: list[tuple[int, int]], non_blocking: bool = False) -> None:
         """Offload several `(block_id, slot)` pairs.

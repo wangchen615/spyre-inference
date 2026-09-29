@@ -43,7 +43,7 @@ PREFIX = "test_pool"
 class _RecordingOffloader:
     """Stands in for SpyreKvPageOffloader, recording calls on a shared list."""
 
-    def __init__(self, calls, *, cache, pool_name, num_slots, layout_kind):
+    def __init__(self, calls, *, cache, pool_name, num_slots, layout_kind, pool_factory=None):
         self._calls = calls
         self.pool_name = pool_name
         self.num_slots = num_slots
@@ -62,7 +62,7 @@ def calls(monkeypatch):
     """Patch the offloader class; yield the list every instance records into."""
     recorded: list[tuple] = []
 
-    def factory(*, cache, pool_name, num_slots, layout_kind):
+    def factory(*, cache, pool_name, num_slots, layout_kind, pool_factory=None):
         return _RecordingOffloader(
             recorded,
             cache=cache,
@@ -93,9 +93,7 @@ def _worker(num_caches: int = NUM_CACHES) -> worker_mod.SpyreOffloadingWorker:
 
 
 def _gpu_spec(block_ids: list[int]) -> GPULoadStoreSpec:
-    return GPULoadStoreSpec(
-        block_ids, group_sizes=[len(block_ids)], block_indices=[0]
-    )
+    return GPULoadStoreSpec(block_ids, group_sizes=[len(block_ids)], block_indices=[0])
 
 
 def test_one_offloader_per_cache_named_by_cache_index(calls):
@@ -120,9 +118,7 @@ def test_store_issues_one_copy_per_cache_per_block_not_per_tensor(calls):
 
     assert len(calls) == 8
     assert {(name, blk, slot) for _, name, blk, slot in calls} == {
-        (f"{PREFIX}_c{c}", blk, slot)
-        for c in range(NUM_CACHES)
-        for blk, slot in ((1, 0), (2, 3))
+        (f"{PREFIX}_c{c}", blk, slot) for c in range(NUM_CACHES) for blk, slot in ((1, 0), (2, 3))
     }
     assert {kind for kind, *_ in calls} == {"offload"}
 
@@ -152,10 +148,7 @@ def test_block_count_mismatch_is_reported_as_a_failed_job(calls):
 
 def test_out_of_range_host_block_fails_before_issuing_any_copy(calls):
     worker = _worker()
-    assert (
-        worker.submit_store(4, _gpu_spec([0]), CPULoadStoreSpec([NUM_HOST_BLOCKS]))
-        is True
-    )
+    assert worker.submit_store(4, _gpu_spec([0]), CPULoadStoreSpec([NUM_HOST_BLOCKS])) is True
 
     assert calls == []
     (result,) = worker.get_finished()
