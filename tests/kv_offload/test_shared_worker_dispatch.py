@@ -170,6 +170,7 @@ class FakeDirectory:
         self.events = events
         self.config = None
         self.configs = []
+        self.configs_by_name = {}
         self.registered = {}
         self.resolved = {}
         self.entries = {}
@@ -177,11 +178,16 @@ class FakeDirectory:
 
     def register_or_attach_pool(self, config):
         self.configs.append(config)
+        if config.name in self.registered:
+            if config != self.configs_by_name[config.name]:
+                raise ValueError(f"shared pool {config.name!r} configuration mismatch")
+            return self.registered[config.name]
         registered = FakeRegisteredPool(
             FakePoolRef(1, len(self.configs), 1),
             SimpleNamespace(metadata_version=1, compatibility_id=1),
             config.name,
         )
+        self.configs_by_name[config.name] = config
         self.registered[config.name] = registered
         self.resolved[registered.pool_ref] = FakePool(config.name)
         return registered
@@ -241,7 +247,7 @@ def _runtime(directory, addresses, events):
     )
 
 
-def _make_worker(monkeypatch, *, addresses=None, directory=None):
+def _make_worker(monkeypatch, *, addresses=None, directory=None, compatibility_digest=DIGEST):
     events = []
     tensors = tuple(FakeTensor(name) for name in ("k0", "v0", "k1", "v1"))
     if addresses is None:
@@ -275,7 +281,7 @@ def _make_worker(monkeypatch, *, addresses=None, directory=None):
         physical=physical,
         metadata_name="shared-meta",
         families=(SharedPoolFamily("alpha", 3), SharedPoolFamily("beta", 2)),
-        compatibility_digest=DIGEST,
+        compatibility_digest=compatibility_digest,
         max_components=4,
         runtime_loader=lambda: runtime,
     )
@@ -338,6 +344,29 @@ def test_rejects_a_registered_pool_that_cannot_be_resolved(monkeypatch):
 
     with pytest.raises(RuntimeError, match="could not be resolved"):
         _make_worker(monkeypatch, directory=directory)
+
+
+def test_pool_registration_rejects_mismatched_page_geometry(monkeypatch):
+    _, directory, _, _ = _make_worker(monkeypatch)
+    addresses = {
+        name: FakeAddress(index + 1, PAGE_BYTES[index] * 4)
+        for index, name in enumerate(("k0", "v0", "k1", "v1"))
+    }
+    addresses["k0"] = FakeAddress(1, (PAGE_BYTES[0] + 1) * 4)
+
+    with pytest.raises(ValueError, match="configuration mismatch"):
+        _make_worker(monkeypatch, addresses=addresses, directory=directory)
+
+
+def test_pool_registration_rejects_mismatched_compatibility(monkeypatch):
+    _, directory, _, _ = _make_worker(monkeypatch)
+
+    with pytest.raises(ValueError, match="configuration mismatch"):
+        _make_worker(
+            monkeypatch,
+            directory=directory,
+            compatibility_digest=bytes(reversed(DIGEST)),
+        )
 
 
 def test_store_routes_every_component_through_the_selected_family(

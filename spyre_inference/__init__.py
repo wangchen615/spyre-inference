@@ -18,6 +18,8 @@ import os
 from logging.config import dictConfig
 from typing import Any
 
+from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+
 # Defer torch_spyre's autoload until we explicitly trigger it inside
 # `TorchSpyreWorker.init_device`. Autoload loads `libspyre_comms.so`,
 # which captures `RANK`/`WORLD_SIZE`/`LOCAL_RANK`/`LOCAL_WORLD_SIZE`
@@ -90,3 +92,9 @@ def _init_logging():
 
 
 _init_logging()
+
+OffloadingSpecFactory.register_spec(
+    "SpyreSharedOffloadingSpec",
+    "spyre_inference.v1.kv_offload.shared_spec",
+    "SpyreSharedOffloadingSpec",
+)

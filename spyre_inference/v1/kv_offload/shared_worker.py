@@ -27,13 +27,12 @@ from vllm.v1.kv_offload.base import GPULoadStoreSpec, LoadStoreSpec
 from spyre_inference.v1.kv_offload.connector import SpyrePhysicalCaches
 from spyre_inference.v1.kv_offload.shared_runtime import load_shared_runtime
 from spyre_inference.v1.kv_offload.shared_types import (
+    COMPATIBILITY_FORMAT_VERSION,
     SharedLoadStoreSpec,
     SharedPoolFamily,
 )
 from spyre_inference.v1.kv_offload.worker import SpyreOffloadingWorker
 from spyre_inference.v1.worker.spyre_kv_offload import copy_kv_page_pair
-
-COMPATIBILITY_FORMAT_VERSION = 1
 
 
 @dataclass(frozen=True)

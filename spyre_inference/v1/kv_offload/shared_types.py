@@ -22,6 +22,8 @@ from dataclasses import dataclass
 
 from vllm.v1.kv_offload.base import LoadStoreSpec, OffloadKey
 
+COMPATIBILITY_FORMAT_VERSION = 1
+
 
 @dataclass(frozen=True)
 class SharedPoolFamily:
