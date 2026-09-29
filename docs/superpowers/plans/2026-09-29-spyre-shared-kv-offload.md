@@ -61,6 +61,7 @@
 ### Task 1: Extract M1-Preserving Construction and Copy Seams
 
 **Files:**
+
 - Modify: `spyre_inference/v1/kv_offload/spec.py:151-224`
 - Modify: `spyre_inference/v1/kv_offload/connector.py:322-350`
 - Modify: `spyre_inference/v1/kv_offload/worker.py:115-172`
@@ -70,6 +71,7 @@
 - Modify: `tests/kv_offload/test_worker_dispatch.py`
 
 **Interfaces:**
+
 - Consumes: existing `SpyrePhysicalCaches`, `CPUOffloadingManager`, `SpyreOffloadingWorker`, and `copy_kv_page_raw` contracts.
 - Produces: `SpyreOffloadingSpec.bind_vllm_config(vllm_config)`, `_create_manager()`, `_create_worker(physical)`, `SpyreOffloadingWorker._validate_gpu_spec(gpu_spec)`, and `copy_kv_page_pair(copy_fn, cache, block_id, k_pool, k_slot_id, v_pool, v_slot_id, to_device, non_blocking=False)`.
 
@@ -171,11 +173,13 @@ If `ty` alone reports the repository's existing unavailable local torch-spyre im
 ### Task 2: Define Runtime-Neutral Shared Transfer Contracts
 
 **Files:**
+
 - Create: `spyre_inference/v1/kv_offload/shared_types.py`
 - Create: `spyre_inference/v1/kv_offload/shared_runtime.py`
 - Create: `tests/kv_offload/test_shared_types.py`
 
 **Interfaces:**
+
 - Consumes: `vllm.v1.kv_offload.base.OffloadKey` and `LoadStoreSpec`.
 - Produces: `SharedPoolFamily`, `SharedLocation`, `SharedTransfer`, `SharedLoadStoreSpec`, `allocate_family_slots`, `shared_block_hash`, and `load_shared_runtime()`.
 
@@ -280,10 +284,12 @@ Expected: the pure tests pass without importing or initializing torch-spyre.
 ### Task 3: Integrate Upstream Cache Policy with the Shared Directory
 
 **Files:**
+
 - Create: `spyre_inference/v1/kv_offload/shared_manager.py`
 - Create: `tests/kv_offload/test_shared_manager.py`
 
 **Interfaces:**
+
 - Consumes: `SharedPoolFamily`, `SharedLocation`, `SharedTransfer`, `SharedLoadStoreSpec`, `shared_block_hash`, and the torch-spyre objects returned by `load_shared_runtime()`.
 - Produces: `SpyreSharedOffloadingManager(CPUOffloadingManager)` with the unchanged upstream `OffloadingManager` public methods.
 
@@ -416,10 +422,12 @@ Expected: all manager tests pass without a Spyre device or real shared memory.
 ### Task 4: Register Pool Families and Transfer Complete Logical Blocks
 
 **Files:**
+
 - Create: `spyre_inference/v1/kv_offload/shared_worker.py`
 - Create: `tests/kv_offload/test_shared_worker_dispatch.py`
 
 **Interfaces:**
+
 - Consumes: `SpyreOffloadingWorker._run()`, `_validate_gpu_spec()`, `copy_kv_page_pair()`, `SharedLoadStoreSpec`, and the torch-spyre M2 directory/pool API.
 - Produces: `SpyreSharedOffloadingWorker(SpyreOffloadingWorker)` with inherited `submit_store`, `submit_load`, `get_finished`, and `wait` behavior.
 
@@ -489,12 +497,14 @@ git commit -s -m "Add shared KV offload worker"
 ### Task 5: Build and Lazily Register `SpyreSharedOffloadingSpec`
 
 **Files:**
+
 - Create: `spyre_inference/v1/kv_offload/shared_spec.py`
 - Modify: `spyre_inference/__init__.py:92`
 - Create: `tests/kv_offload/test_shared_spec.py`
 - Modify: `tests/kv_offload/test_spec.py`
 
 **Interfaces:**
+
 - Consumes: M1 construction hooks, `SpyreSharedOffloadingManager`, `SpyreSharedOffloadingWorker`, `allocate_family_slots`, page signatures, and full `VllmConfig` from the connector.
 - Produces: `SpyreSharedOffloadingSpec(SpyreOffloadingSpec)` resolvable by `spec_name="SpyreSharedOffloadingSpec"` without `spec_module_path`.
 
@@ -579,10 +589,12 @@ git commit -s -m "Register shared Spyre offloading spec"
 ### Task 6: Prove Shared Misses Fall Back to Recompute
 
 **Files:**
+
 - Create: `tests/kv_offload/test_connector_miss_recompute.py`
 - Modify only if the test exposes an integration defect: `spyre_inference/v1/kv_offload/shared_manager.py`
 
 **Interfaces:**
+
 - Consumes: `SpyreSharedOffloadingManager.lookup()` and upstream `OffloadingConnectorScheduler._maximal_prefix_lookup()` / `update_state_after_alloc()` behavior.
 - Produces: a connector-level regression proving an M2 miss schedules zero externally loaded tokens and no H2D job.
 
@@ -625,6 +637,7 @@ git commit -s -m "Test shared offload miss recomputation"
 ### Task 7: Run the Single-Chunk Gate and Shared-Pool Hardware Round Trip
 
 **Files:**
+
 - Create: `tests/kv_offload/test_shared_pool_round_trip.py`
 - Modify if the real integration exposes a shared-worker contract defect: `spyre_inference/v1/kv_offload/shared_worker.py`
 - Modify its mock-safe regression if needed: `tests/kv_offload/test_shared_worker_dispatch.py`
@@ -634,6 +647,7 @@ git commit -s -m "Test shared offload miss recomputation"
 - Modify only if the gate proves it necessary: `/home/yzhu/dt-inductor/torch-spyre/.worktrees/kvc-offload-m2/tests/distributed/test_kv_offload_distributed.py`
 
 **Interfaces:**
+
 - Consumes: real Spyre `get_composite_address`, shared directory bindings, shared worker, and the existing bit-exact helpers in `tests/kv_offload/hw_helpers.py`.
 - Produces: a bit-exact connector-level shared-slot round trip, or hard evidence that M2-F3 must be implemented first.
 
@@ -692,10 +706,12 @@ git commit -s -m "Test shared KV pool round trip"
 ### Task 8: Add the Two-Instance Functional Acceptance and A/B Timing
 
 **Files:**
+
 - Create: `tests/kv_offload/test_cross_instance.py`
 - Create after a successful run: `docs/superpowers/results/2026-09-29-spyre-shared-kv-offload.md`
 
 **Interfaces:**
+
 - Consumes: `vllm serve`, `SpyreOffloadingConnector`, lazy `SpyreSharedOffloadingSpec`, two distinct Spyre cards, Prometheus offload counters, and the OpenAI-compatible completions endpoint.
 - Produces: an opt-in two-process test plus recorded A self-reload and B peer-reload duration/throughput.
 
@@ -782,9 +798,11 @@ git commit -s -m "Test cross-instance shared KV reload"
 ### Task 9: Run the Full M1/M2 Regression Gate
 
 **Files:**
+
 - Verify: all changed files on `kvc-offload-m2`
 
 **Interfaces:**
+
 - Consumes: every deliverable from Tasks 1-8.
 - Produces: final evidence that M2 works and M1 remains unchanged.
 

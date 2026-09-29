@@ -51,9 +51,7 @@ HALF_PAGE = BLOCK_SIZE * NUM_KV_HEADS * HEAD_SIZE * 2
 
 
 def _pages() -> torch.Tensor:
-    return torch.zeros(
-        (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), dtype=DTYPE
-    )
+    return torch.zeros((NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), dtype=DTYPE)
 
 
 def _cache() -> tuple[torch.Tensor, torch.Tensor]:
@@ -74,11 +72,7 @@ def _kv_cache_config(layer_names: list[str], spec=None) -> KVCacheConfig:
     return KVCacheConfig(
         num_blocks=NUM_BLOCKS,
         kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                layer_names=layer_names, kv_cache_spec=spec or _spec()
-            )
-        ],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec or _spec())],
     )
 
 
@@ -116,9 +110,7 @@ def test_layers_sharing_one_allocation_collapse_to_one_cache():
     its own DMA for bytes already moved.
     """
     shared = _cache()
-    canonical, physical = _canonicalize(
-        {"layer.0": shared, "layer.1": shared, "layer.2": _cache()}
-    )
+    canonical, physical = _canonicalize({"layer.0": shared, "layer.1": shared, "layer.2": _cache()})
 
     assert len(physical.caches) == 2
     assert len(canonical.tensors) == 4
@@ -144,9 +136,7 @@ def test_head_major_layout_is_recorded():
     Both layouts fold logical dim 1 into device dim 0, so shape alone cannot tell
     them apart; guessing would transpose block_size against num_kv_heads.
     """
-    _, physical = _canonicalize(
-        {"layer.0": _cache()}, layouts={"layer.0": HEAD_MAJOR}
-    )
+    _, physical = _canonicalize({"layer.0": _cache()}, layouts={"layer.0": HEAD_MAJOR})
     assert physical.layout_kinds == (HEAD_MAJOR,)
 
 
@@ -188,9 +178,7 @@ def test_non_tuple_cache_is_rejected():
 
 def test_mismatched_k_and_v_pages_are_rejected():
     with pytest.raises(ValueError, match="k/v pages disagree"):
-        _canonicalize(
-            {"layer.0": (_pages(), torch.zeros((NUM_BLOCKS, 1), dtype=DTYPE))}
-        )
+        _canonicalize({"layer.0": (_pages(), torch.zeros((NUM_BLOCKS, 1), dtype=DTYPE))})
 
 
 def test_num_blocks_disagreement_across_layers_raises():

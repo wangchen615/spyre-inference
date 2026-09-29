@@ -38,6 +38,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+# ruff: noqa: F811 - imported pytest fixtures are intentionally used by name
 # Fixtures and byte-fidelity helpers live in hw_helpers so the connector/worker
 # hardware tests share them verbatim. `offloader` and `_init_device` are
 # fixtures and must be imported into this module's namespace for pytest to
@@ -77,7 +78,7 @@ def test_round_trip_is_bit_exact(impl_cls, offloader):
     torch.spyre.synchronize()
 
     _zero_pages(cache, [3])
-    assert _bits(cache.k_pages[3]).any() == False, "zeroing the device page failed"
+    assert not _bits(cache.k_pages[3]).any(), "zeroing the device page failed"
 
     off.reload(slot=0, block_id=3)
     torch.spyre.synchronize()

@@ -23,6 +23,7 @@ differently -- see the individual docstrings.
 from __future__ import annotations
 
 import os
+from contextlib import suppress
 
 import pytest
 import torch
@@ -45,6 +46,7 @@ LAYOUT_KIND = {
     SpyreAttentionImpl: "token-major",
     SpyreHeadMajorAttentionImpl: "head-major",
 }
+
 
 def _real_device() -> bool:
     """True only on an actual card.
@@ -230,7 +232,5 @@ def offloader(request):
     yield _make
 
     for name in made:
-        try:
+        with suppress(Exception):  # noqa: BLE001 - teardown must not mask a test failure
             SharedHostPool.unlink_by_name(name)
-        except Exception:  # noqa: BLE001 - teardown must not mask a test failure
-            pass
