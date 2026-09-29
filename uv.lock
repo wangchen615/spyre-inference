@@ -4923,7 +4923,7 @@ dev = [
 requires-dist = [
     { name = "torch", marker = "platform_machine != 'ppc64le'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "platform_machine == 'ppc64le'", git = "https://github.com/pytorch/pytorch?tag=v2.13.0" },
-    { name = "torch-spyre", extras = ["cpsat"], git = "https://github.com/torch-spyre/torch-spyre?rev=336dad3003f6f85d13cda0dc3f9f0983371deb33" },
+    { name = "torch-spyre", extras = ["cpsat"], editable = "../torch-spyre" },
     { name = "torchvision", marker = "platform_machine not in 's390x, ppc64le'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "transformers", specifier = "<5.17" },
     { name = "vllm", extras = ["grpc"], git = "https://github.com/vllm-project/vllm?rev=v0.28.0" },
@@ -5305,8 +5305,7 @@ wheels = [
 
 [[package]]
 name = "torch-spyre"
-version = "0.0.1"
-source = { git = "https://github.com/torch-spyre/torch-spyre?rev=336dad3003f6f85d13cda0dc3f9f0983371deb33#336dad3003f6f85d13cda0dc3f9f0983371deb33" }
+source = { editable = "../torch-spyre" }
 dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
@@ -5322,6 +5321,37 @@ dependencies = [
 cpsat = [
     { name = "ortools", marker = "platform_machine == 'x86_64'" },
 ]
+
+[package.metadata]
+requires-dist = [
+    { name = "build", marker = "extra == 'build'" },
+    { name = "cmake", marker = "extra == 'build'", specifier = ">=3.27,<4.0.0" },
+    { name = "expecttest", marker = "extra == 'build'", specifier = ">=0.3.0" },
+    { name = "jinja2", marker = "extra == 'build'" },
+    { name = "mypy", marker = "extra == 'lint'", specifier = "~=2.1.0" },
+    { name = "ninja", marker = "extra == 'build'" },
+    { name = "numpy" },
+    { name = "numpy", marker = "extra == 'build'" },
+    { name = "ortools", marker = "platform_machine != 'ppc64le' and platform_machine != 's390x'", specifier = ">=9.0" },
+    { name = "ortools", marker = "platform_machine != 'ppc64le' and platform_machine != 's390x' and extra == 'cpsat'", specifier = ">=9.0" },
+    { name = "pre-commit", marker = "extra == 'lint'", specifier = "~=4.6.0" },
+    { name = "psutil" },
+    { name = "pydantic", marker = "extra == 'test'" },
+    { name = "pytest", marker = "extra == 'test'", specifier = "~=9.0" },
+    { name = "pytest-xdist", marker = "extra == 'test'" },
+    { name = "pyyaml", marker = "extra == 'build'" },
+    { name = "regex" },
+    { name = "regex", marker = "extra == 'build'" },
+    { name = "safetensors", marker = "extra == 'safetensors'", specifier = ">=0.8.0" },
+    { name = "safetensors", marker = "extra == 'test'", specifier = ">=0.8.0" },
+    { name = "setuptools", marker = "extra == 'build'", specifier = ">=77.0.3" },
+    { name = "torch", specifier = "~=2.13.0", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torch", marker = "extra == 'build'", specifier = "~=2.13.0", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "types-pyyaml", marker = "extra == 'lint'", specifier = "~=6.0.12.20260518" },
+    { name = "uv", marker = "extra == 'lint'", specifier = "~=0.11.15" },
+    { name = "wheel", marker = "extra == 'build'" },
+]
+provides-extras = ["safetensors", "cpsat", "build", "test", "lint"]
 
 [[package]]
 name = "torchvision"
