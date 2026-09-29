@@ -22,6 +22,7 @@ differently -- see the individual docstrings.
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import pytest
@@ -31,7 +32,11 @@ from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
 from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
     SpyreHeadMajorAttentionImpl,
 )
-from spyre_inference.v1.worker.spyre_kv_offload import SpyreKvPageOffloader
+from spyre_inference.v1.worker.spyre_kv_offload import (
+    HostPoolFactory,
+    MarvellPoolFactory,
+    SpyreKvPageOffloader,
+)
 
 DTYPE = torch.float16
 NUM_BLOCKS = 8
@@ -45,6 +50,85 @@ LAYOUT_KIND = {
     SpyreAttentionImpl: "token-major",
     SpyreHeadMajorAttentionImpl: "head-major",
 }
+
+# The Marvell card and where in its BAR2 these tests may write. FLEX_TEST_PCI_BDF
+# is the same switch flex's and torch-spyre's Marvell tests use; without it the
+# Marvell cases skip. FLEX_TEST_BAR2_OFFSET moves the tests' region so they can
+# stay clear of anything else using the card.
+MARVELL_BDF = os.environ.get("FLEX_TEST_PCI_BDF", "")
+MARVELL_BAR2_OFFSET = int(os.environ.get("FLEX_TEST_BAR2_OFFSET", "0"), 0)
+
+POOL_BACKENDS = [
+    "host",
+    pytest.param(
+        "marvell",
+        marks=pytest.mark.skipif(
+            not MARVELL_BDF, reason="FLEX_TEST_PCI_BDF (Marvell card BDF) not set"
+        ),
+    ),
+]
+
+
+class _PoolFactories:
+    """Hands out pool factories for one test, each Marvell one in a fresh window.
+
+    Several pools can be alive together inside one test (one per offloader, or
+    per cache in a worker), and flex does not detect overlapping BAR2 windows,
+    so each Marvell pool gets the window right after the previous one -- the
+    same rule `SpyreOffloadingSpec` applies in production. Every name handed
+    out is unlinked on the way in (a crashed run's stale `.ctl` would otherwise
+    be attached, and its geometry check would mask the real error) and again
+    in teardown.
+    """
+
+    def __init__(self, backend: str):
+        self.backend = backend
+        self._next_offset = MARVELL_BAR2_OFFSET
+        self._names: list[str] = []
+
+    @property
+    def unlink_by_name(self):
+        return (
+            MarvellPoolFactory.unlink_by_name
+            if self.backend == "marvell"
+            else HostPoolFactory.unlink_by_name
+        )
+
+    def claim(self, name: str) -> None:
+        self.unlink_by_name(name)
+        self._names.append(name)
+
+    def factory(self, name: str, num_slots: int, page_bytes: int):
+        """A factory for pool `name` holding `num_slots` logical K/V pages."""
+        self.claim(name)
+        if self.backend == "host":
+            return HostPoolFactory()
+        from spyre_inference.v1.kv_offload.spec import marvell_window_bytes
+
+        window = marvell_window_bytes(page_bytes, num_slots)
+        offset = self._next_offset
+        self._next_offset += window
+        return MarvellPoolFactory(MARVELL_BDF, bar_offset=offset, window_bytes=window)
+
+    def cleanup(self) -> None:
+        for name in self._names:
+            # Teardown must not mask a test failure.
+            with contextlib.suppress(Exception):
+                self.unlink_by_name(name)
+
+
+@pytest.fixture(params=POOL_BACKENDS)
+def pool_backend(request):
+    """Every hardware test runs once per tier: host DRAM, then the Marvell card."""
+    return request.param
+
+
+@pytest.fixture
+def pool_factories(pool_backend):
+    pools = _PoolFactories(pool_backend)
+    yield pools
+    pools.cleanup()
+
 
 def _real_device() -> bool:
     """True only on an actual card.
@@ -207,30 +291,31 @@ def _zero_pages(cache, blocks) -> dict:
 
 
 @pytest.fixture
-def offloader(request):
-    """An offloader on a uniquely-named pool, unlinked before and after.
+def offloader(request, pool_factories):
+    """An offloader on a uniquely-named pool of the test's backend.
 
-    Stale POSIX SHM segments survive a crashed run, so the name is unlinked on
-    the way in as well as out; otherwise a previous failure's segment would be
-    attached and its geometry check would mask the real error.
+    The name is unlinked before and after (see `_PoolFactories`), and every
+    offloader is released at teardown so its attach does not outlive the test.
     """
-    from torch_spyre._C import SharedHostPool
+    from spyre_inference.v1.worker.spyre_kv_offload import page_bytes
 
-    made = []
+    made: list[SpyreKvPageOffloader] = []
 
     def _make(cache, impl_cls, num_slots=2):
         name = f"kv_e2e_{os.getpid()}_{abs(hash(request.node.name)) % 10**6}_{len(made)}"
-        SharedHostPool.unlink_by_name(name)
         off = SpyreKvPageOffloader(
-            cache, name, num_slots=num_slots, layout_kind=LAYOUT_KIND[impl_cls]
+            cache,
+            name,
+            num_slots=num_slots,
+            layout_kind=LAYOUT_KIND[impl_cls],
+            pool_factory=pool_factories.factory(name, num_slots, page_bytes(cache)),
         )
-        made.append(name)
+        made.append(off)
         return off
 
     yield _make
 
-    for name in made:
-        try:
-            SharedHostPool.unlink_by_name(name)
-        except Exception:  # noqa: BLE001 - teardown must not mask a test failure
-            pass
+    for off in made:
+        # Teardown must not mask a test failure.
+        with contextlib.suppress(Exception):
+            off.release()
