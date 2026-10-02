@@ -32,7 +32,6 @@ command=(
     uv run --no-sync vllm serve "$model"
     --host 127.0.0.1
     --port 18101
-    --enforce-eager
     --no-enable-prefix-caching
     --tensor-parallel-size 1
     --distributed-executor-backend uni

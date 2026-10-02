@@ -43,6 +43,7 @@ def test_launcher_configures_the_one_shared_data_pool(launcher, port, device):
     assert result.returncode == 0, result.stderr
     assert f"SPYRE_DEVICES={device}" in result.stdout
     assert f"--port {port}" in result.stdout
+    assert "--enforce-eager" not in result.stdout
     assert "--no-enable-prefix-caching" in result.stdout
     command = shlex.split(result.stdout)
     transfer_config = json.loads(command[command.index("--kv-transfer-config") + 1])

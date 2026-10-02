@@ -17,7 +17,8 @@ The 2026-10-02 run used:
 - vLLM `0.28.0`;
 - model `ibm-ai-platform/micro-g3.3-8b-instruct-1b`;
 - device 0 at `0000:ac:00.0` for A and device 1 at <code>0000:b&#x61;:00.0</code> for B; and
-- `PYTHONHASHSEED=0`, TP1, the `uni` executor, and eager execution.
+- `PYTHONHASHSEED=0`, TP1, the `uni` executor, and
+  `STOCK_TORCH_COMPILE` execution.
 
 Both launchers pass the same connector configuration:
 
@@ -31,6 +32,10 @@ shared_metadata_name: spyre_manual_4096
 pool_name: spyre_manual_4096.data
 cpu_bytes_to_use: 536870912
 ```
+
+The launchers omit `--enforce-eager`, so the Spyre platform selects
+`STOCK_TORCH_COMPILE`. Model and attention compilation therefore happens
+during server startup instead of the first measured requests.
 
 `enable_prefix_caching: false` prevents vLLM's device-local prefix cache from
 masking the shared-KV path. `max_num_batched_tokens: 512` bounds each scheduler
@@ -184,16 +189,16 @@ The 2026-10-02 run produced:
 
 | Request | TTFT | E2E wall time | Prompt source | KV copy time | KV bytes |
 | --- | ---: | ---: | --- | ---: | ---: |
-| A cold compute/store | 3.282 s | 12.014 s | 4,096 local-compute tokens | 0.008741 s | 67,108,864 stored |
-| A first self reload | 8.038 s | 16.688 s | 4,096 external-transfer tokens | 0.006692 s | 67,108,864 loaded |
-| B first peer reload | 8.127 s | 16.892 s | 4,096 external-transfer tokens | 0.005804 s | 67,108,864 loaded |
+| A cold compute/store | 0.710 s | 1.125 s | 4,096 local-compute tokens | 0.008910 s | 67,108,864 stored |
+| A first self reload | 0.044 s | 0.467 s | 4,096 external-transfer tokens | 0.005367 s | 67,108,864 loaded |
+| B first peer reload | 0.045 s | 0.474 s | 4,096 external-transfer tokens | 0.005124 s | 67,108,864 loaded |
 
-Because the warmup no longer primes either reload path, each first measured
-reload includes its instance's one-time external-load initialization. The KV
-copies themselves took only 5.8--6.7 ms. Diagnostic second reloads reached
-0.655 s TTFT on A and 0.585 s on B, but they are not part of the three-request
-measurement above. All measured requests generated 16 output tokens with
-identical token IDs:
+The two servers each spent about 165.6 seconds initializing before becoming
+ready. Approximately 42 seconds warmed the model graphs and 123 seconds
+recorded the attention graphs. Moving this work to startup removed the
+first-reload latency seen under eager execution: both first reloads reached the
+first token in about 45 ms while transferring the full 64 MiB KV entry. All
+measured requests generated 16 output tokens with identical token IDs:
 
 ```text
 [203, 203, 1397, 44, 10720, 3303, 518, 322, 15872, 2582, 11385, 39171, 461, 7624, 8019, 26322]
@@ -210,8 +215,14 @@ prompt:
 
 | Warmup request | TTFT | E2E wall time | Prompt source | KV copy time | KV bytes |
 | --- | ---: | ---: | --- | ---: | ---: |
-| A junk compute/store | 84.003 s | 131.961 s | 4,096 local-compute tokens | 0.016263 s | 67,108,864 stored |
-| B distinct junk compute/store | 80.619 s | 128.734 s | 4,096 local-compute tokens | 0.013781 s | 67,108,864 stored |
+| A junk compute/store | 0.784 s | 1.213 s | 4,096 local-compute tokens | 0.013093 s | 67,108,864 stored |
+| B distinct junk compute/store | 0.779 s | 1.210 s | 4,096 local-compute tokens | 0.011186 s | 67,108,864 stored |
+
+For comparison, the same one-pool test under `--enforce-eager` reported
+3.282-second cold TTFT, 8.038-second A reload TTFT, and 8.127-second B reload
+TTFT. Second reloads in those eager processes fell to 0.655 seconds on A and
+0.585 seconds on B, identifying the earlier penalty as process-local first-use
+work rather than shared-pool lookup or KV-copy time.
 
 ## Stop and clean up
 
@@ -236,18 +247,14 @@ unrelated `flex_kv_*` objects remained.
 
 ## Artifacts
 
-The captured cold-only run produced:
+The captured compiled-mode run produced:
 
-- `/tmp/spyre-shared-kv-cold-only-a-server.log`
-- `/tmp/spyre-shared-kv-cold-only-b-server.log`
-- `/tmp/spyre-shared-kv-cold-only-warmup.log`
-- `/tmp/spyre-shared-kv-cold-only-a-cold.log`
-- `/tmp/spyre-shared-kv-cold-only-a-reload.log`
-- `/tmp/spyre-shared-kv-cold-only-b-reload.log`
-
-The latency investigation also produced the non-acceptance diagnostic logs
-`/tmp/spyre-shared-kv-cold-only-a-second-reload-diagnostic.log` and
-`/tmp/spyre-shared-kv-cold-only-b-second-reload-diagnostic.log`.
+- `/tmp/spyre-shared-kv-compiled-instance-a.log`
+- `/tmp/spyre-shared-kv-compiled-instance-b.log`
+- `/tmp/spyre-shared-kv-compiled-warmup.log`
+- `/tmp/spyre-shared-kv-compiled-a-cold.log`
+- `/tmp/spyre-shared-kv-compiled-a-reload.log`
+- `/tmp/spyre-shared-kv-compiled-b-reload.log`
 
 ## Historical pre-redesign reference
 
