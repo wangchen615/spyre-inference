@@ -184,7 +184,7 @@ def test_run_request_shows_target_and_prompt_before_sending(monkeypatch, capsys)
     assert "Prompt source  4 local-compute tokens" in output
     assert "TTFT           3.250 s" in output
     assert "E2E            11.750 s" in output
-    assert "KV transfer    STORE 64 bytes in 125.000 ms" in output
+    assert "KV transfer" not in output
     assert result["path"] == "local_compute_store"
     assert result["computed_prompt_tokens"] == 4
 
@@ -224,7 +224,7 @@ def test_run_request_reports_external_reload(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "Outcome        EXTERNAL KV RELOAD" in output
     assert "Prompt source  4 external-transfer tokens" in output
-    assert "KV transfer    LOAD 64 bytes in 62.500 ms" in output
+    assert "KV transfer" not in output
     assert result["path"] == "external_kv_reload"
     assert result["loaded_prompt_tokens"] == 4
 

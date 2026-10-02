@@ -130,8 +130,11 @@ the backing and control objects for the same single data pool.
 
 ## Warm both instances with unrelated data
 
-The warmup prompt is visibly different from the measured incident prompt. It
-only cold-computes and stores one unique junk prompt on each server:
+The warmup prompts are visibly different from the measured incident prompt and
+from each other. A uses an amber-observatory astronomy report and B uses a
+cobalt-reef marine survey; each also ends with a subject-specific completion
+cue. The script only cold-computes and stores one unique junk prompt on each
+server:
 
 1. Junk prompt A to instance A: cold compute and store.
 2. Junk prompt B to instance B: cold compute and store.
@@ -152,9 +155,9 @@ uv run --no-sync python -u scripts/warmup_shared_kv_demo.py \
 
 Each invocation prints its instance and endpoint, stable identifier, prompt
 preview, exact token count, path classification, TTFT, E2E time, prompt-source
-tokens, KV bytes/copy time, output token IDs, and output text. Default output is
+tokens, output token IDs, and output text. Default output is
 formatted for the visual demo; add `--show-json` when complete machine-readable
-results are also needed.
+results, including KV byte and copy-time metrics, are also needed.
 
 First send the cold request to A:
 

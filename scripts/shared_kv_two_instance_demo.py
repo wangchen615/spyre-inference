@@ -38,7 +38,6 @@ RESPONSE_INSTRUCTION = (
     "\n\nResponse: Summarize the recurring symptoms and give three concrete "
     "recovery actions in plain language."
 )
-WARMUP_RESPONSE_INSTRUCTION = "\n\nWarmup response: emit sixteen deterministic tokens."
 MEASURED_PROMPT = """
 You are reviewing an accelerator inference incident for a live demonstration.
 The gateway accepted a long-context generation request and divided its prefill
@@ -395,24 +394,6 @@ def _prompt_preview(prompt_text: str, limit: int = 800) -> str:
     )
 
 
-def _format_bytes(byte_count: int) -> str:
-    if byte_count >= 1024 * 1024:
-        return f"{byte_count / (1024 * 1024):.1f} MiB ({byte_count:,} bytes)"
-    return f"{byte_count:,} bytes"
-
-
-def _transfer_summary(result: dict[str, Any]) -> str:
-    if result["path"] == "local_compute_store":
-        action = "STORE"
-        byte_count = result["store_bytes"]
-        copy_seconds = result["store_copy_seconds"]
-    else:
-        action = "LOAD"
-        byte_count = result["load_bytes"]
-        copy_seconds = result["load_copy_seconds"]
-    return f"{action} {_format_bytes(byte_count)} in {copy_seconds * 1000:.3f} ms"
-
-
 def _print_result(result: dict[str, Any]) -> None:
     if result["path"] == "local_compute_store":
         outcome = "COLD COMPUTE + STORE"
@@ -428,7 +409,6 @@ def _print_result(result: dict[str, Any]) -> None:
     print(f"{'Prompt source':<15}{source}")
     print(f"{'TTFT':<15}{result['ttft_seconds']:.3f} s")
     print(f"{'E2E':<15}{result['wall_seconds']:.3f} s")
-    print(f"{'KV transfer':<15}{_transfer_summary(result)}")
     print(f"{'Output':<15}{result['output_tokens']} tokens")
     print(f"{'Token IDs':<15}{result['token_ids']}")
     print(f"{'Text':<15}{json.dumps(result['text'], ensure_ascii=False)}")
@@ -445,7 +425,6 @@ def print_request_summary(title: str, requests: list[dict[str, Any]]) -> None:
         print(f"   Target       {result['instance']} @ {result['endpoint']}")
         print(f"   Outcome      {outcome}")
         print(f"   TTFT / E2E   {result['ttft_seconds']:.3f} s / {result['wall_seconds']:.3f} s")
-        print(f"   KV transfer  {_transfer_summary(result)}")
 
 
 def execute_request(

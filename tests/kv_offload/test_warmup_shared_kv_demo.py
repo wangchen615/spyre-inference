@@ -70,7 +70,11 @@ def test_warmup_only_cold_stores_distinct_junk_prompts(monkeypatch, capsys):
         demo.LOCAL_COMPUTE,
     ]
     assert calls[0]["prompt_source"] != calls[1]["prompt_source"]
-    assert "shared host memory" in calls[0]["prompt_source"]
+    assert "amber observatory" in calls[0]["prompt_source"]
+    assert "cobalt reef" in calls[1]["prompt_source"]
+    assert calls[0]["response_instruction"] != calls[1]["response_instruction"]
+    assert "amber observatory" in calls[0]["response_instruction"]
+    assert "cobalt reef" in calls[1]["response_instruction"]
     assert "host-to-device" not in calls[0]["prompt_source"]
     assert [(call["host"], call["port"]) for call in calls] == [
         ("10.1.2.3", 18100),
@@ -84,7 +88,7 @@ def test_warmup_only_cold_stores_distinct_junk_prompts(monkeypatch, capsys):
     assert "A junk cold compute/store" in output
     assert "B junk cold compute/store" in output
     assert "82.500 s" in output
-    assert "64.0 MiB (67,108,864 bytes)" in output
+    assert "KV transfer" not in output
     assert "=== Machine-readable warmup result ===" not in output
     assert len(result["requests"]) == 2
 
@@ -128,7 +132,9 @@ def test_warmup_shows_json_only_when_requested(monkeypatch, capsys):
         show_json=True,
     )
 
-    assert "=== Machine-readable warmup result ===" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "=== Machine-readable warmup result ===" in output
+    assert '"store_bytes": 64' in output
 
 
 def test_warmup_script_can_run_directly_from_the_repository_root():

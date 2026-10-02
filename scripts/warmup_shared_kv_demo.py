@@ -27,18 +27,29 @@ if __package__:
 else:
     import shared_kv_two_instance_demo as demo
 
-WARMUP_PROMPT = """
-This is unrelated warmup material for the Spyre shared-KV visual demo. It does
-not contain the measured incident prompt. The request fills the configured
-prefill buckets, generates deterministic output, and stores completed key and
-value pages in shared host memory before anyone records performance results.
-Every sentence in this paragraph is disposable warmup data.
+WARMUP_PROMPT_A = """
+The amber observatory sits above a dry desert plateau. Its astronomers calibrate
+mirrors, track distant galaxies, compare stellar spectra, and record nightly
+weather conditions. This disposable astronomy report exists only to warm
+instance A before the Spyre shared-KV visual demonstration.
 """.strip()
+WARMUP_PROMPT_B = """
+The cobalt reef lies beneath a quiet tropical harbor. Its marine biologists map
+coral gardens, count juvenile fish, measure ocean currents, and catalog coastal
+wildlife. This disposable marine survey exists only to warm instance B before
+the Spyre shared-KV visual demonstration.
+""".strip()
+WARMUP_RESPONSE_INSTRUCTION_A = (
+    "\n\nContinue the astronomy report: The amber observatory detected three distant"
+)
+WARMUP_RESPONSE_INSTRUCTION_B = (
+    "\n\nContinue the marine survey: The cobalt reef sheltered seven juvenile"
+)
 
 
-def build_warmup_prompt(identifier: str) -> str:
+def build_warmup_prompt(identifier: str, body: str) -> str:
     header = f"Warmup-only identifier: {identifier}\n\n"
-    return header + (WARMUP_PROMPT + "\n\n") * 192
+    return header + (body + "\n\n") * 192
 
 
 def run_warmup(
@@ -66,18 +77,17 @@ def run_warmup(
 
     identifier_a = f"{warmup_id}-a"
     identifier_b = f"{warmup_id}-b"
-    prompt_a = build_warmup_prompt(identifier_a)
-    prompt_b = build_warmup_prompt(identifier_b)
+    prompt_a = build_warmup_prompt(identifier_a, WARMUP_PROMPT_A)
+    prompt_b = build_warmup_prompt(identifier_b, WARMUP_PROMPT_B)
 
     print("=== Shared-KV warmup ===")
     print(f"Warmup identifier: {warmup_id}")
     print(f"Instance A: http://{instance_a_host}:{instance_a_port}")
     print(f"Instance B: http://{instance_b_host}:{instance_b_port}")
-    print("Each instance cold-computes and stores one unrelated junk prompt.")
+    print("Each instance cold-computes and stores one visibly different junk prompt.")
 
     common: dict[str, Any] = {
         "model": model,
-        "response_instruction": demo.WARMUP_RESPONSE_INSTRUCTION,
         "prompt_tokens": prompt_tokens,
         "output_tokens": output_tokens,
         "request_timeout": request_timeout,
@@ -91,6 +101,7 @@ def run_warmup(
             port=instance_a_port,
             identifier=identifier_a,
             prompt_source=prompt_a,
+            response_instruction=WARMUP_RESPONSE_INSTRUCTION_A,
             expected_source=demo.LOCAL_COMPUTE,
             **common,
         ),
@@ -101,6 +112,7 @@ def run_warmup(
             port=instance_b_port,
             identifier=identifier_b,
             prompt_source=prompt_b,
+            response_instruction=WARMUP_RESPONSE_INSTRUCTION_B,
             expected_source=demo.LOCAL_COMPUTE,
             **common,
         ),
