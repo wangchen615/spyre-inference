@@ -12,121 +12,176 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Worker-side registration and DMA routing for shared KV pool families."""
+"""Worker-side registration and DMA routing for one shared KV data pool."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 from typing_extensions import override
+from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import GPULoadStoreSpec, LoadStoreSpec
 
 from spyre_inference.v1.kv_offload.connector import SpyrePhysicalCaches
 from spyre_inference.v1.kv_offload.shared_runtime import load_shared_runtime
 from spyre_inference.v1.kv_offload.shared_types import (
     COMPATIBILITY_FORMAT_VERSION,
+    SharedComponentDescriptor,
     SharedLoadStoreSpec,
-    SharedPoolFamily,
+    SharedPageTransfer,
+    SharedPoolGeometry,
 )
 from spyre_inference.v1.kv_offload.worker import SpyreOffloadingWorker
-from spyre_inference.v1.worker.spyre_kv_offload import copy_kv_page_pair
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
-class _FamilyPools:
-    slot_count: int
-    component_pools: tuple[tuple[object, object], ...]
+class _ComponentBinding:
+    tensor: object
+    page_bytes: int
+    domain_id: int
 
 
 class SpyreSharedOffloadingWorker(SpyreOffloadingWorker):
-    """Route complete logical blocks through versioned shared pool slots."""
+    """Copy explicitly located physical pages through one shared host pool."""
 
     def __init__(
         self,
         *,
         physical: SpyrePhysicalCaches,
         metadata_name: str,
-        families: tuple[SharedPoolFamily, ...],
+        pool_name: str,
+        geometry: SharedPoolGeometry,
+        manifest: Sequence[SharedComponentDescriptor],
         compatibility_digest: bytes,
-        max_components: int,
+        max_pool_slots: int,
         runtime_loader: Callable[[], Any] = load_shared_runtime,
     ) -> None:
         self._finished_jobs = []
         self._physical = physical
         self._runtime = runtime_loader()
+        manifest = tuple(manifest)
+        if len(manifest) != geometry.component_count:
+            raise ValueError("manifest component count disagrees with pool geometry")
+        if tuple(item.component_id for item in manifest) != tuple(range(len(manifest))):
+            raise ValueError("manifest component IDs must be ordered and contiguous")
 
-        components = []
-        for cache in physical.caches:
-            cache_components = []
-            for tensor in cache:
-                address = self._runtime.get_composite_address(tensor)
-                if address.num_chunks != 1:
-                    raise NotImplementedError(
-                        "M2-F3 required: shared KV allocation has "
-                        f"{address.num_chunks} CompositeAddress chunks"
-                    )
-                if address.total_size % physical.num_blocks:
-                    raise ValueError(
-                        f"KV allocation of {address.total_size} bytes does not divide "
-                        f"into {physical.num_blocks} pages"
-                    )
-                page_bytes = address.total_size // physical.num_blocks
-                chunk = address.chunks()[0]
-                cache_components.append((tensor, page_bytes, chunk.domain_id))
-            components.append(tuple(cache_components))
-
-        capacity = self._runtime.SharedMetadataCapacity(
-            len(families) * max_components,
-            max(family.slot_count for family in families),
-            1,
-        )
-        config = self._runtime.SharedMetadataConfig(max_components, [], capacity)
-        self._directory = self._runtime.SharedMetadata.create_or_attach(metadata_name, config)
-        compatibility = self._runtime.CompatibilityDescriptor(
-            COMPATIBILITY_FORMAT_VERSION, list(compatibility_digest)
-        )
-
-        self._families_by_anchor_id: dict[int, _FamilyPools] = {}
-        for family in families:
-            pools = []
-            anchor_pool_id = None
-            for cache_index, cache_components in enumerate(components):
-                cache_pools = []
-                for role, (_, page_bytes, _) in zip(("k", "v"), cache_components, strict=True):
-                    pool_config = self._runtime.SharedDataPoolConfig(
-                        f"{family.name}.c{cache_index}.{role}",
-                        self._runtime.SharedPoolKind.HOST,
-                        family.slot_count,
-                        page_bytes,
-                        compatibility,
-                    )
-                    registered = self._directory.register_or_attach_pool(pool_config)
-                    pool = self._directory.resolve_pool(registered.pool_ref)
-                    if pool is None:
-                        raise RuntimeError(
-                            f"registered shared pool {pool_config.name!r} could not be resolved"
-                        )
-                    if anchor_pool_id is None:
-                        anchor_pool_id = registered.pool_ref.pool_id
-                    cache_pools.append(pool)
-                pools.append(tuple(cache_pools))
-            assert anchor_pool_id is not None
-            self._families_by_anchor_id[anchor_pool_id] = _FamilyPools(
-                family.slot_count, tuple(pools)
+        components: dict[int, _ComponentBinding] = {}
+        for descriptor in manifest:
+            if not 0 <= descriptor.cache_index < len(physical.caches):
+                raise ValueError("manifest cache index is outside the physical caches")
+            role_index = 0 if descriptor.role == "k" else 1
+            tensor = physical.caches[descriptor.cache_index][role_index]
+            address = self._runtime.get_composite_address(tensor)
+            if address.num_chunks != 1:
+                raise NotImplementedError(
+                    "shared KV allocations must contain exactly one single chunk"
+                )
+            if address.total_size % physical.num_blocks:
+                raise ValueError(
+                    f"KV allocation of {address.total_size} bytes does not divide "
+                    f"into {physical.num_blocks} pages"
+                )
+            page_bytes = address.total_size // physical.num_blocks
+            if page_bytes != descriptor.page_bytes:
+                raise ValueError(
+                    f"component {descriptor.component_id} runtime page size "
+                    f"{page_bytes} disagrees with manifest {descriptor.page_bytes}"
+                )
+            if page_bytes > geometry.slot_bytes:
+                raise ValueError(
+                    f"component {descriptor.component_id} page is larger than a pool slot"
+                )
+            chunk = address.chunks()[0]
+            components[descriptor.component_id] = _ComponentBinding(
+                tensor, page_bytes, chunk.domain_id
             )
 
-        # Flex's descriptor describes the claimed c0.k slot. Publishing it
-        # after the bundle-wide fence makes every sibling component visible.
-        _, anchor_page_bytes, anchor_domain_id = components[0][0]
-        self._anchor_chunk_descriptor = (
-            self._runtime.ChunkDescriptorEntry(anchor_domain_id, anchor_page_bytes),
+        capacity = self._runtime.SharedMetadataCapacity(1, max_pool_slots, 1)
+        config = self._runtime.SharedMetadataConfig(1, [], capacity)
+        self._directory = self._runtime.SharedMetadata.create_or_attach(metadata_name, config)
+        pool_config = self._runtime.SharedDataPoolConfig(
+            pool_name,
+            self._runtime.SharedPoolKind.HOST,
+            geometry.slot_count,
+            geometry.slot_bytes,
+            self._runtime.CompatibilityDescriptor(
+                COMPATIBILITY_FORMAT_VERSION, list(compatibility_digest)
+            ),
         )
-        self._bytes_per_block = sum(
-            page_bytes for cache_components in components for _, page_bytes, _ in cache_components
+        registered = self._directory.register_or_attach_pool(pool_config)
+        if (
+            registered.slot_count != geometry.slot_count
+            or registered.slot_bytes != geometry.slot_bytes
+        ):
+            raise RuntimeError("registered pool geometry disagrees with requested geometry")
+        pool = self._directory.resolve_pool(registered.pool_ref)
+        if pool is None:
+            raise RuntimeError(f"registered shared pool {pool_name!r} could not be resolved")
+        if pool.slot_count() != geometry.slot_count or pool.slot_bytes() != geometry.slot_bytes:
+            raise RuntimeError("resolved pool geometry disagrees with requested geometry")
+
+        self._registered = registered
+        self._pool = pool
+        self._geometry = geometry
+        self._components = components
+        self._bytes_per_block = sum(item.page_bytes for item in components.values())
+        padding_bytes = geometry.logical_block_capacity * sum(
+            geometry.slot_bytes - item.page_bytes for item in components.values()
         )
+        logger.info(
+            "Spyre shared KV pool %s: %d components, %d logical blocks, %d slots, "
+            "%d bytes/slot, %d bytes actual, %d bytes fixed-slot padding",
+            pool_name,
+            geometry.component_count,
+            geometry.logical_block_capacity,
+            geometry.slot_count,
+            geometry.slot_bytes,
+            geometry.actual_pool_bytes,
+            padding_bytes,
+        )
+
+    @staticmethod
+    def _same_pool(left: object, right: object) -> bool:
+        return all(
+            getattr(left, field_name, None) == getattr(right, field_name, None)
+            for field_name in ("metadata_version", "pool_id", "pool_version")
+        )
+
+    @classmethod
+    def _same_slot(cls, left: object, right: object) -> bool:
+        return (
+            cls._same_pool(left.pool, right.pool)
+            and left.slot_id == right.slot_id
+            and left.slot_version == right.slot_version
+        )
+
+    def _validate_page(self, page: SharedPageTransfer, *, to_device: bool) -> _ComponentBinding:
+        component = self._components.get(page.component_id)
+        if component is None:
+            raise ValueError(f"unknown shared component {page.component_id}")
+        if page.location.pool_id != self._registered.pool_ref.pool_id:
+            raise ValueError(f"foreign shared pool ID {page.location.pool_id}")
+        if not 0 <= page.location.slot_id < self._geometry.slot_count:
+            raise IndexError(
+                f"shared slot {page.location.slot_id} out of range [0, {self._geometry.slot_count})"
+            )
+        if to_device:
+            if page.reservation is not None:
+                raise ValueError("shared load pages must not carry reservations")
+        else:
+            if page.reservation is None:
+                raise ValueError("shared store pages require reservations")
+            if (
+                not self._same_pool(page.reservation.slot.pool, self._registered.pool_ref)
+                or page.reservation.slot.slot_id != page.location.slot_id
+            ):
+                raise ValueError("store reservation does not match its page location")
+        return component
 
     @override
     def _transfer(
@@ -136,72 +191,67 @@ class SpyreSharedOffloadingWorker(SpyreOffloadingWorker):
             raise TypeError(
                 f"shared worker requires SharedLoadStoreSpec, got {type(host_spec).__name__}"
             )
-        self._validate_gpu_spec(gpu_spec)
         transfers = host_spec.transfers
-        device_blocks = list(gpu_spec.block_ids)
-        if len(device_blocks) != len(transfers):
-            raise ValueError(
-                f"block count mismatch: {len(device_blocks)} device blocks vs "
-                f"{len(transfers)} shared transfers"
-            )
-        if to_device and any(item.reservation is not None for item in transfers):
-            raise ValueError("shared load transfers must not carry reservations")
-        if not to_device and any(item.reservation is None for item in transfers):
-            raise ValueError("shared store transfers require reservations")
-
-        unpublished = [
-            transfer.reservation for transfer in transfers if transfer.reservation is not None
+        reservations: list[Any] = [
+            page.reservation
+            for transfer in transfers
+            for page in transfer.pages
+            if page.reservation is not None
         ]
-        published = []
         try:
-            routes = []
+            self._validate_gpu_spec(gpu_spec)
+            device_blocks = list(gpu_spec.block_ids)
+            if len(device_blocks) != len(transfers):
+                raise ValueError(
+                    f"block count mismatch: {len(device_blocks)} device blocks vs "
+                    f"{len(transfers)} shared transfers"
+                )
+
+            routes: list[tuple[_ComponentBinding, ...]] = []
             for transfer in transfers:
-                family = self._families_by_anchor_id.get(transfer.location.anchor_pool_id)
-                if family is None:
-                    raise ValueError(
-                        f"unknown shared anchor pool {transfer.location.anchor_pool_id}"
-                    )
-                if not 0 <= transfer.location.slot_id < family.slot_count:
-                    raise IndexError(
-                        f"shared slot {transfer.location.slot_id} out of range "
-                        f"[0, {family.slot_count})"
-                    )
-                routes.append(family)
+                component_ids = tuple(page.component_id for page in transfer.pages)
+                if len(set(component_ids)) != len(component_ids):
+                    raise ValueError("shared block contains duplicate component IDs")
+                if to_device and set(component_ids) != set(self._components):
+                    raise ValueError("shared load requires every component exactly once")
+                routes.append(
+                    tuple(self._validate_page(page, to_device=to_device) for page in transfer.pages)
+                )
 
             torch.spyre.synchronize()
-            for device_block, transfer, family in zip(
+            transfer_size = 0
+            for device_block, transfer, components in zip(
                 device_blocks, transfers, routes, strict=True
             ):
-                for cache, (k_pool, v_pool) in zip(
-                    self._physical.caches, family.component_pools, strict=True
-                ):
-                    copy_kv_page_pair(
-                        self._runtime.copy_kv_page_raw,
-                        cache,
+                for page, component in zip(transfer.pages, components, strict=True):
+                    self._runtime.copy_kv_page_raw(
+                        component.tensor,
                         device_block,
-                        k_pool,
-                        transfer.location.slot_id,
-                        v_pool,
-                        transfer.location.slot_id,
+                        self._pool,
+                        page.location.slot_id,
                         to_device,
                         True,
                     )
+                    transfer_size += component.page_bytes
             torch.spyre.synchronize()
 
             if not to_device:
                 for transfer in transfers:
-                    reservation = transfer.reservation
-                    self._directory.publish(reservation, self._anchor_chunk_descriptor)
-                    unpublished.remove(reservation)
-                    published.append(reservation)
+                    for page, component in zip(transfer.pages, routes.pop(0), strict=True):
+                        descriptor = (
+                            self._runtime.ChunkDescriptorEntry(
+                                component.domain_id, component.page_bytes
+                            ),
+                        )
+                        self._directory.publish(page.reservation, descriptor)
         except Exception:
             torch.spyre.synchronize()
-            for reservation in published:
+            for reservation in reservations:
                 entry = self._directory.lookup(reservation.key)
-                if entry is not None:
+                if entry is None:
+                    self._directory.abort(reservation)
+                elif self._same_slot(entry.slot, reservation.slot):
                     self._directory.evict(entry)
-            for reservation in unpublished:
-                self._directory.abort(reservation)
             raise
 
-        return len(transfers) * self._bytes_per_block
+        return transfer_size

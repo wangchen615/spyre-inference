@@ -25,90 +25,150 @@ import pytest
 from vllm.v1.kv_offload.base import make_offload_key
 
 from spyre_inference.v1.kv_offload.shared_types import (
+    SharedBlockTransfer,
+    SharedComponentDescriptor,
     SharedLoadStoreSpec,
-    SharedLocation,
-    SharedPoolFamily,
-    SharedTransfer,
-    allocate_family_slots,
-    shared_block_hash,
+    SharedPageLocation,
+    SharedPageTransfer,
+    SharedPoolGeometry,
+    compute_shared_pool_geometry,
+    shared_page_hash,
 )
 
+OFFLOAD_KEY = make_offload_key(bytes.fromhex("22" * 32), 0)
 
-def test_family_slots_distribute_remainder_in_configuration_order():
-    assert allocate_family_slots(8, ("alpha", "beta", "gamma")) == (
-        SharedPoolFamily("alpha", 3),
-        SharedPoolFamily("beta", 3),
-        SharedPoolFamily("gamma", 2),
+
+def test_shared_page_hash_covers_key_and_component():
+    key = make_offload_key(bytes.fromhex("11" * 32), 0)
+    assert shared_page_hash(key, 0) == 0xFD8C6177AECACCE2
+    assert shared_page_hash(key, 1) == 0x962C86167AD9E163
+    assert shared_page_hash(key, 7) == 0xC340A847F6514AA5
+    assert shared_page_hash(make_offload_key(bytes.fromhex("11" * 32), 1), 0) != shared_page_hash(
+        key, 0
     )
 
 
-def test_family_slots_distribute_even_capacity():
-    assert allocate_family_slots(6, ("alpha", "beta", "gamma")) == (
-        SharedPoolFamily("alpha", 2),
-        SharedPoolFamily("beta", 2),
-        SharedPoolFamily("gamma", 2),
+@pytest.mark.parametrize("component_id", [-1, 0x1_0000_0000])
+def test_shared_page_hash_rejects_component_id_outside_uint32(component_id):
+    with pytest.raises(ValueError, match="four unsigned bytes"):
+        shared_page_hash(OFFLOAD_KEY, component_id)
+
+
+def test_manual_pool_geometry_is_one_512_mib_pool():
+    geometry = compute_shared_pool_geometry(
+        cpu_bytes_to_use=536_870_912,
+        page_bytes=(262_144,) * 8,
+        alignment=4096,
     )
+    assert geometry == SharedPoolGeometry(
+        component_count=8,
+        slot_bytes=262_144,
+        logical_block_capacity=256,
+        slot_count=2048,
+        actual_pool_bytes=536_870_912,
+    )
+
+
+def test_geometry_uses_aligned_largest_page():
+    geometry = compute_shared_pool_geometry(16_384, (1000, 3000), 4096)
+    assert geometry.slot_bytes == 4096
+    assert geometry.logical_block_capacity == 2
+    assert geometry.slot_count == 4
+    assert geometry.actual_pool_bytes == 16_384
 
 
 @pytest.mark.parametrize(
-    ("slots", "names", "message"),
+    ("budget", "page_bytes", "alignment", "message"),
     [
-        (8, (), "at least one"),
-        (8, ("alpha", ""), "non-empty"),
-        (8, ("alpha", "   "), "non-empty"),
-        (8, ("alpha", "alpha"), "unique"),
-        (2, ("alpha", "beta", "gamma"), "fewer slots"),
-        (0, ("alpha",), "positive"),
+        (0, (1,), 1, "positive"),
+        (-1, (1,), 1, "positive"),
+        (16_384, (), 4096, "positive"),
+        (16_384, (0,), 4096, "positive"),
+        (16_384, (-1,), 4096, "positive"),
+        (16_384, (1,), 0, "positive"),
+        (4095, (4096, 1), 4096, "complete KV block"),
     ],
 )
-def test_family_slot_allocation_rejects_invalid_configuration(slots, names, message):
+def test_geometry_rejects_invalid_inputs(budget, page_bytes, alignment, message):
     with pytest.raises(ValueError, match=message):
-        allocate_family_slots(slots, names)
+        compute_shared_pool_geometry(budget, page_bytes, alignment)
 
 
-def test_pool_family_rejects_invalid_direct_construction():
-    with pytest.raises(ValueError, match="non-empty"):
-        SharedPoolFamily("", 1)
-    with pytest.raises(ValueError, match="positive"):
-        SharedPoolFamily("alpha", 0)
+def test_geometry_rejects_native_size_t_overflow():
+    with pytest.raises(OverflowError, match="size_t"):
+        compute_shared_pool_geometry(sys.maxsize + 1, (1,), 1)
 
 
-def test_shared_block_hash_covers_the_complete_offload_key():
-    key0 = make_offload_key(bytes.fromhex("11" * 32), 0)
-    key1 = make_offload_key(bytes.fromhex("11" * 32), 1)
-    assert shared_block_hash(key0) == 0x632D1E16D4E6599B
-    assert shared_block_hash(key1) != shared_block_hash(key0)
+def test_component_descriptor_retains_physical_page_contract():
+    descriptor = SharedComponentDescriptor(
+        component_id=3,
+        cache_index=1,
+        role="v",
+        layout_kind="head_major",
+        layout_version=1,
+        block_size=128,
+        local_kv_heads=4,
+        head_size=128,
+        page_bytes=131_072,
+    )
+    assert descriptor.component_id == 3
+    assert descriptor.page_bytes == 131_072
 
 
-def test_shared_block_hash_is_deterministic():
-    key = make_offload_key(bytes.fromhex("a5" * 32), 7)
-    assert shared_block_hash(key) == shared_block_hash(key)
-
-
-def _transfer(*, reservation=None):
-    return SharedTransfer(
-        key=make_offload_key(bytes.fromhex("22" * 32), 0),
-        location=SharedLocation(anchor_pool_id=3, slot_id=5),
-        reservation=reservation,
+def _page(component_id: int, slot_id: int, *, reservation=None):
+    return SharedPageTransfer(
+        component_id,
+        SharedPageLocation(pool_id=3, slot_id=slot_id),
+        reservation,
     )
 
 
-def test_load_store_spec_accepts_uniform_load_and_store_modes():
-    load = SharedLoadStoreSpec([_transfer(), _transfer()])
-    store = SharedLoadStoreSpec([_transfer(reservation=object()), _transfer(reservation=object())])
-    assert len(load.transfers) == 2
-    assert len(store.transfers) == 2
+def test_load_spec_retains_fragmented_component_locations_in_order():
+    pages = tuple(_page(i, slot) for i, slot in enumerate((7, 2, 11, 5)))
+    spec = SharedLoadStoreSpec([SharedBlockTransfer(OFFLOAD_KEY, pages)])
+    assert [page.component_id for page in spec.transfers[0].pages] == [0, 1, 2, 3]
+    assert [page.location.slot_id for page in spec.transfers[0].pages] == [7, 2, 11, 5]
+    assert all(page.reservation is None for page in spec.transfers[0].pages)
 
 
-def test_load_store_spec_rejects_mixed_transfer_modes():
+def test_store_spec_retains_each_page_reservation():
+    reservations = tuple(object() for _ in range(4))
+    pages = tuple(
+        _page(i, slot, reservation=reservation)
+        for i, (slot, reservation) in enumerate(zip((7, 2, 11, 5), reservations))
+    )
+    spec = SharedLoadStoreSpec([SharedBlockTransfer(OFFLOAD_KEY, pages)])
+    assert tuple(page.reservation for page in spec.transfers[0].pages) == reservations
+
+
+def test_block_transfer_rejects_empty_or_duplicate_component_pages():
+    with pytest.raises(ValueError, match="at least one page"):
+        SharedBlockTransfer(OFFLOAD_KEY, ())
+    with pytest.raises(ValueError, match="component IDs must be unique"):
+        SharedBlockTransfer(OFFLOAD_KEY, (_page(0, 7), _page(0, 2)))
+
+
+def test_block_transfer_rejects_mixed_page_modes():
     with pytest.raises(ValueError, match="mix load and store"):
-        SharedLoadStoreSpec([_transfer(), _transfer(reservation=object())])
+        SharedBlockTransfer(
+            OFFLOAD_KEY,
+            (_page(0, 7), _page(1, 2, reservation=object())),
+        )
 
 
-@pytest.mark.parametrize("bad_transfer", [(object(), object()), (1, 2, 3, 4)])
-def test_load_store_spec_rejects_malformed_transfer_tuples(bad_transfer):
-    with pytest.raises(TypeError, match="SharedTransfer"):
-        SharedLoadStoreSpec([bad_transfer])
+def test_load_store_spec_rejects_mixed_block_modes():
+    load = SharedBlockTransfer(OFFLOAD_KEY, (_page(0, 7),))
+    store = SharedBlockTransfer(
+        make_offload_key(bytes.fromhex("33" * 32), 0),
+        (_page(0, 2, reservation=object()),),
+    )
+    with pytest.raises(ValueError, match="mix load and store"):
+        SharedLoadStoreSpec([load, store])
+
+
+def test_load_store_spec_rejects_malformed_transfers():
+    with pytest.raises(TypeError, match="SharedBlockTransfer"):
+        SharedLoadStoreSpec([object()])
 
 
 def test_shared_runtime_module_import_is_inert(monkeypatch):

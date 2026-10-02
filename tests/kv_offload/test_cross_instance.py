@@ -80,7 +80,7 @@ class _Server:
         port: int,
         device: int,
         metadata_name: str,
-        family_names: tuple[str, ...],
+        pool_name: str,
         log_path: Path,
     ) -> None:
         self.name = name
@@ -88,7 +88,7 @@ class _Server:
         self.log_path = log_path
         self._log_stream = log_path.open("w", encoding="utf-8")
         self._process = subprocess.Popen(
-            _server_command(port, metadata_name, family_names),
+            _server_command(port, metadata_name, pool_name),
             stdout=self._log_stream,
             stderr=subprocess.STDOUT,
             text=True,
@@ -150,7 +150,7 @@ class _Server:
         return "\n".join(self.log_text().splitlines()[-lines:])
 
 
-def _server_command(port: int, metadata_name: str, family_names: tuple[str, ...]) -> list[str]:
+def _server_command(port: int, metadata_name: str, pool_name: str) -> list[str]:
     kv_transfer_config = {
         "kv_connector": "SpyreOffloadingConnector",
         "kv_role": "kv_both",
@@ -158,7 +158,7 @@ def _server_command(port: int, metadata_name: str, family_names: tuple[str, ...]
         "kv_connector_extra_config": {
             "spec_name": "SpyreSharedOffloadingSpec",
             "shared_metadata_name": metadata_name,
-            "shared_pool_families": list(family_names),
+            "pool_name": pool_name,
             "cpu_bytes_to_use": CPU_BYTES,
         },
     }
@@ -290,13 +290,102 @@ def _host_block_count(server: _Server) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _assert_one_pool_topology(
+    server: _Server,
+    metadata_name: str,
+    pool_name: str,
+    num_blocks: int,
+) -> None:
+    inspection = r"""
+import json
+import sys
+from torch_spyre._C import SharedMetadata, SharedMetadataCapacity, SharedMetadataConfig
+
+metadata_name, pool_name = sys.argv[1:3]
+max_pool_slots = int(sys.argv[3])
+directory = SharedMetadata.create_or_attach(
+    metadata_name,
+    SharedMetadataConfig(1, [], SharedMetadataCapacity(1, max_pool_slots, 1)),
+)
+registered = directory.find_pool(pool_name)
+if registered is None:
+    raise RuntimeError(f"pool {pool_name!r} is not registered")
+pool = directory.resolve_pool(registered.pool_ref)
+if pool is None:
+    raise RuntimeError(f"pool {pool_name!r} cannot be resolved")
+print(json.dumps({
+    "pool_count": directory.pool_count(),
+    "metadata_version": registered.pool_ref.metadata_version,
+    "pool_id": registered.pool_ref.pool_id,
+    "pool_version": registered.pool_ref.pool_version,
+    "slot_count": registered.slot_count,
+    "slot_bytes": registered.slot_bytes,
+    "resolved_slot_count": pool.slot_count(),
+    "resolved_slot_bytes": pool.slot_bytes(),
+    "total_bytes": pool.total_bytes(),
+}))
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            inspection,
+            metadata_name,
+            pool_name,
+            str(num_blocks * MAX_COMPONENTS),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={
+            **os.environ,
+            "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+            "FLEX_DEVICE": "MOCK1p0",
+            "FLEX_COMPUTE": "NULL",
+            "AIU_WORLD_SIZE": "1",
+            "LOCAL_RANK": "0",
+        },
+    )
+    topology = json.loads(result.stdout.strip().splitlines()[-1])
+    assert topology["pool_count"] == 1
+
+    pattern = re.compile(
+        rf"Spyre shared KV pool {re.escape(pool_name)}: "
+        r"(?P<components>\d+) components, (?P<logical>\d+) logical blocks, "
+        r"(?P<slots>\d+) slots, (?P<slot_bytes>\d+) bytes/slot, "
+        r"(?P<actual>\d+) bytes actual"
+    )
+    match = pattern.search(server.log_text())
+    assert match is not None, server.log_tail()
+    assert int(match["components"]) == MAX_COMPONENTS
+    assert int(match["logical"]) == num_blocks
+    assert topology["slot_count"] == int(match["slots"])
+    assert topology["slot_bytes"] == int(match["slot_bytes"])
+    assert topology["resolved_slot_count"] == topology["slot_count"]
+    assert topology["resolved_slot_bytes"] == topology["slot_bytes"]
+    assert topology["total_bytes"] == int(match["actual"])
+
+    expected = (
+        f"/flex_kv_{topology['metadata_version']:016x}_{topology['pool_id']}_"
+        f"{topology['pool_version']:016x}"
+    )
+    metadata_bytes = (Path("/dev/shm") / metadata_name).read_bytes()
+    mentioned = {
+        value.decode()
+        for value in re.findall(rb"/flex_kv_[0-9a-f]{16}_[0-9]+_[0-9a-f]{16}", metadata_bytes)
+    }
+    assert mentioned == {expected}
+    assert (Path("/dev/shm") / expected.lstrip("/")).is_file()
+    assert (Path("/dev/shm") / f"{expected.lstrip('/')}.ctl").is_file()
+
+
 def _cleanup_shared_resources(
     metadata_name: str,
-    family_names: tuple[str, ...],
+    pool_name: str,
     num_blocks: int | None,
 ) -> None:
     cleanup = r"""
-import json
 import sys
 
 from torch_spyre._C import (
@@ -307,44 +396,33 @@ from torch_spyre._C import (
 )
 
 metadata_name = sys.argv[1]
-family_names = json.loads(sys.argv[2])
+pool_name = sys.argv[2]
 num_blocks = int(sys.argv[3])
-model_layer_count = int(sys.argv[4])
-max_components = int(sys.argv[5])
+max_components = int(sys.argv[4])
 cleanup_errors = []
-component_names = [
-    f"{family}.c{cache_index}.{role}"
-    for family in family_names
-    for cache_index in range(model_layer_count)
-    for role in ("k", "v")
-]
 
 if num_blocks:
     try:
         directory = SharedMetadata.create_or_attach(
             metadata_name,
             SharedMetadataConfig(
-                max_components,
+                1,
                 [],
-                SharedMetadataCapacity(
-                    len(family_names) * max_components,
-                    (num_blocks + len(family_names) - 1) // len(family_names),
-                    1,
-                ),
+                SharedMetadataCapacity(1, num_blocks * max_components, 1),
             ),
         )
-        for component_name in component_names:
-            registered = directory.find_pool(component_name)
-            if registered is not None and not directory.retire_pool(registered.pool_ref):
-                cleanup_errors.append(f"could not retire {component_name}")
+        if directory.pool_count() > 1:
+            cleanup_errors.append("directory contains an unknown pool")
+        registered = directory.find_pool(pool_name)
+        if registered is not None:
+            backing_name = (
+                f"/flex_kv_{registered.pool_ref.metadata_version:016x}_"
+                f"{registered.pool_ref.pool_id}_"
+                f"{registered.pool_ref.pool_version:016x}"
+            )
+            SharedHostPool.unlink_by_name(backing_name)
     except Exception as error:
         cleanup_errors.append(f"could not attach directory: {error}")
-
-for component_name in component_names:
-    try:
-        SharedHostPool.unlink_by_name(component_name)
-    except Exception as error:
-        cleanup_errors.append(f"could not unlink {component_name}: {error}")
 try:
     SharedMetadata.unlink_by_name(metadata_name)
 except Exception as error:
@@ -359,15 +437,22 @@ if cleanup_errors:
             "-c",
             cleanup,
             metadata_name,
-            json.dumps(family_names),
+            pool_name,
             str(num_blocks or 0),
-            str(MODEL_LAYER_COUNT),
             str(MAX_COMPONENTS),
         ],
         capture_output=True,
         text=True,
         timeout=30,
         check=False,
+        env={
+            **os.environ,
+            "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+            "FLEX_DEVICE": "MOCK1p0",
+            "FLEX_COMPUTE": "NULL",
+            "AIU_WORLD_SIZE": "1",
+            "LOCAL_RANK": "0",
+        },
     )
     if result.returncode:
         raise AssertionError(
@@ -379,10 +464,10 @@ if cleanup_errors:
 def test_two_instances_reload_from_one_shared_pool(tmp_path: Path) -> None:
     unique = f"spyre_m2_{os.getpid()}_{uuid.uuid4().hex[:8]}"
     metadata_a = unique
-    families_a = (f"{unique}.a", f"{unique}.b")
+    pool_a = f"{metadata_a}.data"
     isolate_b = os.environ.get("SPYRE_SHARED_KV_ISOLATE_B") == "1"
     metadata_b = f"{unique}_isolated" if isolate_b else metadata_a
-    families_b = (f"{metadata_b}.a", f"{metadata_b}.b") if isolate_b else families_a
+    pool_b = f"{metadata_b}.data" if isolate_b else pool_a
     ports = _free_ports(2)
     servers: list[_Server] = []
     num_blocks: int | None = None
@@ -393,7 +478,7 @@ def test_two_instances_reload_from_one_shared_pool(tmp_path: Path) -> None:
             port=ports[0],
             device=0,
             metadata_name=metadata_a,
-            family_names=families_a,
+            pool_name=pool_a,
             log_path=tmp_path / "server-a.log",
         )
         servers.append(server_a)
@@ -404,7 +489,7 @@ def test_two_instances_reload_from_one_shared_pool(tmp_path: Path) -> None:
             port=ports[1],
             device=1,
             metadata_name=metadata_b,
-            family_names=families_b,
+            pool_name=pool_b,
             log_path=tmp_path / "server-b.log",
         )
         servers.append(server_b)
@@ -415,6 +500,7 @@ def test_two_instances_reload_from_one_shared_pool(tmp_path: Path) -> None:
         store_before = _metric_snapshot(server_a)  # A computes and publishes.
         baseline = _completion(server_a)
         store = _wait_for_positive_deltas(server_a, store_before, (STORE_BYTES,))
+        _assert_one_pool_topology(server_a, metadata_a, pool_a, num_blocks)
 
         a_before = _metric_snapshot(server_a)  # A reloads its released blocks.
         a_reload = _completion(server_a)
@@ -452,6 +538,6 @@ def test_two_instances_reload_from_one_shared_pool(tmp_path: Path) -> None:
     finally:
         for server in reversed(servers):
             server.stop()
-        _cleanup_shared_resources(metadata_a, families_a, num_blocks)
+        _cleanup_shared_resources(metadata_a, pool_a, num_blocks)
         if metadata_b != metadata_a:
-            _cleanup_shared_resources(metadata_b, families_b, num_blocks)
+            _cleanup_shared_resources(metadata_b, pool_b, num_blocks)

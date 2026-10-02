@@ -34,14 +34,12 @@ from vllm.v1.kv_offload.config import (
 )
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
-from spyre_inference.v1.kv_offload.connector import (
-    TOKEN_MAJOR,
-    SpyrePhysicalCaches,
-)
+from spyre_inference.v1.kv_offload.connector import TOKEN_MAJOR, SpyrePhysicalCaches
+from spyre_inference.v1.kv_offload.shared_types import PAGE_KEY_ALGORITHM
 from spyre_inference.v1.kv_offload.spec import SpyreOffloadingSpec
 from spyre_inference.v1.worker.spyre_kv_offload import PageSignature
 
-KV_BYTES_PER_BLOCK = 2 * 262144
+PAGE_BYTES = 262_144
 
 
 def _shared_spec_module():
@@ -56,25 +54,27 @@ def _config(
     num_blocks: int = 8,
     world_size: int = 1,
     group_count: int = 1,
+    layer_count: int = 1,
     dtype: str = "float16",
 ) -> OffloadingConfig:
+    worker_kv_bytes_per_block = 2 * max(layer_count, 1) * PAGE_BYTES
     extra_config = {
-        "cpu_bytes_to_use": num_blocks * KV_BYTES_PER_BLOCK * world_size,
+        "cpu_bytes_to_use": num_blocks * worker_kv_bytes_per_block * world_size,
         "shared_metadata_name": "run-42",
-        "shared_pool_families": ["pool-a", "pool-b", "pool-c"],
+        "pool_name": "run-42.data",
     }
     if extra is not None:
         extra_config.update(extra)
     groups = tuple(
         OffloadingGroupConfig(
             tokens_per_block=128,
-            layer_names=(f"layer.{index}",),
+            layer_names=tuple(f"layer.{group}.{index}" for index in range(layer_count)),
         )
-        for index in range(group_count)
+        for group in range(group_count)
     )
     return OffloadingConfig(
         groups=groups,
-        worker_kv_bytes_per_block=KV_BYTES_PER_BLOCK,
+        worker_kv_bytes_per_block=worker_kv_bytes_per_block,
         enable_kv_cache_events=False,
         extra_config=extra_config,
         engine_id="eng0",
@@ -95,6 +95,12 @@ def _config(
     )
 
 
+def _config_without_pool_name() -> OffloadingConfig:
+    config = _config()
+    config.extra_config.pop("pool_name")
+    return config
+
+
 def _vllm_config(
     *,
     backend: str = "uni",
@@ -109,14 +115,14 @@ def _vllm_config(
     )
 
 
-def _physical(layout_kind: str = TOKEN_MAJOR) -> SpyrePhysicalCaches:
+def _physical(cache_count: int = 1, layout_kind: str = TOKEN_MAJOR) -> SpyrePhysicalCaches:
+    caches = tuple((object(), object()) for _ in range(cache_count))
     return SpyrePhysicalCaches(
-        caches=cast(
-            tuple[tuple[torch.Tensor, torch.Tensor], ...],
-            ((object(), object()),),
-        ),
-        layout_kinds=(layout_kind,),
-        tensor_idx_to_cache={0: 0, 1: 0},
+        caches=cast(tuple[tuple[torch.Tensor, torch.Tensor], ...], caches),
+        layout_kinds=(layout_kind,) * cache_count,
+        tensor_idx_to_cache={
+            tensor_index: tensor_index // 2 for tensor_index in range(2 * cache_count)
+        },
         num_blocks=4,
     )
 
@@ -128,7 +134,7 @@ def _signature(
     block_size: int = 128,
     local_kv_heads: int = 8,
     head_size: int = 128,
-    page_bytes: int = 262144,
+    page_bytes: int = PAGE_BYTES,
     layout_version: int = 1,
 ) -> PageSignature:
     return PageSignature(
@@ -142,34 +148,54 @@ def _signature(
     )
 
 
-def test_shared_configuration_splits_aggregate_capacity_in_order():
-    spec = _shared_spec_module().SpyreSharedOffloadingSpec(_config())
+def test_explicit_pool_name_wins_over_environment(monkeypatch):
+    monkeypatch.setenv("SPYRE_KV_POOL_NAME", "from-env")
+    spec = _shared_spec_module().SpyreSharedOffloadingSpec(_config(extra={"pool_name": "explicit"}))
+    assert spec.pool_name == "explicit"
 
-    assert [(family.name, family.slot_count) for family in spec.families] == [
-        ("pool-a", 3),
-        ("pool-b", 3),
-        ("pool-c", 2),
-    ]
-    assert spec.metadata_name == "run-42"
-    assert spec.max_components == 2
+
+def test_environment_pool_name_is_the_fallback(monkeypatch):
+    monkeypatch.setenv("SPYRE_KV_POOL_NAME", "from-env")
+    spec = _shared_spec_module().SpyreSharedOffloadingSpec(_config_without_pool_name())
+    assert spec.pool_name == "from-env"
+
+
+def test_generated_pool_name_is_private_without_shared_configuration(monkeypatch):
+    monkeypatch.delenv("SPYRE_KV_POOL_NAME", raising=False)
+    spec = _shared_spec_module().SpyreSharedOffloadingSpec(_config_without_pool_name())
+    assert spec.pool_name == "spyre_kv_eng0_r0.shared"
+
+
+@pytest.mark.parametrize("pool_name", ["", " ", "/", "nested/name", "/nested/name"])
+def test_explicit_invalid_pool_name_does_not_fall_through(monkeypatch, pool_name):
+    monkeypatch.setenv("SPYRE_KV_POOL_NAME", "valid-env")
+    with pytest.raises(ValueError, match="pool_name"):
+        _shared_spec_module().SpyreSharedOffloadingSpec(_config(extra={"pool_name": pool_name}))
+
+
+def test_invalid_environment_pool_name_does_not_generate_fallback(monkeypatch):
+    monkeypatch.setenv("SPYRE_KV_POOL_NAME", " ")
+    with pytest.raises(ValueError, match="SPYRE_KV_POOL_NAME"):
+        _shared_spec_module().SpyreSharedOffloadingSpec(_config_without_pool_name())
+
+
+def test_removed_family_configuration_has_migration_error():
+    with pytest.raises(ValueError, match="shared_pool_families.*pool_name"):
+        _shared_spec_module().SpyreSharedOffloadingSpec(
+            _config(extra={"shared_pool_families": ["a", "b"]})
+        )
 
 
 @pytest.mark.parametrize(
     ("extra", "match"),
     [
         ({"shared_metadata_name": " "}, "shared_metadata_name"),
-        ({"shared_pool_families": []}, "family"),
-        ({"shared_pool_families": ["same", "same"]}, "unique"),
+        ({"shared_metadata_name": "nested/name"}, "shared_metadata_name"),
     ],
 )
-def test_rejects_invalid_shared_configuration(extra, match):
+def test_rejects_invalid_shared_metadata_configuration(extra, match):
     with pytest.raises(ValueError, match=match):
         _shared_spec_module().SpyreSharedOffloadingSpec(_config(extra=extra))
-
-
-def test_rejects_fewer_slots_than_pool_families():
-    with pytest.raises(ValueError, match="fewer slots"):
-        _shared_spec_module().SpyreSharedOffloadingSpec(_config(num_blocks=2))
 
 
 @pytest.mark.parametrize(
@@ -177,6 +203,7 @@ def test_rejects_fewer_slots_than_pool_families():
     [
         (_config(world_size=2), "world_size"),
         (_config(group_count=2), "one KV cache group"),
+        (_config(layer_count=0), "at least one layer"),
         (_config(dtype="bfloat16"), "float16"),
     ],
 )
@@ -187,22 +214,36 @@ def test_rejects_unsupported_shared_execution_shapes(config, match):
 
 def test_rejects_non_uni_executor_after_vllm_resolution():
     spec = _shared_spec_module().SpyreSharedOffloadingSpec(_config())
-
     with pytest.raises(ValueError, match="uni"):
         spec.bind_vllm_config(_vllm_config(backend="mp"))
 
 
-def test_compatibility_payload_covers_every_interpretation_field(
-    monkeypatch,
-):
+def test_component_manifest_is_stable_cache_then_k_v(monkeypatch):
+    module = _shared_spec_module()
+    monkeypatch.setattr(
+        module,
+        "page_signature",
+        lambda _cache, layout: _signature(layout_kind=layout),
+    )
+    manifest = module.component_manifest(_physical(cache_count=2))
+    assert [(item.component_id, item.cache_index, item.role) for item in manifest] == [
+        (0, 0, "k"),
+        (1, 0, "v"),
+        (2, 1, "k"),
+        (3, 1, "v"),
+    ]
+
+
+def test_compatibility_payload_covers_every_interpretation_field(monkeypatch):
     module = _shared_spec_module()
     monkeypatch.setenv("PYTHONHASHSEED", "0")
     monkeypatch.setattr(module, "page_signature", lambda *_: _signature())
     spec = module.SpyreSharedOffloadingSpec(_config())
     spec.bind_vllm_config(_vllm_config())
 
-    assert spec.compatibility_payload(_physical()) == {
-        "format": 1,
+    assert spec.compatibility_payload(module.component_manifest(_physical())) == {
+        "format": 2,
+        "page_key_algorithm": PAGE_KEY_ALGORITHM,
         "model": "model-a",
         "revision": "rev-a",
         "hash_algorithm": "sha256",
@@ -213,6 +254,7 @@ def test_compatibility_payload_covers_every_interpretation_field(
         "tp_size": 1,
         "components": (
             {
+                "component_id": 0,
                 "cache_index": 0,
                 "role": "k",
                 "layout_kind": "token-major",
@@ -220,9 +262,10 @@ def test_compatibility_payload_covers_every_interpretation_field(
                 "block_size": 128,
                 "local_kv_heads": 8,
                 "head_size": 128,
-                "page_bytes": 262144,
+                "page_bytes": PAGE_BYTES,
             },
             {
+                "component_id": 1,
                 "cache_index": 0,
                 "role": "v",
                 "layout_kind": "token-major",
@@ -230,7 +273,7 @@ def test_compatibility_payload_covers_every_interpretation_field(
                 "block_size": 128,
                 "local_kv_heads": 8,
                 "head_size": 128,
-                "page_bytes": 262144,
+                "page_bytes": PAGE_BYTES,
             },
         ),
     }
@@ -239,7 +282,8 @@ def test_compatibility_payload_covers_every_interpretation_field(
 def test_every_compatibility_field_changes_the_digest():
     module = _shared_spec_module()
     base: dict[str, Any] = {
-        "format": 1,
+        "format": 2,
+        "page_key_algorithm": PAGE_KEY_ALGORITHM,
         "model": "model-a",
         "revision": "rev-a",
         "hash_algorithm": "sha256",
@@ -250,6 +294,7 @@ def test_every_compatibility_field_changes_the_digest():
         "tp_size": 1,
         "components": (
             {
+                "component_id": 0,
                 "cache_index": 0,
                 "role": "k",
                 "layout_kind": "token-major",
@@ -257,13 +302,14 @@ def test_every_compatibility_field_changes_the_digest():
                 "block_size": 128,
                 "local_kv_heads": 8,
                 "head_size": 128,
-                "page_bytes": 262144,
+                "page_bytes": PAGE_BYTES,
             },
         ),
     }
     expected = module.compatibility_digest(base)
     mutations = {
-        "format": 2,
+        "format": 3,
+        "page_key_algorithm": "another",
         "model": "model-b",
         "revision": "rev-b",
         "hash_algorithm": "sha256_cbor_64bit",
@@ -273,13 +319,13 @@ def test_every_compatibility_field_changes_the_digest():
         "dtype": "bfloat16",
         "tp_size": 2,
     }
-
     for field, value in mutations.items():
         changed = copy.deepcopy(base)
         changed[field] = value
         assert module.compatibility_digest(changed) != expected, field
 
     for field, value in {
+        "component_id": 1,
         "cache_index": 1,
         "role": "v",
         "layout_kind": "head-major",
@@ -287,7 +333,7 @@ def test_every_compatibility_field_changes_the_digest():
         "block_size": 64,
         "local_kv_heads": 4,
         "head_size": 64,
-        "page_bytes": 131072,
+        "page_bytes": 131_072,
     }.items():
         changed = copy.deepcopy(base)
         changed["components"][0][field] = value
@@ -297,7 +343,8 @@ def test_every_compatibility_field_changes_the_digest():
 def test_compatibility_digest_is_stable_across_processes():
     module = _shared_spec_module()
     payload = {
-        "format": 1,
+        "format": 2,
+        "page_key_algorithm": PAGE_KEY_ALGORITHM,
         "model": "model-a",
         "revision": "rev-a",
         "hash_algorithm": "sha256",
@@ -309,13 +356,12 @@ def test_compatibility_digest_is_stable_across_processes():
         "components": (),
     }
     expected = module.compatibility_digest(payload).hex()
-    assert expected == "a3567edf4796a801e7681081e5a6e0d299be4ca03fb5445b9af681f28eaf9883"
+    assert expected == "d199b281b070184311bd69db73e5995fe6bd8a93ded59b899437277e9c3df567"
     code = (
         "from spyre_inference.v1.kv_offload.shared_spec import "
         "compatibility_digest; "
         f"print(compatibility_digest({payload!r}).hex())"
     )
-
     completed = subprocess.run(
         [sys.executable, "-c", code],
         check=True,
@@ -323,7 +369,6 @@ def test_compatibility_digest_is_stable_across_processes():
         text=True,
         env={**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"},
     )
-
     assert completed.stdout.strip().splitlines()[-1] == expected
 
 
@@ -333,46 +378,62 @@ def test_compatibility_requires_an_explicit_python_hash_seed(monkeypatch):
     monkeypatch.setattr(module, "page_signature", lambda *_: _signature())
     spec = module.SpyreSharedOffloadingSpec(_config())
     spec.bind_vllm_config(_vllm_config())
-
     with pytest.raises(ValueError, match="PYTHONHASHSEED"):
-        spec.compatibility_payload(_physical())
+        spec.compatibility_payload(module.component_manifest(_physical()))
 
 
-def test_shared_factories_receive_validated_configuration(monkeypatch):
+def test_shared_factories_receive_one_pool_manifest_and_geometry(monkeypatch):
     module = _shared_spec_module()
     from spyre_inference.v1.kv_offload import shared_manager, shared_worker
 
     monkeypatch.setenv("PYTHONHASHSEED", "0")
     monkeypatch.setattr(module, "page_signature", lambda *_: _signature())
-    manager_kwargs = {}
-    worker_kwargs = {}
+    manager_kwargs: dict[str, Any] = {}
+    worker_kwargs: dict[str, Any] = {}
 
     class RecordingManager:
         def __init__(self, **kwargs):
             manager_kwargs.update(kwargs)
 
     class RecordingWorker:
-        _bytes_per_block = KV_BYTES_PER_BLOCK
+        _bytes_per_block = 8 * PAGE_BYTES
 
         def __init__(self, **kwargs):
             worker_kwargs.update(kwargs)
 
     monkeypatch.setattr(shared_manager, "SpyreSharedOffloadingManager", RecordingManager)
     monkeypatch.setattr(shared_worker, "SpyreSharedOffloadingWorker", RecordingWorker)
-    spec = module.SpyreSharedOffloadingSpec(_config())
+    spec = module.SpyreSharedOffloadingSpec(_config(num_blocks=256, layer_count=4))
     spec.bind_vllm_config(_vllm_config())
-    physical = _physical()
+    physical = _physical(cache_count=4)
     spec.bind_physical_caches(physical)
 
+    assert spec.component_count == 8
+    assert spec.max_pool_slots == 2048
     assert spec.get_manager().__class__ is RecordingManager
     spec._create_worker(physical)
 
+    manifest = module.component_manifest(physical)
     assert manager_kwargs["metadata_name"] == "run-42"
-    assert manager_kwargs["families"] == spec.families
-    assert manager_kwargs["num_blocks"] == 8
+    assert manager_kwargs["pool_name"] == "run-42.data"
+    assert manager_kwargs["component_count"] == 8
+    assert manager_kwargs["max_pool_slots"] == 2048
     assert worker_kwargs["physical"] is physical
-    assert worker_kwargs["families"] == spec.families
+    assert worker_kwargs["pool_name"] == "run-42.data"
+    assert worker_kwargs["geometry"].slot_count == 2048
+    assert worker_kwargs["manifest"] == manifest
+    assert worker_kwargs["max_pool_slots"] == 2048
     assert len(worker_kwargs["compatibility_digest"]) == 32
+
+
+def test_worker_factory_rejects_physical_component_count_mismatch(monkeypatch):
+    module = _shared_spec_module()
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    monkeypatch.setattr(module, "page_signature", lambda *_: _signature())
+    spec = module.SpyreSharedOffloadingSpec(_config(layer_count=2))
+    spec.bind_vllm_config(_vllm_config())
+    with pytest.raises(ValueError, match="component count"):
+        spec._create_worker(_physical(cache_count=1))
 
 
 def test_shared_spec_factory_registration_is_lazy():
@@ -388,7 +449,6 @@ assert cls.__name__ == "SpyreSharedOffloadingSpec"
 assert module in sys.modules
 print("lazy-ok")
 """
-
     completed = subprocess.run(
         [sys.executable, "-c", code],
         check=True,
@@ -396,7 +456,6 @@ print("lazy-ok")
         text=True,
         env={**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"},
     )
-
     assert completed.stdout.strip().splitlines()[-1] == "lazy-ok"
 
 
@@ -413,14 +472,6 @@ sys.modules["torch_spyre._C"] = torch_spyre._C
 
 import spyre_inference
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
-
-m1 = OffloadingSpecFactory.get_spec_cls({
-    "spec_name": "SpyreOffloadingSpec",
-    "spec_module_path": "spyre_inference.v1.kv_offload.spec",
-})
-assert m1.__name__ == "SpyreOffloadingSpec"
-m2 = OffloadingSpecFactory.get_spec_cls({"spec_name": "SpyreSharedOffloadingSpec"})
-
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
     OffloadingConfig,
@@ -429,6 +480,12 @@ from vllm.v1.kv_offload.config import (
     OffloadingParallelConfig,
 )
 
+m1 = OffloadingSpecFactory.get_spec_cls({
+    "spec_name": "SpyreOffloadingSpec",
+    "spec_module_path": "spyre_inference.v1.kv_offload.spec",
+})
+assert m1.__name__ == "SpyreOffloadingSpec"
+m2 = OffloadingSpecFactory.get_spec_cls({"spec_name": "SpyreSharedOffloadingSpec"})
 config = OffloadingConfig(
     groups=(OffloadingGroupConfig(tokens_per_block=128, layer_names=("layer.0",)),),
     worker_kv_bytes_per_block=524288,
@@ -436,22 +493,15 @@ config = OffloadingConfig(
     extra_config={
         "cpu_bytes_to_use": 4194304,
         "shared_metadata_name": "run-42",
-        "shared_pool_families": ["pool-a"],
+        "pool_name": "run-42.data",
     },
     engine_id="eng0",
     model=OffloadingModelConfig(name="model-a", dtype="float16"),
     cache=OffloadingCacheConfig(tokens_per_hash=128, blocks_per_chunk=1),
     parallel=OffloadingParallelConfig(
-        rank=0,
-        world_size=1,
-        tp_size=1,
-        pp_size=1,
-        pcp_size=1,
-        dcp_size=1,
-        data_parallel_index=0,
-        data_parallel_size=1,
-        data_parallel_rank_local=None,
-        is_parallelism_agnostic=False,
+        rank=0, world_size=1, tp_size=1, pp_size=1, pcp_size=1, dcp_size=1,
+        data_parallel_index=0, data_parallel_size=1,
+        data_parallel_rank_local=None, is_parallelism_agnostic=False,
     ),
 )
 try:
@@ -464,7 +514,6 @@ else:
     raise AssertionError("missing M2 runtime unexpectedly succeeded")
 print("missing-runtime-ok")
 """
-
     completed = subprocess.run(
         [sys.executable, "-c", code],
         check=True,
@@ -476,7 +525,6 @@ print("missing-runtime-ok")
             "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
         },
     )
-
     assert completed.stdout.strip().splitlines()[-1] == "missing-runtime-ok"
 
 
@@ -490,6 +538,5 @@ def test_m1_factory_still_builds_the_upstream_manager():
         }
     )
     spec = OffloadingSpecFactory.create_spec(config)
-
     assert type(spec) is SpyreOffloadingSpec
     assert type(spec.get_manager()) is CPUOffloadingManager

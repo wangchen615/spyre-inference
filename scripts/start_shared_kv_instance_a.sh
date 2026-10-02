@@ -26,7 +26,7 @@ export VLLM_ENABLE_V1_MULTIPROCESSING=0
 export VLLM_PLUGINS=spyre_inference
 
 model="${MODEL:-ibm-ai-platform/micro-g3.3-8b-instruct-1b}"
-kv_transfer_config='{"kv_connector":"SpyreOffloadingConnector","kv_role":"kv_both","kv_connector_module_path":"spyre_inference.v1.kv_offload.connector","kv_connector_extra_config":{"spec_name":"SpyreSharedOffloadingSpec","shared_metadata_name":"spyre_manual_4096","shared_pool_families":["spyre_manual_4096.a","spyre_manual_4096.b"],"cpu_bytes_to_use":536870912}}'
+kv_transfer_config='{"kv_connector":"SpyreOffloadingConnector","kv_role":"kv_both","kv_connector_module_path":"spyre_inference.v1.kv_offload.connector","kv_connector_extra_config":{"spec_name":"SpyreSharedOffloadingSpec","shared_metadata_name":"spyre_manual_4096","pool_name":"spyre_manual_4096.data","cpu_bytes_to_use":536870912}}'
 
 command=(
     uv run --no-sync vllm serve "$model"

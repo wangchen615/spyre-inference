@@ -22,11 +22,11 @@ import json
 import time
 import urllib.error
 import urllib.request
-import uuid
 from dataclasses import dataclass
 from typing import Any
 
 DEFAULT_MODEL = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
+DEFAULT_IDENTIFIER = "spyre-shared-kv-visual-demo-v1"
 LOAD_BYTES = "vllm:kv_offload_load_bytes_total"
 LOAD_TIME = "vllm:kv_offload_load_time_total"
 STORE_BYTES = "vllm:kv_offload_store_bytes_total"
@@ -38,18 +38,33 @@ RESPONSE_INSTRUCTION = (
     "\n\nResponse: Summarize the recurring symptoms and give three concrete "
     "recovery actions in plain language."
 )
+WARMUP_RESPONSE_INSTRUCTION = "\n\nWarmup response: emit sixteen deterministic tokens."
+MEASURED_PROMPT = """
+You are reviewing an accelerator inference incident for a live demonstration.
+The gateway accepted a long-context generation request and divided its prefill
+into bounded chunks. The Spyre worker computed deterministic key and value
+pages, copied completed pages into shared host memory, and published them only
+after each transfer finished. A serving instance can later find the same
+content, reload those pages, and continue generation without recomputing the
+cached prefix. Review the incident, preserve the important component names,
+and explain the expected recovery behavior in plain language.
+""".strip()
 SETUP_HELP = """Requirements:
   - Start two already-running vLLM servers on separate Spyre devices.
   - Configure both with SpyreSharedOffloadingSpec, the same shared-pool
-    metadata name and pool-family list, and the same PYTHONHASHSEED.
+    metadata name and one data-pool name, and the same PYTHONHASHSEED.
   - Use tensor parallel size 1, the uni executor, disabled prefix caching,
     and a model length of at least prompt tokens plus output tokens.
   - Keep both servers dedicated: send no other requests during this demo.
+  - Before a new A -> A -> B sequence, stop both servers and clean the pools:
+      uv run --no-sync python scripts/cleanup_shared_kv_demo.py
 
-This script does not start or stop either server.
+Run this command once against A, again against A, and then against B. Keep the
+identifier unchanged so all three invocations create exactly the same prompt.
 
 Example:
-  uv run --no-sync python -u scripts/shared_kv_two_instance_demo.py
+  uv run --no-sync python -u scripts/shared_kv_two_instance_demo.py \\
+    --instance A --host 127.0.0.1 --port 18100
 """
 
 
@@ -57,6 +72,7 @@ Example:
 class Completion:
     text: str
     token_ids: tuple[int, ...]
+    ttft_seconds: float
     wall_seconds: float
 
 
@@ -102,31 +118,9 @@ def select_prompt_token_ids(
     return tuple(token_ids[:prefix_count]) + suffix
 
 
-def build_realistic_prompt(run_id: str | None = None) -> str:
-    run_identifier = f"Run identifier: {run_id}.\n" if run_id else ""
-    introduction = (
-        f"{run_identifier}"
-        "You are reviewing an accelerator inference incident. Read the request "
-        "traces below, identify recurring symptoms, and propose a concise recovery "
-        "plan. Preserve important times, component names, and observed behavior.\n\n"
-    )
-    traces = []
-    for index in range(1, 65):
-        traces.append(
-            f"Request trace {index:03d}: The gateway accepted a long-context "
-            f"generation request for tenant-{index % 7}. The scheduler assigned "
-            f"batch-{1000 + index} to accelerator-{index % 2} and divided prefill "
-            "into bounded chunks. Device memory pressure remained stable while the "
-            "worker produced deterministic key and value pages. Completed pages "
-            "were copied to the shared host-memory tier and published only after "
-            "the transfer completed. A second serving instance queried the same "
-            "content hash, resolved the shared slot, reloaded the page, and resumed "
-            "generation without recomputing the cached prefix. Operators recorded "
-            "request latency, transferred bytes, copy duration, cache source, and "
-            "the generated token sequence for comparison. No disk-tier access, "
-            "device fallback, stale page, or partial payload was observed.\n"
-        )
-    return introduction + "\n".join(traces)
+def build_measured_prompt(identifier: str) -> str:
+    header = f"Shared KV demo identifier: {identifier}\n\n"
+    return header + (MEASURED_PROMPT + "\n\n") * 128
 
 
 def _get_text(url: str, timeout: float) -> str:
@@ -200,27 +194,25 @@ def _metric_snapshot(
         raise RuntimeError(f"{error} from {server}") from error
 
 
-def _wait_for_deltas(
+def _wait_for_request_metrics(
     server: str,
     before: dict[str, float],
-    names: tuple[str, ...],
     request_timeout: float,
     metric_timeout: float,
 ) -> dict[str, float]:
     deadline = time.monotonic() + metric_timeout
     last = dict.fromkeys(before, 0.0)
     while time.monotonic() < deadline:
-        after = _metric_snapshot(
-            server,
-            request_timeout,
-            required_names=names,
-        )
+        after = _metric_snapshot(server, request_timeout)
         last = {name: after[name] - before[name] for name in before}
-        if all(last[name] > 0 for name in names):
+        computed = last[LOCAL_COMPUTE] > 0 and last[STORE_BYTES] > 0 and last[STORE_TIME] > 0
+        loaded = last[EXTERNAL_TRANSFER] > 0 and last[LOAD_BYTES] > 0 and last[LOAD_TIME] > 0
+        if computed or loaded:
             return last
         time.sleep(0.2)
-    expected = {name: last[name] for name in names}
-    raise RuntimeError(f"no positive metric delta for {names}: {expected}")
+    raise RuntimeError(
+        f"request produced neither a compute/store nor an external-reload metric delta: {last}"
+    )
 
 
 def _require_prompt_source(
@@ -249,24 +241,63 @@ def _complete(
     print_output: bool = True,
 ) -> Completion:
     started = time.monotonic()
-    body = _post_json(
+    request = urllib.request.Request(
         f"{server}/v1/completions",
-        {
-            "model": model,
-            "prompt": prompt,
-            "add_special_tokens": False,
-            "temperature": 0.0,
-            "seed": 17,
-            "ignore_eos": True,
-            "max_tokens": output_tokens,
-            "return_token_ids": True,
-        },
-        request_timeout,
+        data=json.dumps(
+            {
+                "model": model,
+                "prompt": prompt,
+                "add_special_tokens": False,
+                "temperature": 0.0,
+                "seed": 17,
+                "ignore_eos": True,
+                "max_tokens": output_tokens,
+                "return_token_ids": True,
+                "stream": True,
+            }
+        ).encode(),
+        headers={"Accept": "text/event-stream", "Content-Type": "application/json"},
+        method="POST",
     )
-    choice = body["choices"][0]
+    text_parts: list[str] = []
+    token_ids: list[int] = []
+    ttft_seconds: float | None = None
+    try:
+        with urllib.request.urlopen(request, timeout=request_timeout) as response:
+            for raw_line in response:
+                line = raw_line.decode().strip()
+                if not line.startswith("data: "):
+                    continue
+                payload = line.removeprefix("data: ")
+                if payload == "[DONE]":
+                    break
+                chunk = json.loads(payload)
+                if "error" in chunk:
+                    raise RuntimeError(f"streaming completion failed: {chunk['error']}")
+                choices = chunk.get("choices", ())
+                if not choices:
+                    continue
+                choice = choices[0]
+                chunk_token_ids = choice.get("token_ids") or ()
+                chunk_text = choice.get("text", "")
+                if ttft_seconds is None and (chunk_token_ids or chunk_text):
+                    ttft_seconds = time.monotonic() - started
+                token_ids.extend(chunk_token_ids)
+                text_parts.append(chunk_text)
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")
+        raise RuntimeError(
+            f"request failed for {server}/v1/completions ({error.code}): {detail}"
+        ) from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"request failed for {server}/v1/completions: {error}") from error
+
+    if ttft_seconds is None:
+        raise RuntimeError(f"{label} returned no output token")
     completion = Completion(
-        text=choice["text"],
-        token_ids=tuple(choice["token_ids"]),
+        text="".join(text_parts),
+        token_ids=tuple(token_ids),
+        ttft_seconds=ttft_seconds,
         wall_seconds=time.monotonic() - started,
     )
     if len(completion.token_ids) != output_tokens:
@@ -275,6 +306,7 @@ def _complete(
         )
     if print_output:
         print(f"\n=== {label} output ===")
+        print(f"TTFT: {completion.ttft_seconds:.3f} seconds")
         print(f"wall time: {completion.wall_seconds:.3f} seconds")
         print(f"token IDs: {list(completion.token_ids)}")
         print(f"text: {json.dumps(completion.text, ensure_ascii=False)}")
@@ -288,12 +320,15 @@ def _prepare_prompt(
     prompt_tokens: int,
     output_tokens: int,
     request_timeout: float,
+    *,
+    text: str | None = None,
+    response_instruction: str = RESPONSE_INSTRUCTION,
 ) -> tuple[int, ...]:
     tokenized = _post_json(
         f"{server}/tokenize",
         {
             "model": model,
-            "prompt": build_realistic_prompt(run_id=run_id),
+            "prompt": text if text is not None else build_measured_prompt(run_id),
             "add_special_tokens": False,
         },
         request_timeout,
@@ -302,7 +337,7 @@ def _prepare_prompt(
         f"{server}/tokenize",
         {
             "model": model,
-            "prompt": RESPONSE_INSTRUCTION,
+            "prompt": response_instruction,
             "add_special_tokens": False,
         },
         request_timeout,
@@ -321,228 +356,189 @@ def _prepare_prompt(
     return prompt
 
 
-def run_demo(
+def _verify_server(
+    instance_name: str,
+    server: str,
+    request_timeout: float,
+) -> None:
+    _get_text(f"{server}/health", request_timeout)
+    metrics = _get_text(f"{server}/metrics", request_timeout)
+    try:
+        disabled = metric_value(
+            metrics,
+            "vllm:cache_config_info",
+            {"enable_prefix_caching": "False"},
+            required=True,
+        )
+    except ValueError as error:
+        raise RuntimeError(f"{error} from instance {instance_name} at {server}") from error
+    if disabled <= 0:
+        raise RuntimeError(
+            f"instance {instance_name} at {server} does not report prefix caching disabled"
+        )
+
+
+def _prompt_preview(prompt_text: str, limit: int = 800) -> str:
+    if len(prompt_text) <= limit:
+        return prompt_text
+    tail = 160
+    return (
+        f"{prompt_text[: limit - tail]}\n"
+        "... [prompt shortened for display] ...\n"
+        f"{prompt_text[-tail:]}"
+    )
+
+
+def execute_request(
     *,
-    server_a: str,
-    server_b: str,
+    label: str,
+    instance_name: str,
+    host: str,
+    port: int,
     model: str,
+    identifier: str,
+    prompt_source: str,
+    response_instruction: str,
+    prompt_tokens: int,
+    output_tokens: int,
+    request_timeout: float,
+    metric_timeout: float,
+    expected_source: str | None = None,
+) -> dict[str, Any]:
+    if not host.strip():
+        raise ValueError("host must not be empty")
+    if not 1 <= port <= 65535:
+        raise ValueError(f"port must be between 1 and 65535, got {port}")
+    server = f"http://{host.strip()}:{port}"
+    _verify_server(instance_name, server, request_timeout)
+
+    prompt = _prepare_prompt(
+        server,
+        model,
+        identifier,
+        prompt_tokens,
+        output_tokens,
+        request_timeout,
+        text=prompt_source,
+        response_instruction=response_instruction,
+    )
+    prompt_text = _post_json(
+        f"{server}/detokenize",
+        {"model": model, "tokens": prompt},
+        request_timeout,
+    )["prompt"]
+
+    print("\n=== Request ===")
+    print(f"Request: {label}")
+    print(f"Instance: {instance_name}")
+    print(f"Endpoint: {server}")
+    print(f"Identifier: {identifier}")
+    print(f"Prompt tokens: {len(prompt)}")
+    print("Prompt preview:")
+    print(_prompt_preview(prompt_text))
+    print("\nSending request...", flush=True)
+
+    before = _metric_snapshot(server, request_timeout)
+    completion = _complete(
+        label,
+        server,
+        model,
+        prompt,
+        output_tokens,
+        request_timeout,
+        print_output=False,
+    )
+    deltas = _wait_for_request_metrics(
+        server,
+        before,
+        request_timeout,
+        metric_timeout,
+    )
+
+    computed = deltas[LOCAL_COMPUTE]
+    loaded = deltas[EXTERNAL_TRANSFER]
+    if computed > 0 and loaded > 0:
+        raise AssertionError(
+            f"request mixed {computed:g} locally computed tokens with "
+            f"{loaded:g} externally loaded tokens"
+        )
+    if computed > 0:
+        actual_source = LOCAL_COMPUTE
+        _require_prompt_source(label, deltas, len(prompt), actual_source)
+        path = "local_compute_store"
+        path_label = "local compute + shared-pool store"
+    else:
+        actual_source = EXTERNAL_TRANSFER
+        _require_prompt_source(label, deltas, len(prompt), actual_source)
+        path = "external_kv_reload"
+        path_label = "external shared-pool reload"
+    if expected_source is not None and actual_source != expected_source:
+        raise AssertionError(
+            f"{label} expected prompt source {expected_source}, got {actual_source}"
+        )
+
+    result: dict[str, Any] = {
+        "instance": instance_name,
+        "endpoint": server,
+        "identifier": identifier,
+        "path": path,
+        "prompt_tokens": len(prompt),
+        "output_tokens": len(completion.token_ids),
+        "ttft_seconds": completion.ttft_seconds,
+        "wall_seconds": completion.wall_seconds,
+        "computed_prompt_tokens": int(computed),
+        "loaded_prompt_tokens": int(loaded),
+        "store_bytes": int(deltas[STORE_BYTES]),
+        "store_copy_seconds": deltas[STORE_TIME],
+        "load_bytes": int(deltas[LOAD_BYTES]),
+        "load_copy_seconds": deltas[LOAD_TIME],
+        "token_ids": list(completion.token_ids),
+        "text": completion.text,
+    }
+
+    print("\n=== Result ===")
+    print(f"Path: {path_label}")
+    print(f"TTFT: {completion.ttft_seconds:.3f} seconds")
+    print(f"E2E wall time: {completion.wall_seconds:.3f} seconds")
+    print(f"Prompt source: {int(computed)} local-compute tokens")
+    print(f"Prompt source: {int(loaded)} external-transfer tokens")
+    if path == "local_compute_store":
+        print(f"KV stored: {int(deltas[STORE_BYTES])} bytes")
+        print(f"KV store copy time: {deltas[STORE_TIME]:.6f} seconds")
+    else:
+        print(f"KV loaded: {int(deltas[LOAD_BYTES])} bytes")
+        print(f"KV load copy time: {deltas[LOAD_TIME]:.6f} seconds")
+    print(f"Output token IDs: {list(completion.token_ids)}")
+    print(f"Output text: {json.dumps(completion.text, ensure_ascii=False)}")
+    return result
+
+
+def run_request(
+    *,
+    instance_name: str,
+    host: str,
+    port: int,
+    model: str,
+    identifier: str,
     prompt_tokens: int,
     output_tokens: int,
     request_timeout: float,
     metric_timeout: float,
 ) -> dict[str, Any]:
-    server_a = server_a.rstrip("/")
-    server_b = server_b.rstrip("/")
-    if server_a == server_b:
-        raise ValueError("instances A and B must use different server URLs")
-    for name, server in (("A", server_a), ("B", server_b)):
-        _get_text(f"{server}/health", request_timeout)
-        metrics = _get_text(f"{server}/metrics", request_timeout)
-        try:
-            prefix_caching_disabled = metric_value(
-                metrics,
-                "vllm:cache_config_info",
-                {"enable_prefix_caching": "False"},
-                required=True,
-            )
-        except ValueError as error:
-            raise RuntimeError(f"{error} from instance {name} at {server}") from error
-        if prefix_caching_disabled <= 0:
-            raise RuntimeError(f"instance {name} does not report prefix caching disabled")
-
-    warmup_id = uuid.uuid4().hex
-    warmup_a_prompt = _prepare_prompt(
-        server_a,
-        model,
-        f"warmup-a-{warmup_id}",
-        prompt_tokens,
-        output_tokens,
-        request_timeout,
+    return execute_request(
+        label=f"instance {instance_name} measured request",
+        instance_name=instance_name,
+        host=host,
+        port=port,
+        model=model,
+        identifier=identifier,
+        prompt_source=build_measured_prompt(identifier),
+        response_instruction=RESPONSE_INSTRUCTION,
+        prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens,
+        request_timeout=request_timeout,
+        metric_timeout=metric_timeout,
     )
-    warmup_b_prompt = _prepare_prompt(
-        server_b,
-        model,
-        f"warmup-b-{warmup_id}",
-        prompt_tokens,
-        output_tokens,
-        request_timeout,
-    )
-
-    print(
-        f"Warming A and B with distinct {prompt_tokens}-token prompts "
-        f"and {output_tokens} output tokens each"
-    )
-    before = _metric_snapshot(server_a, request_timeout)
-    warmup_a = _complete(
-        "A warmup",
-        server_a,
-        model,
-        warmup_a_prompt,
-        output_tokens,
-        request_timeout,
-        print_output=False,
-    )
-    warmup_a_metrics = _wait_for_deltas(
-        server_a,
-        before,
-        (STORE_BYTES, STORE_TIME, LOCAL_COMPUTE),
-        request_timeout,
-        metric_timeout,
-    )
-    _require_prompt_source(
-        "A warmup",
-        warmup_a_metrics,
-        len(warmup_a_prompt),
-        LOCAL_COMPUTE,
-    )
-
-    before = _metric_snapshot(server_b, request_timeout)
-    warmup_b = _complete(
-        "B warmup",
-        server_b,
-        model,
-        warmup_b_prompt,
-        output_tokens,
-        request_timeout,
-        print_output=False,
-    )
-    warmup_b_metrics = _wait_for_deltas(
-        server_b,
-        before,
-        (STORE_BYTES, STORE_TIME, LOCAL_COMPUTE),
-        request_timeout,
-        metric_timeout,
-    )
-    _require_prompt_source(
-        "B warmup",
-        warmup_b_metrics,
-        len(warmup_b_prompt),
-        LOCAL_COMPUTE,
-    )
-    print(f"A warmup wall time: {warmup_a.wall_seconds:.3f} seconds")
-    print(f"B warmup wall time: {warmup_b.wall_seconds:.3f} seconds")
-    print("Warmup complete; starting measured requests")
-
-    run_id = uuid.uuid4().hex
-    prompt = _prepare_prompt(
-        server_a,
-        model,
-        run_id,
-        prompt_tokens,
-        output_tokens,
-        request_timeout,
-    )
-    prompt_text = _post_json(
-        f"{server_a}/detokenize",
-        {"model": model, "tokens": prompt},
-        request_timeout,
-    )["prompt"]
-    print(f"Run identifier: {run_id}")
-    print(f"Prompt: exactly {len(prompt)} token IDs")
-    print(f"Prompt preview: {prompt_text[:500]!r}")
-
-    before = _metric_snapshot(server_a, request_timeout)
-    baseline = _complete(
-        "A data-cold compute/store",
-        server_a,
-        model,
-        prompt,
-        output_tokens,
-        request_timeout,
-    )
-    cold = _wait_for_deltas(
-        server_a,
-        before,
-        (STORE_BYTES, STORE_TIME, LOCAL_COMPUTE),
-        request_timeout,
-        metric_timeout,
-    )
-    _require_prompt_source("A data-cold", cold, len(prompt), LOCAL_COMPUTE)
-
-    before = _metric_snapshot(server_a, request_timeout)
-    a_reload = _complete(
-        "A self shared-pool reload",
-        server_a,
-        model,
-        prompt,
-        output_tokens,
-        request_timeout,
-    )
-    a_load = _wait_for_deltas(
-        server_a,
-        before,
-        (LOAD_BYTES, LOAD_TIME, EXTERNAL_TRANSFER),
-        request_timeout,
-        metric_timeout,
-    )
-    _require_prompt_source("A self reload", a_load, len(prompt), EXTERNAL_TRANSFER)
-
-    before = _metric_snapshot(server_b, request_timeout)
-    b_reload = _complete(
-        "B peer shared-pool reload",
-        server_b,
-        model,
-        prompt,
-        output_tokens,
-        request_timeout,
-    )
-    b_load = _wait_for_deltas(
-        server_b,
-        before,
-        (LOAD_BYTES, LOAD_TIME, EXTERNAL_TRANSFER),
-        request_timeout,
-        metric_timeout,
-    )
-    _require_prompt_source("B peer reload", b_load, len(prompt), EXTERNAL_TRANSFER)
-    if not (cold[STORE_BYTES] == a_load[LOAD_BYTES] == b_load[LOAD_BYTES]):
-        raise AssertionError(
-            "store and reload transfer byte counts differ: "
-            f"A store={cold[STORE_BYTES]}, A load={a_load[LOAD_BYTES]}, "
-            f"B load={b_load[LOAD_BYTES]}"
-        )
-
-    outputs_identical = (
-        a_reload.token_ids == baseline.token_ids
-        and a_reload.text.encode() == baseline.text.encode()
-        and b_reload.token_ids == baseline.token_ids
-        and b_reload.text.encode() == baseline.text.encode()
-    )
-    if not outputs_identical:
-        raise AssertionError("cold, self-reload, and peer-reload outputs differ")
-
-    result = {
-        "run_id": run_id,
-        "prompt_tokens": len(prompt),
-        "output_tokens": len(baseline.token_ids),
-        "warmup": {
-            "a_wall_seconds": warmup_a.wall_seconds,
-            "b_wall_seconds": warmup_b.wall_seconds,
-            "prompt_tokens_each": prompt_tokens,
-            "output_tokens_each": output_tokens,
-        },
-        "a_cold": {
-            "wall_seconds": baseline.wall_seconds,
-            "computed_prompt_tokens": int(cold[LOCAL_COMPUTE]),
-            "store_bytes": int(cold[STORE_BYTES]),
-            "store_copy_seconds": cold[STORE_TIME],
-        },
-        "a_self_reload": {
-            "wall_seconds": a_reload.wall_seconds,
-            "loaded_prompt_tokens": int(a_load[EXTERNAL_TRANSFER]),
-            "load_bytes": int(a_load[LOAD_BYTES]),
-            "load_copy_seconds": a_load[LOAD_TIME],
-        },
-        "b_peer_reload": {
-            "wall_seconds": b_reload.wall_seconds,
-            "loaded_prompt_tokens": int(b_load[EXTERNAL_TRANSFER]),
-            "load_bytes": int(b_load[LOAD_BYTES]),
-            "load_copy_seconds": b_load[LOAD_TIME],
-        },
-        "outputs_identical": True,
-    }
-    print("\n=== Verification summary ===")
-    print(json.dumps(result, indent=2, sort_keys=True))
-    return result
 
 
 def _parse_args() -> argparse.Namespace:
@@ -551,17 +547,15 @@ def _parse_args() -> argparse.Namespace:
         epilog=SETUP_HELP,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--server-a",
-        default="http://127.0.0.1:18100",
-        help="instance A base URL (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--server-b",
-        default="http://127.0.0.1:18101",
-        help="instance B base URL (default: %(default)s)",
-    )
+    parser.add_argument("--instance", required=True, help="display name, such as A or B")
+    parser.add_argument("--host", required=True, help="instance IP address or host name")
+    parser.add_argument("--port", required=True, type=int, help="instance HTTP port")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="served model name")
+    parser.add_argument(
+        "--identifier",
+        default=DEFAULT_IDENTIFIER,
+        help="stable prompt identifier; use the same value for A, A, and B",
+    )
     parser.add_argument("--prompt-tokens", type=int, default=4096)
     parser.add_argument("--output-tokens", type=int, default=16)
     parser.add_argument("--request-timeout", type=float, default=900)
@@ -571,15 +565,19 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    run_demo(
-        server_a=args.server_a,
-        server_b=args.server_b,
+    result = run_request(
+        instance_name=args.instance,
+        host=args.host,
+        port=args.port,
         model=args.model,
+        identifier=args.identifier,
         prompt_tokens=args.prompt_tokens,
         output_tokens=args.output_tokens,
         request_timeout=args.request_timeout,
         metric_timeout=args.metric_timeout,
     )
+    print("\n=== Machine-readable result ===")
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

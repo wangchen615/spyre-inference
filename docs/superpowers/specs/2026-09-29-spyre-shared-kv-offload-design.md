@@ -2,396 +2,447 @@
 
 ## Purpose
 
-Add an explicitly selected `SpyreSharedOffloadingSpec` that lets two vLLM
-instances on one host reuse KV blocks through Flex `SharedMetadata` and
-`SharedHostPool`. Instance A can publish a completed logical KV block and
-instance B can recognize the same vLLM offload key, reload the complete block,
-and generate the same deterministic output as a no-cache run.
+Add an explicitly selected `SpyreSharedOffloadingSpec` that lets compatible
+vLLM instances on one host reuse Spyre KV pages through one Flex
+`SharedMetadata` directory and one `SharedHostPool` data pool. Instance A can
+publish the pages produced for a vLLM offload key, and instance B can locate
+and reload every page required for that same key without recomputing its
+prefix.
 
-The primary milestone is functional correctness. The acceptance run records
-the time for instance A to reload its own published blocks and for instance B
-to reload those same blocks, but an M1 versus M2 performance comparison is
-deferred.
+The design follows the slot geometry and copy contract in
+`SharedKvPoolRFC.md` at commit
+`114011e842014b8ce6eb2fde9e3f83fd6abb9a81`:
+
+- a data pool is one DMA-reachable region divided into equal-size slots;
+- one slot holds one physical KV page;
+- `slot_bytes` accommodates the largest physical KV page used with the pool;
+- each metadata key resolves to one `(pool_id, slot_id)`;
+- one page is copied to or from the beginning of its selected slot; and
+- a pool slot is claimed independently from the pool's free-slot list.
+
+The first milestone prioritizes correctness. The acceptance run also records
+time to first token (TTFT), end-to-end request time, and KV transfer metrics so
+that cold computation can be compared with same-instance and peer-instance
+reload.
 
 ## Starting Point and Branch Isolation
 
-The implementation branch is `kvc-offload-m2`, created from
-`kvc-offload-m1` commit `86f56ed`. It lives in the isolated worktree
-`/home/yzhu/dt-inductor/spyre-inference-kvc-offload-m2`; the dirty
-`kvc-offload-poc` worktree remains untouched.
+The implementation branch is `kvc-offload-m2`, rebased on
+`kvc-offload-m1`, in
+`/home/yzhu/dt-inductor/spyre-inference-kvc-offload-m2`. Flex and torch-spyre
+have corresponding local M2 branches rebased on their M1 branches.
 
-Flex `kvc-offload-m2` at `e6dff26d` supplies the versioned directory, publish
-gate, slot read pins, dynamic pool registration, and cross-process race tests.
-torch-spyre `kvc-offload-m2` at `39b479fd` exposes that contract to Python and
-already verifies metadata plus DMA across processes. Changes to those projects
-are made only on their existing `kvc-offload-m2` branches and only when an
-integration test demonstrates a missing runtime capability.
+M1 already provides the required page-copy mechanism:
 
-The mock-safe M1 baseline is 36 passing tests across `test_spec.py`,
-`test_canonicalize_paged.py`, and `test_worker_dispatch.py`.
+- Flex `copyRaw` accepts an optional device `Range` on its pool-slot overload.
+- torch-spyre `copy_kv_page_raw` validates the full rank-four KV allocation,
+  derives the physical range for one `block_id`, and passes that range to
+  Flex.
+- The range works for both token-major and head-major layouts because each
+  physical page is one contiguous, aligned interval in the validated device
+  image.
+
+M2 therefore does not add a pool-relative byte offset or change the raw-copy
+API. There is no such pool-offset parameter in the current M1 or M2 API, so
+nothing is removed: every selected device page continues to copy at byte zero
+of its independently claimed host slot. Existing unrelated and visual-demo
+work in the worktrees remains preserved. Commits, sign-off, and pushing are
+deferred until implementation and validation are complete.
+
+## Terminology
+
+- **vLLM block:** the logical cache unit identified by an `OffloadKey`. With
+  `block_size=128`, it represents 128 token positions for one KV-cache group.
+- **KV component:** one stable K or V cache tensor participating in the
+  supported KV-cache group.
+- **KV page:** the physical byte interval `component_tensor[block_id]` in one
+  full K or V cache tensor. For a cache shaped `[num_blocks, ...]`, each value
+  of `block_id` selects one page.
+- **Data-pool slot:** one fixed-size host-memory location that stores exactly
+  one KV page.
+- **Page key:** a deterministic key derived from the complete vLLM
+  `OffloadKey` and one stable component ID. Flex maps one page key to one
+  pool slot.
+
+One vLLM block normally has several component pages. It therefore occupies
+several independently claimed slots in the one data pool. A full K or V cache
+tensor contains pages for many vLLM block IDs and can consequently occupy many
+pool slots over time. An individual page never spans slots.
 
 ## Scope
 
 The implementation includes:
 
-- lazy factory registration for `SpyreSharedOffloadingSpec`;
-- shared directory and shared data-pool attachment;
-- deterministic vLLM offload-key conversion and cache-compatibility checks;
-- scheduler-side shared lookup, read-pin lifetime, local admission, and local
-  eviction integration;
-- worker-side D2H and H2D transfer through M1's validated
-  `copy_kv_page_raw` path;
-- atomic visibility of a complete logical KV block after all of its component
-  pages finish D2H;
-- ordinary recomputation when lookup or read-pin validation reports a miss;
-- mock-safe unit and connector tests, a Spyre-gated connector round trip, and a
-  two-instance functional acceptance run;
-- recorded shared-pool reload timings for instance A's self-reload and
-  instance B's peer reload.
-
-The implementation does not add a cache policy, disk or network tiers,
-multi-host sharing, DP support, or a host-wide eviction algorithm. It does not
-use or modify vLLM's `SharedOffloadRegion`. The existing M1
-`SpyreOffloadingSpec` retains its engine/rank-private pools, configuration, and
-observable behavior.
+- lazy registration of `SpyreSharedOffloadingSpec` without changing the M1
+  `SpyreOffloadingSpec` selection path;
+- one shared metadata directory and exactly one independently backed shared
+  data pool for this PoC;
+- RFC slot geometry based on one physical KV page;
+- deterministic component-qualified page keys;
+- scheduler-side lookup, claim, pin, completion, and local eviction across all
+  component pages belonging to a vLLM offload key;
+- worker-side D2H and H2D through M1's validated `copy_kv_page_raw` path;
+- connector-level all-pages-present semantics for a logical cache hit;
+- normal vLLM recomputation when any required page is absent or cannot be
+  pinned;
+- cleanup and visual-demo scripts that discover and remove every shared pool
+  owned by the configured demo namespace;
+- mock-safe, hardware, cross-instance, and manual-demo validation; and
+- TTFT, end-to-end time, copied bytes, copy time, and output-equivalence
+  reporting.
 
 M2 retains M1's current restrictions: float16 KV pages, one KV-cache group,
-and `blocks_per_chunk == 1`. This first cross-instance integration additionally
-requires one worker per vLLM instance (`world_size == 1` and the `uni`
-executor). The two-instance acceptance run therefore uses two independent
-single-worker instances on two distinct Spyre devices. M1's existing TP support
-is unaffected; shared offload across TP workers requires a later serializable
-reservation and aggregate-publish protocol.
+`blocks_per_chunk == 1`, and the current supported single-chunk Spyre device
+allocations. This milestone additionally requires `world_size == 1`, TP1, and
+the `uni` executor. The two-instance test uses two independent processes and
+two distinct Spyre devices.
 
-## Approaches Considered
+The implementation does not add multiple active data pools, cross-pool
+placement, contiguous multi-slot allocation, packed aggregate slots,
+pool-relative copy offsets, disk/network tiers, multi-host sharing, DP, or a
+host-wide victim policy.
 
-### Worker-only shared pool substitution
+## Selected Architecture
 
-This is the smallest literal interpretation of the issue: inherit M1's
-manager and worker and replace only private-pool construction. It cannot
-produce a peer hit. The upstream `CPUOffloadingManager` maps an offload key to
-a process-local numeric block ID; instance B therefore reports a miss before
-its worker is asked to load anything. M1's worker also expands one logical host
-block across every physical cache, whereas one Flex directory entry names one
-pool slot.
+### One metadata directory and one data pool
 
-### vLLM `SharedOffloadRegion`
-
-This preserves more upstream CPU-offload code, but it is the wrong storage
-contract. Its lifetime and geometry are scoped to workers in one vLLM engine,
-its DMA registration is CUDA-oriented, and it has no cross-instance block-hash
-directory, versioned read pin, or publish gate.
-
-### Policy-neutral manager integration plus a shared worker
-
-This is the selected approach. `SpyreSharedOffloadingManager` subclasses
-`CPUOffloadingManager` and calls its existing operations for admission
-thresholds, LRU/ARC victim selection, reference counts, metrics, and completion
-bookkeeping. It adds only the shared-directory address/protocol operations
-required to turn a vLLM key into a cross-instance location. A shared worker
-consumes those locations while reusing M1's page validation and raw DMA
-primitive.
-
-## Registration and Runtime Compatibility
-
-`spyre_inference.__init__` registers
-`SpyreSharedOffloadingSpec` with `OffloadingSpecFactory` using module and class
-name strings. Importing `spyre_inference` does not import `shared_spec.py` or
-access `torch_spyre._C.SharedMetadata`. The M2 module and runtime symbols are
-loaded only when the user selects `SpyreSharedOffloadingSpec`.
-
-Consequently:
-
-- an M1-only torch-spyre build can still import and use the plugin;
-- selecting the M2 spec on such a build fails with a direct error naming the
-  missing M2 runtime surface;
-- selecting `SpyreOffloadingSpec` continues to construct the M1 path.
-
-The M1 spec gains `_create_manager()` and `_create_worker()` protected
-construction hooks for its manager and worker.
-Their default implementations construct the same M1 objects with the same
-arguments as today. The M2 subclass overrides those hooks, avoiding a copied
-version of M1's validation, metrics declaration, and physical-cache binding.
-
-## Shared Configuration and Compatibility
-
-Both vLLM instances use the same shared metadata name and the same ordered
-pool-family configuration in `kv_connector_extra_config`:
+Both instances use the same logical names:
 
 ```yaml
 spec_name: SpyreSharedOffloadingSpec
-shared_metadata_name: <host-unique-name>
-shared_pool_families: [<family-name>, ...]
-cpu_bytes_to_use: <aggregate-logical-capacity-in-bytes>
+shared_metadata_name: <host-unique-metadata-name>
+pool_name: <host-unique-data-pool-name>
+cpu_bytes_to_use: <pool-budget>
 ```
 
-`shared_metadata_name` is non-empty and common to the participating instances.
-`shared_pool_families` is a non-empty ordered list of unique names. M1's
-existing `cpu_bytes_to_use` calculation determines the aggregate logical slot
-count; slots are divided across the families in list order, with the remainder
-assigned one at a time to the earliest families. A configuration with fewer
-logical slots than families is rejected.
+`shared_metadata_name` identifies the one CPU-only metadata object.
+`pool_name` identifies the one `SharedHostPool`. Both instances must resolve
+the same values. The RFC configuration precedence for `pool_name` remains
+explicit configuration, then `SPYRE_KV_POOL_NAME`, then a generated private
+name. Cross-instance tests always pass an explicit shared name.
 
-A pool family is a capacity shard with one common logical slot count. Each
-physical K or V page component has a separate data pool in that family. Its
-logical name is `<family>.c<cache-index>.<k-or-v>`. Slot `s` in every component
-pool belongs to the same complete logical KV block.
+The Flex metadata capacity is configured for one registered pool. The pool is
+created or attached once by each participating worker and resolves to one
+`pool_id`. All page locations used by M2 contain that same `pool_id`.
 
-The `c0.k` component pool is the family's anchor. `SharedMetadata.claim`
-allocates only anchor slots. The returned `(anchor_pool_id, slot_id)` identifies
-the family and the common logical slot; auxiliary component pools are never
-independently claimed. The anchor slot's read pin protects reuse of the whole
-family slot because every conforming writer obtains that slot exclusively
-through the anchor claim.
+Flex remains capable of registering several independent pools for future
+memory kinds or placement policies, but M2 neither configures nor exercises
+that policy.
 
-The published Flex chunk descriptor describes only the claimed `c0.k` anchor
-slot, as required by `SharedMetadata`'s per-data-pool slot contract. The
-complete bundle geometry lives in the compatibility descriptor. Publication
-still gates the whole logical block: the worker copies and synchronizes every
-sibling K/V component before publishing the anchor reservation.
+### Slot geometry
 
-The compatibility descriptor covers every fact needed to interpret the
-bundle:
+During KV-cache registration, the worker derives every component's physical
+page size from its complete device allocation:
 
-- format version;
+```text
+page_bytes[c] = composite_address[c].total_size / num_device_blocks
+```
+
+It validates the same divisibility, contiguity, layout, and alignment
+requirements as `copy_kv_page_raw`. For `C` components:
+
+```text
+slot_bytes = align_up(max(page_bytes[0:C]), required_pool_alignment)
+```
+
+Every slot in the pool has this fixed stride. A component smaller than
+`slot_bytes` leaves the remainder of its slot unused. Each copy must satisfy:
+
+```text
+page_bytes[component] <= slot_bytes
+```
+
+The number of pool slots is a multiple of `C`, so scheduler-visible logical
+capacity and physical page capacity remain in step:
+
+```text
+logical_block_capacity = floor(cpu_bytes_to_use / (C * slot_bytes))
+pool_slot_count         = logical_block_capacity * C
+actual_pool_bytes       = pool_slot_count * slot_bytes
+```
+
+If the budget cannot hold all component pages for one vLLM block, startup
+fails. The effective geometry and any bytes lost to slot alignment or
+fixed-slot padding are logged.
+
+For the manual model, the expected geometry is eight page components per
+vLLM block, 256-KiB page slots, 2,048 pool slots, and one 512-MiB data pool.
+The implementation derives and verifies these values rather than hard-coding
+them.
+
+### No slot-contiguity contract
+
+Flex `Claim` removes one slot from an intrusive free-slot list. Initial claims
+may happen to return increasing indices, but abort and eviction return
+individual slots to the head of that list. Neither the RFC nor the API offers
+a contiguous extent allocation.
+
+Accordingly, component pages for one vLLM block may reside anywhere in the
+pool:
+
+```text
+component 0 -> (pool P, slot 7)
+component 1 -> (pool P, slot 2)
+component 2 -> (pool P, slot 11)
+```
+
+Every page location is stored and carried explicitly. No code derives a
+component location with `base_slot + component_index`, and no test relies on
+fresh-pool allocation order.
+
+### Page identity
+
+Flex stores one 64-bit `CompatibleBlockKey.block_hash` per directory entry.
+spyre-inference derives it from:
+
+```text
+page_key = digest(format_version, complete OffloadKey, component_id)
+```
+
+The complete `OffloadKey` includes vLLM's block hash and KV-cache group ID.
+`component_id` is a stable ordinal from the ordered component manifest shared
+by compatible instances. The manifest identifies each K/V component and is
+derived deterministically from the KV-cache group and physical-cache binding;
+process-local object identities are never encoded.
+
+The compatibility descriptor covers every fact required to interpret a page
+key and its bytes:
+
+- format version and page-key algorithm;
 - model identity and revision;
 - vLLM block-hash algorithm and fixed hash seed;
-- tokens per hash and block;
-- dtype;
-- the required TP size of one and component ordering;
-- ordered physical-cache component signatures, including K/V role, layout,
-  page bytes, block size, local KV heads, and head size.
+- token block size and hash granularity;
+- dtype and TP size;
+- ordered component IDs and K/V roles; and
+- each component's layout kind, layout version, physical page bytes, block
+  size, local KV heads, and head size.
 
-Attach rejects mismatched geometry or compatibility before any transfer.
-Cross-instance operation requires the same deterministic vLLM block hashes;
-both acceptance servers therefore use the same explicit `PYTHONHASHSEED` and
-hash algorithm.
+Registration or attachment rejects a different manifest, slot geometry, or
+model compatibility before issuing DMA.
 
-Flex currently stores a 64-bit `BlockHash`. spyre-inference derives that value
-deterministically from the complete vLLM `OffloadKey`, including its group ID,
-with a fixed 64-bit digest. The compatibility descriptor isolates incompatible
-models and layouts. Expanding the Flex key width is a separate runtime-format
-change and is not part of this milestone.
+### Logical block availability
 
-Multiple configured pool families contribute aggregate capacity. Placement
-tries compatible families in deterministic hash order and records the family
-actually returned by `claim`; lookup always follows the directory entry and
-therefore resolves one exact family and slot.
+Flex independently tracks each page entry. spyre-inference defines a vLLM
+offload-key hit as the conjunction of all required page entries:
 
-The worker creates or attaches the directory during KV-cache registration,
-using empty initial pools and fixed capacity for every configured family and
-the maximum component count implied by the KV-cache layer configuration. It
-then derives the exact physical component signatures, registers or attaches
-each component pool, and resolves its DMA-capable handles. The manager attaches
-the same directory lazily on its first lookup or store, after worker
-registration and device initialization. It resolves every family anchor by
-name before lookup or claim. This ordering prevents M2 construction from
-starting torch-spyre's runtime before the worker establishes its rank and
-device environment.
+```text
+logical_hit(key) = every page_key(key, component) is VALID and pinned
+```
+
+Individual page publication is visible in Flex, but a partially published or
+partially evicted set is never exposed to vLLM as a logical hit. If lookup or
+pinning fails for any page, pins already acquired for that key are released
+and the connector reports `LookupResult.MISS`.
 
 ## Components
 
-- `shared_spec.py` owns M2 configuration, lazy runtime imports, directory
-  attachment, and the M2 manager/worker construction hooks.
-- `shared_manager.py` adapts `CPUOffloadingManager` decisions to versioned
-  directory entries and owns pending reservations and read pins.
-- `shared_worker.py` maps a family and logical slot to every physical K/V pool,
-  executes M1's validated page copies, and publishes only after the complete
-  logical block is durable in host memory.
-- A small `SharedLoadStoreSpec` carries offload keys, family/slot locations,
-  and store reservations between the manager and worker. It remains
-  process-local under the required `uni` executor; no pybind protocol object is
-  serialized.
-- `spyre_inference.__init__` contains only the lazy factory registration and no
-  M2 runtime import.
+- `shared_spec.py` owns M2 configuration, one-pool geometry, compatibility,
+  and manager/worker construction.
+- `shared_types.py` defines the component manifest, component-qualified page
+  key, page location, page reservation, and process-local load/store specs.
+- `shared_manager.py` retains upstream admission and logical-block policy while
+  translating each `OffloadKey` into its complete ordered page set.
+- `shared_worker.py` registers or attaches one pool and transfers each page to
+  its explicitly supplied slot.
+- `shared_runtime.py` remains the lazy boundary around the torch-spyre M2
+  bindings.
+- `connector.py` continues to provide both canonical vLLM bookkeeping and the
+  original rank-four physical cache tensors required by
+  `copy_kv_page_raw`.
 
-The directory is attached independently by the scheduler and worker connector
-objects, but both live in the same process under the required `uni` executor.
-Pool registration and resolution happen only on the worker side, where a Spyre
-runtime and physical KV caches already exist. The manager's lazy attach thus
-reuses an initialized process runtime and does not require a metadata-only Flex
-or torch-spyre API.
-
-## Cache Policy Boundary
-
-`SpyreSharedOffloadingManager` retains upstream policy behavior:
-
-- `store_threshold` still controls admission;
-- the configured upstream LRU or ARC policy still selects locally owned
-  victims;
-- upstream reference counts protect locally owned in-flight blocks;
-- upstream completion and metrics behavior remains in force.
-
-The shared integration adds a distinction between locally owned entries and
-peer entries. Locally admitted blocks participate in this instance's upstream
-policy and are removed from `SharedMetadata` when that policy evicts them.
-Peer hits are readable through the directory but are not silently adopted into
-the local eviction policy, so one instance does not invent a policy decision
-for another instance's entry.
-
-If all compatible slots are occupied by peer-owned entries, a store is skipped
-rather than evicting an arbitrary peer entry. Flex explicitly leaves
-host-wide victim selection to follow-on work. This limitation does not affect
-peer lookup/reload and prevents M2 from introducing an unreviewed global cache
-policy.
+The component manifest is finalized during KV-cache canonicalization and must
+be identical on the manager and worker sides before the first shared lookup.
+The `uni`-executor restriction keeps the process-local transfer specification
+and reservation objects out of serialization paths.
 
 ## Data Flow
 
-### Store and publish
-
-1. Upstream `CPUOffloadingManager` logic decides whether the logical block is
-   admitted and which locally owned entries are evicted.
-2. The shared manager evicts the exact directory entries corresponding to
-   those upstream-selected victims.
-3. It claims an anchor slot for the new offload key. A valid existing claim
-   means another instance already published the block, so no duplicate D2H is
-   scheduled and the pending local admission is rolled back. A reserved
-   existing claim remains invisible; this store is skipped and its pending
-   local admission is also rolled back. `NoSpace` skips the store after the
-   same rollback; `Unavailable` is reported as a configuration/runtime error.
-4. The worker copies every K/V physical page component into the selected pool
-   family's common slot using the same page-shape validation and
-   `copy_kv_page_raw` operation as M1.
-5. The single M2 worker synchronizes and publishes the anchor reservation only
-   after every component copy completes. Until then, lookup returns a miss,
-   including during a partially completed multi-component write.
-6. Worker completion lets the manager finish the corresponding upstream local
-   admission.
-7. A failed store is synchronized before its reservation is aborted, so a slot
-   is never reused while DMA can still write it.
-
 ### Lookup and reload
 
-1. The shared manager converts the vLLM offload key and calls
-   `SharedMetadata.lookup`.
-2. It immediately calls `pin_read` on the returned versioned entry. A missing,
-   reserved, stale, or concurrently replaced entry returns `LookupResult.MISS`.
-3. A successful pin is retained by the scheduler-side manager while the load
-   job carries the resolved family and slot identifier to the worker.
-4. The worker reloads every K/V component from that common slot using
-   `copy_kv_page_raw`, then synchronizes.
-5. `complete_load` releases the pin on the scheduler thread after worker
-   completion. Eviction cannot recycle the slot before that release.
+1. For a vLLM `OffloadKey`, the manager derives every ordered page key.
+2. It looks up and read-pins each page entry independently.
+3. If any lookup or pin fails, it releases all pins acquired for that logical
+   key and returns `MISS`.
+4. On a complete hit, `prepare_load` passes every explicit page location to
+   the worker while retaining every pin.
+5. For each component, the worker calls `copy_kv_page_raw` with the full
+   rank-four cache tensor, the destination device block ID, the one shared
+   pool, and that component's slot ID.
+6. `copy_kv_page_raw` derives a device `Range`; Flex copies the selected page
+   to the beginning of the host slot. No pool-relative offset is used.
+7. After the H2D DMAs synchronize, completion releases all page pins.
 
-### Recompute on miss
+### Claim, store, and publish
 
-A directory lookup miss or failed `pin_read` is reported before vLLM commits to
-an external load. The ordinary offloading scheduler therefore schedules the
-uncached tokens for model execution. No H2D is issued and no stale slot is
-consumed. This test targets spyre-inference's translation from the binding
-result to vLLM's `LookupResult.MISS`; Flex and torch-spyre retain responsibility
-for proving that races produce that binding result instead of torn bytes.
+1. Upstream policy decides whether to admit the logical vLLM block and which
+   locally owned logical blocks to evict.
+2. The manager processes component keys in one deterministic order. This makes
+   the first component claim serialize ordinary competing writers.
+3. Each missing component receives an independent reservation from the same
+   pool. Existing valid pages may be reused. An existing reserved page, an
+   unavailable directory, or insufficient free slots causes the new store to
+   stop; reservations obtained by that attempt are aborted before returning.
+4. The worker copies only newly reserved component pages D2H into their exact
+   slots. Existing valid pages are not overwritten.
+5. After all submitted page DMAs synchronize, each new reservation is
+   published with that page's own chunk descriptor.
+6. The manager reports the logical store complete only after every required
+   page is valid. A concurrent reader that observes only part of the page set
+   reports a miss.
+7. If DMA or publication fails, the worker synchronizes, evicts any entries
+   published by that attempt, aborts its remaining reservations, and reports
+   failure. Entries that predated the attempt are untouched.
 
-## Worker Reuse Boundary
+Flex does not provide a multi-entry transaction. Connector-level all-page
+lookup is therefore the visibility boundary. This is safe because a page key
+is immutable for one content-derived key and a partial set is never loaded.
 
-The current M1 worker cannot remain byte-for-byte unchanged as an M2 worker:
-it constructs private pools internally and receives only process-local host
-block IDs. M2 requires a family-plus-slot location supplied by the shared
-directory.
+### Eviction and ownership
 
-The implementation therefore preserves and reuses the correctness-sensitive
-parts rather than duplicating or replacing them:
+Upstream LRU or ARC policy continues to select locally admitted logical
+blocks. For each selected logical block, the shared manager evicts the exact
+page entries that this instance published. Eviction waits for each page's
+read pin before recycling its slot.
 
-- physical rank-4 cache binding and layout signatures;
-- `copy_kv_page_raw` validation and byte-exact DMA;
-- one pre-store device fence per job;
-- synchronous completion and transfer accounting;
-- single-KV-group validation.
-
-M1 keeps its existing private-pool worker behavior. M2 adds only shared
-location routing and publish/pin protocol coordination around the reused page
-copy path.
+Peer-owned entries are readable but are not silently adopted into this
+instance's eviction ownership. A mixture of pre-existing and newly published
+pages records ownership per page. Global victim selection and runtime cleanup
+of unowned partial bundles remain outside this milestone. Controlled test and
+demo teardown removes all shared objects owned by that demo namespace only
+after every participant exits.
 
 ## Failure Handling
 
-- Missing M2 runtime symbols fail only when the M2 spec is selected.
-- Metadata or pool geometry mismatches fail during initialization.
-- `lookup == None` and `pin_read == None` are normal cache misses.
-- `ExistingClaim(valid=False)` is not readable and does not trigger a second
-  writer.
-- `NoSpace` skips the store without changing the serving result.
-- `Unavailable`, a failed DMA, a publish failure, or an impossible component
-  mapping fails the transfer loudly; it is not converted into a cache hit.
-- Cleanup never unlinks a shared directory or pool while another live instance
-  may use it. Forced unlink is limited to controlled test setup/teardown after
-  all participants synchronize.
+- Missing M2 runtime symbols fail only when `SpyreSharedOffloadingSpec` is
+  selected.
+- Metadata, compatibility, or pool-geometry mismatches fail at startup.
+- A page larger than `slot_bytes`, a misaligned device range, or an invalid
+  block ID fails before DMA.
+- Missing, reserved, stale, or unpinnable page entries produce a logical cache
+  miss rather than a partial reload.
+- A mid-claim failure aborts every reservation acquired by that attempt.
+- A transfer failure is synchronized and rolled back before any affected slot
+  can be reused.
+- `NoSpace` skips the store without changing generated output.
+- Cleanup does not unlink live shared objects. After all participating servers
+  stop, controlled cleanup removes every metadata object, data backing, and
+  control object owned by the configured demo namespace, including stale
+  objects left by interrupted or older demo runs. It never removes unrelated
+  pools.
+
+## Repository Impact
+
+### Flex
+
+No production API change is expected. M2 uses the existing RFC operations:
+
+- one-pool registration and resolution;
+- independent `Claim`, `Lookup`, `PinRead`, `Publish`, `Abort`, and `Evict`;
+- fixed-size slot geometry and bounds checks; and
+- `copyRaw(pool, slot, ..., Range)`.
+
+Tests must confirm that page entries remain correct when the free list returns
+non-contiguous slot IDs. A Flex implementation defect found by those tests is
+fixed separately and narrowly.
+
+### torch-spyre
+
+No production API change is expected. M2 reuses M1's
+`copy_kv_page_raw(cache, block_id, pool, slot_id, ...)`, including its
+head-major and token-major range validation. Existing range, bounds, and
+hardware round-trip tests remain regression gates.
+
+### spyre-inference
+
+This repository contains the substantive redesign:
+
+- replace `shared_pool_families` and component pool names with one
+  `pool_name`;
+- replace anchor/sibling routing with component-qualified page entries;
+- compute RFC page-slot geometry and one-pool capacity;
+- carry explicit, potentially non-contiguous page locations;
+- implement all-pages lookup/pinning and per-page claim/publication rollback;
+- preserve M1 connector behavior and restrictions; and
+- update launch, cleanup, visual demo, tests, and result documentation.
 
 ## Testing and Acceptance
 
 ### Mock-safe tests
 
-- factory resolution by `spec_name` without `spec_module_path`;
-- importing the plugin when `SharedMetadata` is absent;
-- M1 factory resolution and worker construction unchanged;
-- deterministic key and compatibility encoding;
-- shared-manager admission remains upstream-controlled;
-- local eviction calls `SharedMetadata.evict` for the exact versioned entry;
-- reserved, stale, and missing entries return a normal miss;
-- a successful lookup retains its read pin through load completion;
-- publish occurs only after every component transfer succeeds;
-- claim rollback covers `ExistingClaim`, `NoSpace`, `Unavailable`, and failed
-  transfers.
+- M1 factory selection and worker behavior remain unchanged.
+- M2 imports lazily when shared runtime symbols are unavailable.
+- configuration resolves exactly one data-pool name.
+- slot size is the aligned maximum component page size.
+- pool capacity accounts for all component slots per logical block.
+- page keys are deterministic and differ by component.
+- attachment rejects component-manifest or geometry mismatch.
+- a deliberately fragmented free list returns non-contiguous slots and the
+  complete page set still round-trips correctly.
+- lookup reports a hit only after every component page is valid and pinned.
+- partial lookup releases already acquired pins and reports a miss.
+- claim, DMA, and publish failures abort or evict only entries created by the
+  failing attempt.
+- locally owned logical eviction removes every locally published component
+  entry and respects outstanding page pins.
 
-### Spyre-gated connector test
+### Hardware tests
 
-Store a known-pattern complete KV block through the shared worker, publish it,
-reload it into fresh KV pages, and compare every K/V component byte-for-byte.
-A separately injected directory miss verifies that the connector schedules
-normal model recomputation and produces the expected output without reading a
-slot.
+- Run existing Flex raw-copy and shared-metadata tests, including range and
+  bounds coverage.
+- Run existing torch-spyre `copy_kv_page_raw` tests for token-major and
+  head-major caches.
+- Store and reload a known-pattern logical block through one shared pool and
+  compare every K/V page byte-for-byte.
+- Run Spyre-backed commands serially, except for the deliberate two-instance
+  topology where each process owns a distinct accelerator.
 
-### Two-instance functional test
+### Cross-instance test
 
-Run two isolated TP1 vLLM instances on distinct available Spyre devices with the
-same model, deterministic hash settings, metadata name, and pool-family
-configuration. Prefix caching is explicitly disabled on both instances. The
-initial request on A completes and releases its device KV blocks before either
-reload is measured, so neither result can be satisfied by a device-resident
-prefix cache:
+Run two compatible TP1 vLLM instances using the same metadata and data-pool
+names with prefix caching disabled. Verify that A publishes all pages, B finds
+and pins their explicit locations, B performs H2D reload, and deterministic
+output matches the cold baseline. The existing cross-instance functional test
+must continue to pass after its configuration and shared-memory assertions are
+updated from component pools to one data pool.
 
-1. Instance A computes, stores, and publishes a prompt block.
-2. Instance A receives the same prompt again and records a shared host-tier
-   self-hit; record the reload duration and bytes per second.
-3. Instance B receives the same prompt as its first request and records a
-   shared host-tier hit.
-4. Instrumentation confirms both reloads perform device-from-host DMA from the
-   shared pool and do not use device-resident prefix KV, recompute the block, or
-   read it from disk.
-5. B's reloaded KV bytes are identical to A's published bytes.
-6. With `temperature=0`, B's generated token IDs and text are identical to a
-   no-cache baseline.
-7. Record B's shared-pool reload duration and bytes per second alongside A's
-   self-reload measurement. No M1 comparison or performance threshold is
-   required in this milestone.
+### Manual A -> A -> B demo
 
-Spyre-backed commands run serially except for the deliberate two-instance
-acceptance topology, which assigns one device to each process. Two commands
-must never contend for the same accelerator.
+1. Stop both servers and run the cleanup script.
+2. Start instance A and instance B on different Spyre devices.
+3. Warm both servers with unrelated junk prompts so compilation and lazy
+   initialization are excluded from measured requests.
+4. Send the measured prompt to A for cold compute/store.
+5. Send the same prompt to A for self-reload.
+6. Send the same prompt to B for peer reload.
+7. Record prompt/output token counts, cold/reload TTFT, end-to-end time,
+   transferred bytes, copy time, and output equality.
+8. Verify prefix caching remains disabled and shared-KV metrics prove that the
+   reload requests loaded rather than recomputed the prompt blocks.
+9. During the run, verify `/dev/shm` contains one metadata object and one active
+   data backing/control pair. After both servers stop, run cleanup and verify
+   that every shared-memory object owned by the demo namespace is gone,
+   including stale pools from interrupted or older runs.
 
-The existing M1 KV-offload test suite is rerun unchanged as the regression
-gate.
-
-## Conditional M2-F3 Work
-
-Before changing Flex, inspect `get_composite_address(...).num_chunks` for every
-real KV allocation used by the connector test. If all are single-chunk, M2-F3
-is not required for this milestone.
-
-If a required KV page is multi-chunk or the connector test reaches Flex's
-`MultiChunkNotSupported` error, extend `copyRaw` on the Flex
-`kvc-offload-m2` branch to pack chunks contiguously into a slot and reload them
-in recorded domain order. Add cross-process multi-chunk and single-chunk
-regression tests in Flex and torch-spyre before resuming spyre-inference. The
-public `copy_tensor_raw(dev_tensor, pool, slot_id, to_device)` shape and
-hardware-runtime ownership of `CompositeAddress.total_size()` remain
-unchanged.
+The expected functional outcome is that the self and peer reloads transfer the
+same KV byte count, produce identical output, and show shorter TTFT than cold
+prefill. Performance is reported rather than enforced as a unit-test
+threshold. These are the same functional and measurement requirements as the
+current demo; only the pool configuration, cleanup expectations, and
+`/dev/shm` topology change to one data pool.
 
 ## Completion Criteria
 
-The milestone is complete when the shared spec resolves lazily, the M1 path is
-unchanged, connector misses recompute, the connector-level shared round trip is
-byte-exact, the two-instance peer hit produces baseline-identical deterministic
-output with prefix caching disabled, and both A's self-reload timing and B's
-peer-reload timing are recorded. Lower-layer race-correctness remains
-demonstrated by the existing Flex and torch-spyre M2 tests rather than
-duplicated here.
+The milestone is complete when:
+
+- both instances attach one compatible data pool;
+- each data slot holds one physical KV page and no implementation assumes slot
+  adjacency;
+- all page entries for one vLLM key reload correctly across instances;
+- partial or stale page sets safely recompute;
+- M1 Flex, torch-spyre, and spyre-inference regression tests remain green;
+- the cross-instance test passes on real Spyre hardware;
+- the documented A -> A -> B demo reports TTFT, end-to-end time, KV bytes,
+  copy time, and identical output;
+- `/dev/shm` shows only the expected one-pool objects during a clean run; and
+- cleanup removes every pool and metadata object owned by the demo namespace
+  after all participants exit, without touching unrelated shared memory.

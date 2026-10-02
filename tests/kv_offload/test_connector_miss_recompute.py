@@ -27,7 +27,6 @@ from vllm.v1.kv_offload.base import ReqContext, make_offload_key
 from spyre_inference.v1.kv_offload.shared_manager import (
     SpyreSharedOffloadingManager,
 )
-from spyre_inference.v1.kv_offload.shared_types import SharedPoolFamily
 
 OFFLOAD_KEY = make_offload_key(bytes.fromhex("11" * 32), 0)
 
@@ -35,6 +34,9 @@ OFFLOAD_KEY = make_offload_key(bytes.fromhex("11" * 32), 0)
 class EmptyDirectory:
     def __init__(self):
         self.pin_calls = []
+
+    def find_pool(self, name):
+        return self.registered if name == self.registered.name else None
 
     def lookup(self, key):
         return None
@@ -46,22 +48,27 @@ class EmptyDirectory:
 
 def _manager_with_empty_directory():
     compatibility = SimpleNamespace(metadata_version=1, compatibility_id=7)
-    anchor = SimpleNamespace(
-        name="alpha.c0.k",
-        pool_ref=SimpleNamespace(pool_id=10),
+    registered = SimpleNamespace(
+        name="shared.data",
+        pool_ref=SimpleNamespace(pool_id=10, pool_version=1),
         compatibility=compatibility,
+        slot_count=4,
     )
     directory = EmptyDirectory()
+    directory.registered = registered
     runtime = SimpleNamespace(
+        SharedMetadata=SimpleNamespace(create_or_attach=lambda _name, _config: directory),
+        SharedMetadataConfig=lambda *args: args,
+        SharedMetadataCapacity=lambda *args: args,
         CompatibleBlockKey=lambda compatibility, block_hash: SimpleNamespace(
             compatibility=compatibility, block_hash=block_hash
-        )
+        ),
     )
     manager = SpyreSharedOffloadingManager(
         metadata_name="shared-meta",
-        families=(SharedPoolFamily("alpha", 2),),
-        max_components=2,
-        num_blocks=2,
+        pool_name="shared.data",
+        component_count=2,
+        max_pool_slots=4,
         cache_policy="lru",
         cache_policy_module_path=None,
         enable_events=False,
@@ -69,9 +76,6 @@ def _manager_with_empty_directory():
         max_tracker_size=64_000,
         runtime_loader=lambda: runtime,
     )
-    manager._runtime = runtime
-    manager._directory = directory
-    manager._anchors = (anchor,)
     return manager, directory
 
 

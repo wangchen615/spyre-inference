@@ -1,857 +1,897 @@
-# Spyre Cross-Instance Shared KV Offload Implementation Plan
+# Spyre One-Pool Shared KV Offload Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add an explicitly selected Spyre offloading tier that lets two TP1 vLLM instances on one host publish and reload byte-identical KV blocks from the same Flex shared-memory directory and pool family.
+**Goal:** Replace M2's per-component pool family with one shared data pool whose independently allocated fixed-size slots each hold one physical K or V page, while preserving cross-instance A -> A -> B reload behavior and the visual performance demo.
 
-**Architecture:** Keep M1's `SpyreOffloadingSpec` and private-pool behavior intact while extracting only construction and page-copy seams. M2 adds a policy-neutral `CPUOffloadingManager` subclass for shared-directory lookup/claim/pin bookkeeping and a `SpyreOffloadingWorker` subclass that routes the existing validated raw page copy through dynamically registered shared pool families. The plugin registers the M2 spec lazily, and the end-to-end run disables prefix caching so both A's self-reload and B's peer reload demonstrably come from shared host memory.
+**Architecture:** `SpyreSharedOffloadingSpec` resolves one logical `pool_name`, builds a deterministic ordered component manifest, and gives the worker enough information to derive one-pool slot geometry from the physical KV allocations. The scheduler-side manager lazily attaches that registered pool, sizes its upstream logical-block policy as `pool.slot_count // component_count`, and represents every logical vLLM block as a complete set of component-qualified page entries with explicit, potentially non-contiguous slot locations. The worker copies each component page through the existing M1 `copy_kv_page_raw(cache, block_id, pool, slot_id, ...)` path; no Flex or torch-spyre production API change is required.
 
-**Tech Stack:** Python 3.12, vLLM 0.28 offloading interfaces, PyTorch/torch-spyre, Flex `SharedMetadata` and `SharedHostPool`, pytest, multiprocessing, OpenAI-compatible vLLM HTTP API.
+**Tech Stack:** Python 3.12, vLLM 0.28 offloading interfaces, PyTorch/torch-spyre, Flex `SharedMetadata` and `SharedHostPool`, pytest, OpenAI-compatible streaming completions, Prometheus metrics, POSIX shared memory.
 
 **Spec:** `docs/superpowers/specs/2026-09-29-spyre-shared-kv-offload-design.md`
 
 ## Global Constraints
 
-- Make spyre-inference changes only in `/home/yzhu/dt-inductor/spyre-inference-kvc-offload-m2` on branch `kvc-offload-m2`, based on M1 commit `86f56ed`.
-- Make conditional Flex and torch-spyre changes only on their existing `kvc-offload-m2` branches; do not touch the dirty `kvc-offload-poc` worktree.
-- M2 supports float16 KV pages, one KV-cache group, `blocks_per_chunk == 1`, `world_size == 1`, TP1, and the `uni` executor.
-- `SpyreOffloadingSpec` keeps its existing engine/rank-private pools, configuration, manager type, and observable transfer behavior.
-- `SpyreSharedOffloadingSpec` must remain inert until selected: importing `spyre_inference` must not import `shared_spec.py` or access `torch_spyre._C.SharedMetadata`.
-- Reuse upstream admission threshold, LRU/ARC choice, ref-counting, metrics, and local victim selection; do not add a host-wide eviction policy or silently adopt peer entries into local policy.
-- Publish one logical KV block only after every K/V component D2H copy has synchronized; retain each read pin until the corresponding H2D job completes.
-- A missing, reserved, stale, or unpinnable directory entry is a normal `LookupResult.MISS`; configuration mismatch, `Unavailable`, transfer failure, and impossible component routing fail loudly.
-- Do not use or modify vLLM `SharedOffloadRegion`; do not add disk, network, multi-host, DP, or cross-TP sharing.
-- Run `uv` commands with `--no-sync` while using the local torch-spyre checkout.
-- Never run two independent Spyre-backed commands concurrently. The sole exception is the deliberate two-instance acceptance topology, with one process restricted to each distinct card.
-- Every commit uses `git commit -s`; before it, run `SKIP=markdownlint pre-commit run --files <changed-files>`.
-- If the real KV allocations have more than one `CompositeAddress` chunk, stop spyre-inference execution at Task 7 and complete the conditional M2-F3 plan described there before continuing.
+- Implement only in `/home/yzhu/dt-inductor/spyre-inference-kvc-offload-m2` on local branch `kvc-offload-m2`; preserve all existing modified and untracked demo work.
+- Follow `torch-spyre-docs` commit `114011e842014b8ce6eb2fde9e3f83fd6abb9a81`, `docs/RFCs/SharedKvPoolRFC.md`, and `docs/RFCs/RawCopyKvOffloadRFC.md` literally at the low-level pool/copy seam.
+- Configure exactly one independent `SharedHostPool` data pool for this milestone; one `SharedMetadata` directory indexes every component page in that pool.
+- One pool slot holds one physical page `component_tensor[block_id]`; one page never spans slots, while one logical vLLM block occupies one independently claimed slot per component.
+- Set `slot_bytes` to the host-page-aligned maximum physical component-page size; set `pool_slot_count = logical_block_capacity * component_count` and fail if the budget cannot hold one complete logical block.
+- Never derive component locations by adjacency. Every `(pool_id, slot_id)` returned by Flex is carried explicitly, and component slots may be fragmented in any order.
+- Define a logical cache hit only when every required component page is valid and read-pinned. A missing, reserved, stale, foreign-pool, or unpinnable page releases earlier pins and returns `LookupResult.MISS`.
+- Keep the existing M1 device-range contract unchanged. Do not add a pool-relative offset, packed aggregate slot, contiguous extent allocator, Flex production change, or torch-spyre production change.
+- Preserve M1 restrictions: float16, one KV-cache group, `blocks_per_chunk == 1`, and supported single-chunk physical allocations. M2 additionally requires `world_size == 1`, TP1, and the `uni` executor.
+- Preserve M1 selection, engine/rank-private M1 pool naming, worker behavior, metrics, lazy M2 imports, and miss-to-recompute behavior.
+- Keep prefix caching disabled in the cross-instance and manual acceptance runs. Only the deliberate two-server topology may run two Spyre processes concurrently, and each server must use a distinct device.
+- Run every `uv` command with `--no-sync` so the local torch-spyre installation is not replaced.
+- Cleanup must refuse to unlink live objects, remove every current or legacy pool registered under the configured demo namespace after the servers exit, and leave unrelated shared memory untouched.
+- Do not commit, sign, push, or rewrite branch history during Tasks 1-6. Run all validation first; create the signed commit only in Task 7 after review findings are resolved.
 
 ## File Structure
 
-- Modify `spyre_inference/v1/kv_offload/spec.py`: add protected M1 construction hooks and a no-op full-vLLM-config binding seam.
-- Modify `spyre_inference/v1/kv_offload/connector.py`: pass the full `VllmConfig` into the selected Spyre spec before worker construction.
-- Modify `spyre_inference/v1/kv_offload/worker.py`: expose the existing single-group validation to the M2 subclass without changing M1 dispatch.
-- Modify `spyre_inference/v1/worker/spyre_kv_offload.py`: extract one validated K/V page-copy helper used by both M1 and M2 routing.
-- Create `spyre_inference/v1/kv_offload/shared_types.py`: runtime-neutral family, location, transfer-item, and transfer-spec value objects plus deterministic key hashing.
-- Create `spyre_inference/v1/kv_offload/shared_runtime.py`: the only lazy import boundary for the required torch-spyre M2 binding symbols.
-- Create `spyre_inference/v1/kv_offload/shared_manager.py`: upstream-policy integration and shared lookup/claim/pin lifecycle.
-- Create `spyre_inference/v1/kv_offload/shared_worker.py`: directory/pool registration, family routing, DMA, publish, and abort handling.
-- Create `spyre_inference/v1/kv_offload/shared_spec.py`: M2 configuration validation, compatibility digest construction, and manager/worker factories.
-- Modify `spyre_inference/__init__.py`: lazy `OffloadingSpecFactory` registration using module and class strings.
-- Extend `tests/kv_offload/test_spec.py`, `tests/kv_offload/test_spyre_kv_offload.py`, and `tests/kv_offload/test_worker_dispatch.py`: M1 preservation gates.
-- Create `tests/kv_offload/test_shared_types.py`: pure key, family, and transfer-shape tests.
-- Create `tests/kv_offload/test_shared_manager.py`: fake-directory policy and lifecycle tests.
-- Create `tests/kv_offload/test_shared_worker_dispatch.py`: fake-runtime pool routing, ordering, and failure tests.
-- Create `tests/kv_offload/test_shared_spec.py`: configuration, compatibility, factory, and lazy-import tests.
-- Create `tests/kv_offload/test_connector_miss_recompute.py`: connector translation of a shared-directory miss into zero external tokens and no H2D job.
-- Create `tests/kv_offload/test_shared_pool_round_trip.py`: real-Spyre shared-worker round trip and `CompositeAddress` chunk gate.
-- Create `tests/kv_offload/test_cross_instance.py`: opt-in two-server functional acceptance, deterministic output comparison, and A/B reload measurements.
-- Create `docs/superpowers/results/2026-09-29-spyre-shared-kv-offload.md`: exact hardware run, revisions, functional evidence, and A/B timing results.
+- Modify `spyre_inference/v1/kv_offload/shared_types.py`: component-manifest, page-level key, geometry, location, reservation, block-transfer, and load/store-spec contracts.
+- Modify `spyre_inference/v1/kv_offload/shared_spec.py`: one-pool name resolution, ordered component manifest, compatibility digest, metadata capacity, and factories.
+- Modify `spyre_inference/v1/kv_offload/shared_manager.py`: lazy one-pool attach, logical policy sizing, all-page lookup/pinning, page claims, rollback, ownership, and eviction.
+- Modify `spyre_inference/v1/kv_offload/shared_worker.py`: one-pool registration and explicit per-component page DMA/publish routing.
+- Preserve `spyre_inference/v1/kv_offload/shared_runtime.py`: existing lazy torch-spyre binding boundary.
+- Preserve `spyre_inference/v1/kv_offload/connector.py`: existing physical-cache binding and M1/M2 connector behavior.
+- Modify `tests/kv_offload/test_shared_types.py`: deterministic page keys, one-pool geometry, and transfer-shape tests.
+- Modify `tests/kv_offload/test_shared_spec.py`: one-pool configuration, manifest, compatibility, lazy registration, and M1 preservation tests.
+- Modify `tests/kv_offload/test_shared_manager.py`: fragmented locations, all-page hit/miss, claim rollback, pin lifetime, ownership, and policy tests.
+- Modify `tests/kv_offload/test_shared_worker_dispatch.py`: one-pool registration, explicit page routing, validation, synchronization, and rollback tests.
+- Modify `tests/kv_offload/test_shared_pool_round_trip.py`: bit-exact real-device round trip through one pool and fragmented slots.
+- Modify `tests/kv_offload/test_cross_instance.py`: two-server one-pool acceptance and shared-memory topology assertions.
+- Modify `scripts/start_shared_kv_instance_a.sh` and `scripts/start_shared_kv_instance_b.sh`: replace `shared_pool_families` with one `pool_name`.
+- Modify `scripts/cleanup_shared_kv_demo.py`: clean every registered current/legacy demo-owned pool, its backing/control objects, and metadata.
+- Modify `tests/kv_offload/test_cleanup_shared_kv_demo.py`: current, legacy, live-owner, unknown-pool, and idempotence cleanup tests.
+- Preserve and retest `scripts/warmup_shared_kv_demo.py` and `tests/kv_offload/test_warmup_shared_kv_demo.py`: unrelated junk warmup and visible target/prompt/performance output.
+- Modify `scripts/shared_kv_two_instance_demo.py` only where one-pool metrics/topology require it; preserve its visible target, identifier, prompt, TTFT, end-to-end, token-source, KV-byte, and copy-time output.
+- Modify `tests/kv_offload/test_shared_kv_two_instance_demo.py`: preserve the visual A/A/B request and metric contracts.
+- Modify `docs/superpowers/results/2026-09-30-spyre-shared-kv-manual-demo.md`: one-pool setup, inspection, cleanup, commands, and fresh result evidence.
 
 ## Review Focus
 
-- A same-sized but incompatible model, revision, hash algorithm, hash seed, layout, or page geometry must fail attachment before DMA; Task 5 varies every encoded field.
-- A partially successful multi-key claim must not leak reservations or pending upstream policy entries when a later key returns `ExistingClaim`, `NoSpace`, or `Unavailable`; Task 3 checks each rollback path and a mixed batch.
-- Lookup pins must survive until `complete_load` but must not leak when lookup is abandoned before `prepare_load`; Task 3 checks both request-finalization paths.
-- A peer hit must be loadable without entering the local LRU/ARC, and local eviction must target only the exact versioned entry owned by that manager; Task 3 inspects the upstream policy and eviction calls.
-- A D2H or publish failure after earlier component copies must synchronize before aborting every unpublished reservation and must never leave a reported hit; Task 4 checks the complete call order and cleanup state.
+- A fragmented free list must yield arbitrary component slot IDs without changing bytes or component routing; Tasks 1, 3, 4, and 5 pin explicit non-contiguous locations in unit and hardware tests.
+- A partial page set or a pin failure after earlier successful pins must be a normal miss with every acquired pin released; Task 3 checks missing, reserved, failed-pin, and foreign-pool cases at each component position.
+- A mid-claim, D2H, or publish failure must abort unpublished reservations, evict only pages published by that attempt, preserve pre-existing peer pages, and roll back logical policy admission; Tasks 3 and 4 inject each failure.
+- Same-name attachment with a different model, page-key version, component order, layout, page size, slot size, or slot count must fail before DMA; Tasks 2 and 4 vary every compatibility and geometry input.
+- Cleanup must discover and remove all registered objects belonging to the current or historical demo naming schemes while refusing a live owner or an unrecognized registered pool; Task 6 tests all three outcomes.
 
 ---
 
-### Task 1: Extract M1-Preserving Construction and Copy Seams
+### Task 1: Replace Family-Level Contracts with Page-Level Contracts
 
 **Files:**
 
-- Modify: `spyre_inference/v1/kv_offload/spec.py:151-224`
-- Modify: `spyre_inference/v1/kv_offload/connector.py:322-350`
-- Modify: `spyre_inference/v1/kv_offload/worker.py:115-172`
-- Modify: `spyre_inference/v1/worker/spyre_kv_offload.py:170-250`
-- Modify: `tests/kv_offload/test_spec.py`
-- Modify: `tests/kv_offload/test_spyre_kv_offload.py`
-- Modify: `tests/kv_offload/test_worker_dispatch.py`
-
-**Interfaces:**
-
-- Consumes: existing `SpyrePhysicalCaches`, `CPUOffloadingManager`, `SpyreOffloadingWorker`, and `copy_kv_page_raw` contracts.
-- Produces: `SpyreOffloadingSpec.bind_vllm_config(vllm_config)`, `_create_manager()`, `_create_worker(physical)`, `SpyreOffloadingWorker._validate_gpu_spec(gpu_spec)`, and `copy_kv_page_pair(copy_fn, cache, block_id, k_pool, k_slot_id, v_pool, v_slot_id, to_device, non_blocking=False)`.
-
-- [ ] **Step 1: Write failing tests for the construction hooks and unchanged M1 arguments**
-
-Add a recording subclass in `test_spec.py` and assert `get_manager()` remains memoized while `get_worker()` validates canonical tensor count before calling its hook:
-
-```python
-class RecordingSpec(SpyreOffloadingSpec):
-    def _create_manager(self):
-        self.manager_calls = getattr(self, "manager_calls", 0) + 1
-        return object()
-
-    def _create_worker(self, physical):
-        self.worker_physical = physical
-        return SimpleNamespace(_bytes_per_block=KV_BYTES_PER_BLOCK)
-
-
-def test_construction_hooks_preserve_memoization_and_physical_binding():
-    spec = RecordingSpec(_config())
-    manager = spec.get_manager()
-    assert spec.get_manager() is manager
-    assert spec.manager_calls == 1
-
-    physical = _physical_for_spec()
-    spec.bind_physical_caches(physical)
-    worker = spec.get_worker(_canonical_for_spec(physical))
-    assert worker is not None
-    assert spec.worker_physical is physical
-```
-
-Add a connector test whose spec records `bind_vllm_config` and prove the call occurs before `_init_worker`. Add a page-copy test that injects a recording `copy_fn` and expects exactly K then V with M1's `2 * slot` and `2 * slot + 1` indices.
-
-- [ ] **Step 2: Run the new tests and verify the seams are absent**
-
-Run:
-
-```bash
-uv run --no-sync pytest tests/kv_offload/test_spec.py tests/kv_offload/test_spyre_kv_offload.py tests/kv_offload/test_worker_dispatch.py -m "not upstream" -q
-```
-
-Expected: FAIL because the protected hooks, vLLM-config binding, shared page-copy helper, and public validation seam do not exist.
-
-- [ ] **Step 3: Refactor M1 without changing behavior**
-
-Keep `get_manager()` and `get_worker()` as the public entry points and move their current constructors behind these hooks:
-
-```python
-def bind_vllm_config(self, vllm_config: VllmConfig) -> None:
-    return
-
-def _create_manager(self) -> OffloadingManager:
-    return CPUOffloadingManager(
-        num_blocks=self.num_blocks,
-        cache_policy=self.eviction_policy,
-        cache_policy_module_path=self.cache_policy_module_path,
-        enable_events=self.kv_events_config.enable_kv_cache_events,
-        store_threshold=int(self.extra_config.get("store_threshold", 0)),
-        max_tracker_size=int(self.extra_config.get("max_tracker_size", 64_000)),
-    )
-
-def _create_worker(self, physical: SpyrePhysicalCaches) -> OffloadingWorker:
-    return SpyreOffloadingWorker(
-        physical=physical,
-        num_host_blocks=self.num_blocks,
-        pool_prefix=self._pool_prefix,
-    )
-```
-
-Change the connector registration order to:
-
-```python
-self.spec.bind_vllm_config(self.vllm_config)
-self.spec.bind_physical_caches(physical)
-self._init_worker(canonical)
-```
-
-Move the single-group check into `_validate_gpu_spec()`. Extract the copy helper and make `SpyreKvPageOffloader.offload()` and `.reload()` delegate to it with the existing paired-slot mapping. The helper must issue only these calls:
-
-```python
-copy_fn(k_pages, block_id, k_pool, k_slot_id, to_device, non_blocking)
-copy_fn(v_pages, block_id, v_pool, v_slot_id, to_device, non_blocking)
-```
-
-- [ ] **Step 4: Run the focused M1 tests**
-
-Run the command from Step 2. Expected: all tests pass with the same M1 copy order, manager class, pool names, transfer byte counts, and failures.
-
-- [ ] **Step 5: Run pre-commit and commit the seam**
-
-```bash
-SKIP=markdownlint pre-commit run --files spyre_inference/v1/kv_offload/spec.py spyre_inference/v1/kv_offload/connector.py spyre_inference/v1/kv_offload/worker.py spyre_inference/v1/worker/spyre_kv_offload.py tests/kv_offload/test_spec.py tests/kv_offload/test_spyre_kv_offload.py tests/kv_offload/test_worker_dispatch.py
-git add spyre_inference/v1/kv_offload/spec.py spyre_inference/v1/kv_offload/connector.py spyre_inference/v1/kv_offload/worker.py spyre_inference/v1/worker/spyre_kv_offload.py tests/kv_offload/test_spec.py tests/kv_offload/test_spyre_kv_offload.py tests/kv_offload/test_worker_dispatch.py
-git commit -s -m "Refactor Spyre KV offload construction"
-```
-
-If `ty` alone reports the repository's existing unavailable local torch-spyre imports, record that separately; do not weaken type checks or alter unrelated files.
-
-### Task 2: Define Runtime-Neutral Shared Transfer Contracts
-
-**Files:**
-
-- Create: `spyre_inference/v1/kv_offload/shared_types.py`
-- Create: `spyre_inference/v1/kv_offload/shared_runtime.py`
-- Create: `tests/kv_offload/test_shared_types.py`
+- Modify: `spyre_inference/v1/kv_offload/shared_types.py`
+- Modify: `tests/kv_offload/test_shared_types.py`
 
 **Interfaces:**
 
 - Consumes: `vllm.v1.kv_offload.base.OffloadKey` and `LoadStoreSpec`.
-- Produces: `SharedPoolFamily`, `SharedLocation`, `SharedTransfer`, `SharedLoadStoreSpec`, `allocate_family_slots`, `shared_block_hash`, and `load_shared_runtime()`.
+- Produces: `SharedComponentDescriptor`, `SharedPoolGeometry`, `SharedPageLocation`, `SharedPageTransfer`, `SharedBlockTransfer`, `SharedLoadStoreSpec`, `compute_shared_pool_geometry(...)`, and `shared_page_hash(key, component_id)`.
 
-- [ ] **Step 1: Write failing pure-Python tests for family allocation, key hashing, and transfer validation**
+- [ ] **Step 1: Replace family-allocation tests with deterministic page-key tests**
 
-Cover even and remainder capacity distribution, duplicate/empty family names, fewer slots than families, deterministic 64-bit hashing of the complete `OffloadKey`, a group-ID change altering the hash, and mismatched transfer tuple lengths. Pin the digest with a literal expected integer:
+Use the complete `OffloadKey` plus a four-byte unsigned component ID and pin the algorithm with literal values:
 
 ```python
-def test_shared_block_hash_covers_the_complete_offload_key():
-    key0 = make_offload_key(bytes.fromhex("11" * 32), 0)
-    key1 = make_offload_key(bytes.fromhex("11" * 32), 1)
-    assert shared_block_hash(key0) == 0x632D1E16D4E6599B
-    assert shared_block_hash(key1) != shared_block_hash(key0)
-
-
-def test_family_slots_distribute_remainder_in_configuration_order():
-    assert allocate_family_slots(8, ("alpha", "beta", "gamma")) == (
-        SharedPoolFamily("alpha", 3),
-        SharedPoolFamily("beta", 3),
-        SharedPoolFamily("gamma", 2),
-    )
+def test_shared_page_hash_covers_key_and_component():
+    key = make_offload_key(bytes.fromhex("11" * 32), 0)
+    assert shared_page_hash(key, 0) == 0xFD8C6177AECACCE2
+    assert shared_page_hash(key, 1) == 0x962C86167AD9E163
+    assert shared_page_hash(key, 7) == 0xC340A847F6514AA5
+    assert shared_page_hash(
+        make_offload_key(bytes.fromhex("11" * 32), 1), 0
+    ) != shared_page_hash(key, 0)
 ```
 
-The algorithm is fixed to BLAKE2b, eight output bytes, personalization
-`b"spyre-m2"`, interpreted unsigned big-endian.
+Reject `component_id < 0` and `component_id > 0xFFFFFFFF` so the byte encoding cannot wrap or alias.
 
-- [ ] **Step 2: Run the pure tests and verify the module is absent**
+- [ ] **Step 2: Add pure geometry tests, including the manual 512-MiB case**
+
+```python
+def test_manual_pool_geometry_is_one_512_mib_pool():
+    geometry = compute_shared_pool_geometry(
+        cpu_bytes_to_use=536_870_912,
+        page_bytes=(262_144,) * 8,
+        alignment=4096,
+    )
+    assert geometry == SharedPoolGeometry(
+        component_count=8,
+        slot_bytes=262_144,
+        logical_block_capacity=256,
+        slot_count=2048,
+        actual_pool_bytes=536_870_912,
+    )
+
+
+def test_geometry_uses_aligned_largest_page():
+    geometry = compute_shared_pool_geometry(16_384, (1000, 3000), 4096)
+    assert geometry.slot_bytes == 4096
+    assert geometry.logical_block_capacity == 2
+    assert geometry.slot_count == 4
+```
+
+Also reject an empty page list, non-positive page sizes/alignment/budget, a native `size_t` overflow (`slot_count > sys.maxsize // slot_bytes`), and a budget smaller than `component_count * slot_bytes`.
+
+- [ ] **Step 3: Add explicit fragmented-transfer tests**
+
+Construct one logical block with component slots `(7, 2, 11, 5)` and assert the load/store spec retains both component order and exact locations. Assert load pages all have `reservation is None`, store pages all have reservations, duplicate component IDs fail, empty per-block page sets fail, and a single spec cannot mix load and store blocks.
+
+```python
+pages = tuple(
+    SharedPageTransfer(i, SharedPageLocation(pool_id=3, slot_id=slot))
+    for i, slot in enumerate((7, 2, 11, 5))
+)
+spec = SharedLoadStoreSpec([SharedBlockTransfer(OFFLOAD_KEY, pages)])
+assert [page.location.slot_id for page in spec.transfers[0].pages] == [7, 2, 11, 5]
+```
+
+- [ ] **Step 4: Run the new contract tests and observe the old API failure**
 
 ```bash
 uv run --no-sync pytest tests/kv_offload/test_shared_types.py -q
 ```
 
-Expected: FAIL with `ModuleNotFoundError` for `shared_types`.
+Expected before implementation: collection or assertion failures naming `SharedPoolFamily`, `allocate_family_slots`, or missing page-level types.
 
-- [ ] **Step 3: Implement immutable transfer values and strict validation**
-
-Use these public shapes:
+- [ ] **Step 5: Implement the page-key and geometry functions**
 
 ```python
-@dataclass(frozen=True)
-class SharedPoolFamily:
-    name: str
-    slot_count: int
+PAGE_KEY_ALGORITHM = "blake2b-64/spyre-m2-page/v1"
 
 
-@dataclass(frozen=True)
-class SharedLocation:
-    anchor_pool_id: int
-    slot_id: int
+def shared_page_hash(key: OffloadKey, component_id: int) -> int:
+    if not 0 <= component_id <= 0xFFFFFFFF:
+        raise ValueError("component_id must fit in four unsigned bytes")
+    digest = hashlib.blake2b(
+        bytes(key) + component_id.to_bytes(4, "big"),
+        digest_size=8,
+        person=b"spyre-m2-page",
+    ).digest()
+    return int.from_bytes(digest, "big")
 
 
-@dataclass(frozen=True)
-class SharedTransfer:
-    key: OffloadKey
-    location: SharedLocation
-    reservation: object | None = None
-
-
-class SharedLoadStoreSpec(LoadStoreSpec):
-    def __init__(self, transfers: Collection[SharedTransfer]) -> None:
-        self.transfers = tuple(transfers)
+def compute_shared_pool_geometry(
+    cpu_bytes_to_use: int,
+    page_bytes: Sequence[int],
+    alignment: int,
+) -> SharedPoolGeometry:
+    sizes = tuple(page_bytes)
+    if cpu_bytes_to_use <= 0 or alignment <= 0 or not sizes or min(sizes) <= 0:
+        raise ValueError("shared pool geometry requires positive inputs")
+    slot_bytes = ((max(sizes) + alignment - 1) // alignment) * alignment
+    component_count = len(sizes)
+    logical_capacity = cpu_bytes_to_use // (component_count * slot_bytes)
+    if logical_capacity == 0:
+        raise ValueError("cpu_bytes_to_use cannot hold one complete KV block")
+    slot_count = logical_capacity * component_count
+    return SharedPoolGeometry(
+        component_count,
+        slot_bytes,
+        logical_capacity,
+        slot_count,
+        slot_count * slot_bytes,
+    )
 ```
 
-Reject empty names, duplicate names, non-positive capacities, and transfer items whose store/load mode is mixed. `shared_block_hash()` must hash `bytes(key)`, not only `get_offload_block_hash(key)`, so group IDs cannot alias.
+Use frozen dataclasses. Define `SharedComponentDescriptor` with `component_id`, `cache_index`, `role`, `layout_kind`, `layout_version`, `block_size`, `local_kv_heads`, `head_size`, and `page_bytes`. `SharedBlockTransfer.pages` is a tuple of `SharedPageTransfer`; no field represents an anchor, sibling, family, base slot, or pool-relative offset.
 
-- [ ] **Step 4: Implement the lazy torch-spyre M2 surface loader**
-
-`shared_runtime.py` imports `torch_spyre._C` only inside `load_shared_runtime()`, verifies these names, and raises one direct `RuntimeError` listing missing names:
-
-```python
-REQUIRED_SHARED_SYMBOLS = (
-    "ChunkDescriptorEntry",
-    "CompatibilityDescriptor",
-    "CompatibleBlockKey",
-    "ExistingClaim",
-    "NoSpace",
-    "Reservation",
-    "SharedDataPoolConfig",
-    "SharedMetadata",
-    "SharedMetadataCapacity",
-    "SharedMetadataConfig",
-    "SharedPoolKind",
-    "Unavailable",
-    "copy_kv_page_raw",
-    "get_composite_address",
-)
-```
-
-Return the extension module itself so tests can replace it with one fake object and manager/worker code can use the same concrete classes for `isinstance` checks.
-
-- [ ] **Step 5: Run tests, pre-commit, and commit**
+- [ ] **Step 6: Run the focused tests**
 
 ```bash
 uv run --no-sync pytest tests/kv_offload/test_shared_types.py -q
-SKIP=markdownlint pre-commit run --files spyre_inference/v1/kv_offload/shared_types.py spyre_inference/v1/kv_offload/shared_runtime.py tests/kv_offload/test_shared_types.py
-git add spyre_inference/v1/kv_offload/shared_types.py spyre_inference/v1/kv_offload/shared_runtime.py tests/kv_offload/test_shared_types.py
-git commit -s -m "Add shared KV offload contracts"
 ```
 
-Expected: the pure tests pass without importing or initializing torch-spyre.
+Expected: all page-key, geometry, explicit-location, mode, validation, and lazy-runtime tests pass without initializing a Spyre device.
 
-### Task 3: Integrate Upstream Cache Policy with the Shared Directory
+### Task 2: Resolve One Pool and Build the Physical Component Manifest
 
 **Files:**
 
-- Create: `spyre_inference/v1/kv_offload/shared_manager.py`
-- Create: `tests/kv_offload/test_shared_manager.py`
+- Modify: `spyre_inference/v1/kv_offload/shared_spec.py`
+- Modify: `tests/kv_offload/test_shared_spec.py`
 
 **Interfaces:**
 
-- Consumes: `SharedPoolFamily`, `SharedLocation`, `SharedTransfer`, `SharedLoadStoreSpec`, `shared_block_hash`, and the torch-spyre objects returned by `load_shared_runtime()`.
-- Produces: `SpyreSharedOffloadingManager(CPUOffloadingManager)` with the unchanged upstream `OffloadingManager` public methods.
+- Consumes: `SpyrePhysicalCaches`, `page_signature`, `SharedComponentDescriptor`, `SharedPoolGeometry`, `compute_shared_pool_geometry`, and `PAGE_KEY_ALGORITHM`.
+- Produces: `component_manifest(physical)`, `SpyreSharedOffloadingSpec.pool_name`, `component_count`, `max_pool_slots`, one-pool manager arguments, and one-pool worker arguments.
 
-- [ ] **Step 1: Build a deterministic fake SharedMetadata protocol and write failing lookup tests**
+- [ ] **Step 1: Write one-pool configuration precedence tests**
 
-The fake must model `lookup`, `pin_read`, `claim`, `publish`, `abort`, `evict`, `find_pool`, slot versions, and destruction-observable read pins. Test:
-
-```python
-def test_peer_lookup_pins_without_entering_local_policy(
-    manager, directory, peer_entry, ctx
-):
-    directory.entries[peer_entry.key.block_hash] = peer_entry
-    assert manager.lookup(OFFLOAD_KEY, ctx) is LookupResult.HIT
-    assert manager._policy.get(OFFLOAD_KEY) is None
-
-    spec = manager.prepare_load([OFFLOAD_KEY], ctx)
-    assert spec.transfers[0].location == SharedLocation(
-        peer_entry.slot.pool.pool_id, peer_entry.slot.slot_id
-    )
-    assert peer_entry.pin.released is False
-
-    manager.complete_load([OFFLOAD_KEY], ctx)
-    assert peer_entry.pin.released is True
-```
-
-Also assert missing lookup, reserved lookup, and failed `pin_read` each return `LookupResult.MISS` and create no load spec or H2D opportunity.
-
-- [ ] **Step 2: Run lookup tests and verify they fail**
-
-```bash
-uv run --no-sync pytest tests/kv_offload/test_shared_manager.py -q
-```
-
-Expected: FAIL because `SpyreSharedOffloadingManager` does not exist.
-
-- [ ] **Step 3: Implement lazy attach, lookup, and pin lifetime**
-
-Construct the superclass with exactly the M1 policy arguments. Attach lazily with an empty initial pool list and fixed capacity:
+Replace `shared_pool_families` fixtures with `pool_name="run-42.data"`. Assert precedence and validation exactly:
 
 ```python
-SharedMetadataConfig(
-    max_chunks=max_components,
-    pools=[],
-    capacity=SharedMetadataCapacity(
-        len(families) * max_components,
-        max(family.slot_count for family in families),
-        1,
-    ),
-)
+def test_explicit_pool_name_wins_over_environment(monkeypatch):
+    monkeypatch.setenv("SPYRE_KV_POOL_NAME", "from-env")
+    spec = SpyreSharedOffloadingSpec(_config(extra={"pool_name": "explicit"}))
+    assert spec.pool_name == "explicit"
+
+
+def test_environment_pool_name_is_the_fallback(monkeypatch):
+    monkeypatch.setenv("SPYRE_KV_POOL_NAME", "from-env")
+    spec = SpyreSharedOffloadingSpec(_config_without_pool_name())
+    assert spec.pool_name == "from-env"
+
+
+def test_generated_pool_name_is_private_without_shared_configuration(monkeypatch):
+    monkeypatch.delenv("SPYRE_KV_POOL_NAME", raising=False)
+    spec = SpyreSharedOffloadingSpec(_config_without_pool_name())
+    assert spec.pool_name == "spyre_kv_eng0_r0.shared"
 ```
 
-Resolve every `<family>.c0.k` anchor before the first operation and require all anchors to carry the same compatibility ID. Convert a vLLM key with:
+An explicitly present empty/invalid `pool_name`, an empty/invalid environment value, or the removed `shared_pool_families` key must raise a migration-focused `ValueError`; it must not silently fall through.
+
+- [ ] **Step 2: Add stable component-manifest and compatibility tests**
+
+For two physical caches, require the manifest order `c0.k, c0.v, c1.k, c1.v` with component IDs `0, 1, 2, 3`. The compatibility payload must include `format=2`, `page_key_algorithm=PAGE_KEY_ALGORITHM`, model/revision/hash seed/hash algorithm/block sizes/dtype/TP size, and every component's ID, cache index, role, layout kind/version, block size, local KV heads, head size, and physical page bytes.
+
+Mutate each field independently and assert `compatibility_digest()` changes. Preserve the cross-process stable-digest test with its new expected SHA-256 literal calculated from the final payload.
+
+- [ ] **Step 3: Add factory argument and metadata-capacity tests**
+
+With eight components and `self.num_blocks == 256`, require:
 
 ```python
-CompatibleBlockKey(anchor.compatibility, shared_block_hash(key))
+assert spec.component_count == 8
+assert spec.max_pool_slots == 2048
+assert manager_kwargs["pool_name"] == "run-42.data"
+assert manager_kwargs["component_count"] == 8
+assert manager_kwargs["max_pool_slots"] == 2048
+assert worker_kwargs["pool_name"] == "run-42.data"
+assert worker_kwargs["geometry"].slot_count == 2048
+assert worker_kwargs["manifest"] == manifest
 ```
 
-Store pending and active pins in a request-local dataclass via
-`ReqContext.set_state()`. `lookup()` calls `super().lookup()` first so
-store-threshold accounting stays upstream-owned; local pending stores preserve
-`HIT_PENDING`, while any published directory entry becomes `HIT` only after
-`pin_read()` succeeds. `prepare_load()` calls `super().prepare_load()` only for
-locally owned keys, moves selected pins from pending to active, releases lookup
-pins that were acquired during scanning but were not selected, and returns
-locations in input order. `complete_load()` releases active pins after calling
-the superclass for locally owned keys. `on_request_finished()` releases
-abandoned pending pins but leaves active pins for later completion callbacks.
+Reject a physical manifest whose component count differs from the scheduler-derived `2 * len(group.layer_names)` before creating the pool.
 
-- [ ] **Step 4: Write failing store, eviction, and rollback tests**
-
-Cover these exact outcomes:
-
-```python
-@pytest.mark.parametrize("claim_result", ["existing_valid", "existing_reserved", "no_space"])
-def test_non_reservation_claim_rolls_back_local_admission(claim_result, manager, ctx):
-    manager.directory.next_claim = claim_result
-    out = manager.prepare_store([OFFLOAD_KEY], ctx)
-    assert out is not None
-    assert out.keys_to_store == []
-    assert manager._policy.get(OFFLOAD_KEY) is None
-    assert manager.directory.live_reservations == []
-```
-
-Add a mixed three-key batch in which the first key reserves, the second is an existing peer entry, and the third exhausts every family. Require only the first key in `keys_to_store`, and require the other two absent from local policy. Add a separate `Unavailable` case that aborts every reservation already acquired, rolls back every newly inserted local entry, and raises `RuntimeError`. Fill a one-slot local policy, complete its store, then admit a second key and assert the directory receives `evict()` with the first key's exact versioned `LookupEntry`.
-
-Add a two-family claim test whose key hashes to the second family first. Make
-that family return `NoSpace`, make the first family return `Reservation`, and
-assert both the deterministic probe order and the location actually returned.
-Also call `lookup()` before anchor registration and require a direct startup
-ordering error instead of an unexplained miss.
-
-- [ ] **Step 5: Implement policy-neutral store and eviction integration**
-
-`prepare_store()` follows this order:
-
-1. Call `super().prepare_store(keys, req_context)` once.
-2. For each `evicted_key`, remove its owned entry and call `directory.evict(entry)`.
-3. For each upstream-admitted key, try families starting at `shared_block_hash(key) % len(families)` and wrapping once.
-4. Keep `Reservation` results; on `NoSpace`, try the next family.
-5. On either `ExistingClaim` value or all-family `NoSpace`, call `super().complete_store([key], req_context, success=False)` and omit that key from the returned store spec.
-6. On `Unavailable` or another protocol exception, abort all acquired reservations, roll back all newly admitted keys through the superclass, and raise a direct runtime error.
-
-Return:
-
-```python
-PrepareStoreOutput(
-    keys_to_store=[item.key for item in transfers],
-    store_spec=SharedLoadStoreSpec(transfers),
-    evicted_keys=upstream.evicted_keys,
-)
-```
-
-On successful `complete_store`, re-lookup every published key, require a valid entry, let the superclass mark it ready, and record it in `_owned_entries`. On failure, remove pending reservations and call the superclass with `success=False`. `reset_cache()` evicts only `_owned_entries`, clears pending request pins/reservations after scheduler quiescence, and then calls `super().reset_cache()`. Never insert peer entries into `_policy`.
-
-- [ ] **Step 6: Compare policy decisions with the upstream manager**
-
-Drive an upstream `CPUOffloadingManager` and the shared manager through the same `store_threshold=2` lookup sequence, completed stores, touches, and one-capacity eviction. Assert the same admitted keys and victim key; additionally assert that only the shared manager emits the matching directory claim/eviction operations. Repeat with `eviction_policy="arc"`.
-
-- [ ] **Step 7: Run tests, pre-commit, and commit**
-
-```bash
-uv run --no-sync pytest tests/kv_offload/test_shared_manager.py -q
-SKIP=markdownlint pre-commit run --files spyre_inference/v1/kv_offload/shared_manager.py tests/kv_offload/test_shared_manager.py
-git add spyre_inference/v1/kv_offload/shared_manager.py tests/kv_offload/test_shared_manager.py
-git commit -s -m "Add shared KV offload manager"
-```
-
-Expected: all manager tests pass without a Spyre device or real shared memory.
-
-### Task 4: Register Pool Families and Transfer Complete Logical Blocks
-
-**Files:**
-
-- Create: `spyre_inference/v1/kv_offload/shared_worker.py`
-- Create: `tests/kv_offload/test_shared_worker_dispatch.py`
-
-**Interfaces:**
-
-- Consumes: `SpyreOffloadingWorker._run()`, `_validate_gpu_spec()`, `copy_kv_page_pair()`, `SharedLoadStoreSpec`, and the torch-spyre M2 directory/pool API.
-- Produces: `SpyreSharedOffloadingWorker(SpyreOffloadingWorker)` with inherited `submit_store`, `submit_load`, `get_finished`, and `wait` behavior.
-
-- [ ] **Step 1: Write failing initialization and routing tests with a fake runtime**
-
-For two families with slot counts `(3, 2)` and two physical caches, assert registration in this exact order:
-
-```text
-alpha.c0.k, alpha.c0.v, alpha.c1.k, alpha.c1.v,
-beta.c0.k, beta.c0.v, beta.c1.k, beta.c1.v
-```
-
-Assert each pool uses the family's logical slot count, each K/V pool uses its own physical page size, all pools use one compatibility descriptor, and anchor pool IDs map back to the correct family. A store at `SharedLocation(alpha_anchor_id, 2)` must call the extracted copy helper for every cache with slot `2` in that family's K and V pools. A load through beta must use only beta pools.
-
-- [ ] **Step 2: Run worker tests and verify they fail**
-
-```bash
-uv run --no-sync pytest tests/kv_offload/test_shared_worker_dispatch.py -q
-```
-
-Expected: FAIL because the shared worker does not exist.
-
-- [ ] **Step 3: Implement directory creation, component registration, and family routing**
-
-Create or attach the directory with the same empty-pool capacity config as Task 3. For every physical cache and K/V role, build:
-
-```python
-SharedDataPoolConfig(
-    f"{family.name}.c{cache_index}.{role}",
-    SharedPoolKind.HOST,
-    family.slot_count,
-    signature.page_bytes,
-    CompatibilityDescriptor(COMPATIBILITY_FORMAT_VERSION, list(digest)),
-)
-```
-
-Call `register_or_attach_pool()`, then `resolve_pool()` and fail if resolution returns `None`. Index the resolved family bundle by the `pool_id` of `c0.k`. Validate that every allocation's `get_composite_address(tensor).num_chunks == 1`; retain one `ChunkDescriptorEntry(domain_id, page_size_bytes)` per K/V component, in cache-index then K/V order, for publication.
-
-- [ ] **Step 4: Write failing ordering and cleanup tests**
-
-Record all copy, synchronize, publish, abort, and evict operations. Require a successful store to be ordered as:
-
-```text
-pre-transfer synchronize
-all K/V D2H copies for every block
-post-D2H synchronize
-publish each reservation
-```
-
-Require a load to perform all H2D copies and a final synchronize before its `TransferResult` becomes visible. Inject an exception on the middle component copy and assert a post-failure synchronize precedes aborting every reservation. Inject a failure on the second publish and assert the first published entry is looked up and evicted while all unpublished reservations are aborted.
-
-- [ ] **Step 5: Implement transfer, publish, and failure cleanup**
-
-Override `_transfer()` only. Call the inherited `_validate_gpu_spec()`, require the device-block count to equal `len(shared_spec.transfers)`, validate every anchor/slot before the first copy, and route each transfer through `copy_kv_page_pair()`. Store mode requires every item to carry a reservation; load mode requires none. Track `published_keys` and `unpublished_reservations` so the exception path can synchronize, evict already-published entries, abort the remainder, and re-raise for inherited `_run()` to report `success=False`.
-
-Set `_bytes_per_block` to the sum of every K and V physical `page_size_bytes`; return `len(transfers) * _bytes_per_block` so upstream transfer metrics directly provide duration and throughput inputs.
-
-- [ ] **Step 6: Run tests, pre-commit, and commit**
-
-```bash
-uv run --no-sync pytest tests/kv_offload/test_shared_worker_dispatch.py tests/kv_offload/test_worker_dispatch.py -q
-SKIP=markdownlint pre-commit run --files spyre_inference/v1/kv_offload/shared_worker.py tests/kv_offload/test_shared_worker_dispatch.py spyre_inference/v1/kv_offload/worker.py spyre_inference/v1/worker/spyre_kv_offload.py
-git add spyre_inference/v1/kv_offload/shared_worker.py tests/kv_offload/test_shared_worker_dispatch.py spyre_inference/v1/kv_offload/worker.py spyre_inference/v1/worker/spyre_kv_offload.py
-git commit -s -m "Add shared KV offload worker"
-```
-
-### Task 5: Build and Lazily Register `SpyreSharedOffloadingSpec`
-
-**Files:**
-
-- Create: `spyre_inference/v1/kv_offload/shared_spec.py`
-- Modify: `spyre_inference/__init__.py:92`
-- Create: `tests/kv_offload/test_shared_spec.py`
-- Modify: `tests/kv_offload/test_spec.py`
-
-**Interfaces:**
-
-- Consumes: M1 construction hooks, `SpyreSharedOffloadingManager`, `SpyreSharedOffloadingWorker`, `allocate_family_slots`, page signatures, and full `VllmConfig` from the connector.
-- Produces: `SpyreSharedOffloadingSpec(SpyreOffloadingSpec)` resolvable by `spec_name="SpyreSharedOffloadingSpec"` without `spec_module_path`.
-
-- [ ] **Step 1: Write failing configuration and factory tests**
-
-Construct the spec with `shared_metadata_name="run-42"`, families `("pool-a", "pool-b", "pool-c")`, and eight logical blocks. Assert slot counts `(3, 3, 2)`. Reject a blank metadata name, an empty family list, duplicate family names, fewer blocks than families, `world_size != 1`, more than one KV group, and a non-float16 dtype.
-
-Verify lazy resolution:
-
-```python
-def test_shared_spec_factory_registration_is_lazy():
-    sys.modules.pop("spyre_inference.v1.kv_offload.shared_spec", None)
-    import spyre_inference
-
-    assert "spyre_inference.v1.kv_offload.shared_spec" not in sys.modules
-    cls = OffloadingSpecFactory.get_spec_cls({"spec_name": "SpyreSharedOffloadingSpec"})
-    assert cls.__name__ == "SpyreSharedOffloadingSpec"
-```
-
-Run a subprocess with a stub `torch_spyre._C` that lacks `SharedMetadata`; importing `spyre_inference` and resolving the M1 spec must succeed. Selecting M2 and first invoking its runtime path must fail with a message containing `SharedMetadata` and `torch-spyre M2`.
-
-- [ ] **Step 2: Run spec tests and verify they fail**
+- [ ] **Step 4: Run spec tests and observe failures from family-based configuration**
 
 ```bash
 uv run --no-sync pytest tests/kv_offload/test_shared_spec.py tests/kv_offload/test_spec.py -q
 ```
 
-Expected: FAIL because the M2 class and registration do not exist.
+Expected before implementation: failures reference `shared_pool_families`, `families`, and the old compatibility payload.
 
-- [ ] **Step 3: Implement M2 validation and factory overrides**
+- [ ] **Step 5: Use the immutable component descriptor and implement one-pool naming**
 
-The constructor calls `super().__init__`, then creates its immutable family allocation and directory-capacity parameters. `bind_vllm_config()` requires `distributed_executor_backend == "uni"` after vLLM resolution and stores the config for compatibility construction. `_create_manager()` lazily imports the manager module; `_create_worker()` requires the bound full config, computes the compatibility digest, and lazily imports the worker module.
-
-Build the digest from canonical JSON with sorted keys and compact separators, then SHA-256 it to 32 bytes. Include:
+Use the Task 1 descriptor:
 
 ```python
-payload = {
-    "format": COMPATIBILITY_FORMAT_VERSION,
-    "model": vllm_config.model_config.model,
-    "revision": vllm_config.model_config.revision,
-    "hash_algorithm": vllm_config.cache_config.prefix_caching_hash_algo,
-    "hash_seed": os.environ.get("PYTHONHASHSEED"),
-    "tokens_per_hash": self.tokens_per_hash,
-    "tokens_per_block": self.tokens_per_block,
-    "dtype": self.config.model.dtype,
-    "tp_size": 1,
-    "components": component_signatures,
-}
+@dataclass(frozen=True)
+class SharedComponentDescriptor:
+    component_id: int
+    cache_index: int
+    role: Literal["k", "v"]
+    layout_kind: str
+    layout_version: int
+    block_size: int
+    local_kv_heads: int
+    head_size: int
+    page_bytes: int
 ```
 
-Require `PYTHONHASHSEED` to be explicitly set for M2 instead of allowing two instances to produce unrelated first-block hashes. Each component signature contains cache index, `"k"` or `"v"`, layout kind/version, block size, local KV heads, head size, and physical page bytes.
-
-- [ ] **Step 4: Register the spec by strings only**
-
-At package initialization, add:
+Resolve names in `SpyreSharedOffloadingSpec.__init__` with explicit config, then `SPYRE_KV_POOL_NAME`, then `f"{self._pool_prefix}.shared"`. Validate POSIX logical names as non-empty and containing no slash beyond an optional leading slash. Set:
 
 ```python
-from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+self.component_count = 2 * len(config.groups[0].layer_names)
+self.max_pool_slots = self.num_blocks * self.component_count
+self.cpu_bytes_to_use = int(self.extra_config["cpu_bytes_to_use"])
+```
 
-OffloadingSpecFactory.register_spec(
-    "SpyreSharedOffloadingSpec",
-    "spyre_inference.v1.kv_offload.shared_spec",
-    "SpyreSharedOffloadingSpec",
+- [ ] **Step 6: Derive the manifest and geometry before worker construction**
+
+Walk `physical.caches` in cache order and each pair in K-then-V order. Build the descriptor from `page_signature(cache, layout_kind)`, assign monotonically increasing component IDs, and compute:
+
+```python
+geometry = compute_shared_pool_geometry(
+    self.cpu_bytes_to_use,
+    tuple(component.page_bytes for component in manifest),
+    mmap.PAGESIZE,
 )
 ```
 
-Do not import `shared_spec`, `shared_manager`, `shared_worker`, or `torch_spyre._C` from `spyre_inference/__init__.py`.
+Require `geometry.slot_count <= self.max_pool_slots`. Include `PAGE_KEY_ALGORITHM` and the component descriptors in the digest. Bump `COMPATIBILITY_FORMAT_VERSION` from `1` to `2` so old family/anchor objects cannot attach as the new page-key format.
 
-- [ ] **Step 5: Pin compatibility failures and M1 preservation**
+- [ ] **Step 7: Construct the one-pool manager and worker**
 
-Tests must prove every field in the payload changes the digest, a same-configuration digest is stable across processes, mismatched pool geometry/compatibility fails at registration, the M1 factory path still builds `CPUOffloadingManager`, and M1 pool prefixes remain engine/rank private.
+Use these exact constructor boundaries:
 
-- [ ] **Step 6: Run tests, pre-commit, and commit**
+```python
+SpyreSharedOffloadingManager(
+    metadata_name=self.metadata_name,
+    pool_name=self.pool_name,
+    component_count=self.component_count,
+    max_pool_slots=self.max_pool_slots,
+    cache_policy=self.eviction_policy,
+    cache_policy_module_path=self.cache_policy_module_path,
+    enable_events=self.kv_events_config.enable_kv_cache_events,
+    store_threshold=int(self.extra_config.get("store_threshold", 0)),
+    max_tracker_size=int(self.extra_config.get("max_tracker_size", 64_000)),
+)
+
+SpyreSharedOffloadingWorker(
+    physical=physical,
+    metadata_name=self.metadata_name,
+    pool_name=self.pool_name,
+    geometry=geometry,
+    manifest=manifest,
+    compatibility_digest=digest,
+    max_pool_slots=self.max_pool_slots,
+)
+```
+
+- [ ] **Step 8: Run spec and M1-preservation tests**
 
 ```bash
 uv run --no-sync pytest tests/kv_offload/test_shared_spec.py tests/kv_offload/test_spec.py tests/kv_offload/test_canonicalize_paged.py tests/kv_offload/test_worker_dispatch.py -q
-SKIP=markdownlint pre-commit run --files spyre_inference/__init__.py spyre_inference/v1/kv_offload/shared_spec.py tests/kv_offload/test_shared_spec.py tests/kv_offload/test_spec.py
-git add spyre_inference/__init__.py spyre_inference/v1/kv_offload/shared_spec.py tests/kv_offload/test_shared_spec.py tests/kv_offload/test_spec.py
-git commit -s -m "Register shared Spyre offloading spec"
 ```
 
-### Task 6: Prove Shared Misses Fall Back to Recompute
+Expected: one-pool configuration and compatibility tests pass; M1 still creates `CPUOffloadingManager`, keeps its private pool prefix, and does not import the shared runtime unless M2 is selected.
+
+### Task 3: Implement All-Page Lookup, Claims, Pins, and Ownership
 
 **Files:**
 
-- Create: `tests/kv_offload/test_connector_miss_recompute.py`
-- Modify only if the test exposes an integration defect: `spyre_inference/v1/kv_offload/shared_manager.py`
+- Modify: `spyre_inference/v1/kv_offload/shared_manager.py`
+- Modify: `tests/kv_offload/test_shared_manager.py`
 
 **Interfaces:**
 
-- Consumes: `SpyreSharedOffloadingManager.lookup()` and upstream `OffloadingConnectorScheduler._maximal_prefix_lookup()` / `update_state_after_alloc()` behavior.
-- Produces: a connector-level regression proving an M2 miss schedules zero externally loaded tokens and no H2D job.
+- Consumes: one registered pool, `shared_page_hash`, page-level transfer types, and upstream `CPUOffloadingManager` policy behavior.
+- Produces: `SpyreSharedOffloadingManager` with the standard `OffloadingManager` interface and explicit all-page hit/store semantics.
 
-- [ ] **Step 1: Write the connector-level miss test**
+- [ ] **Step 1: Replace the fake directory's anchor/family model with one pool and per-page entries**
 
-Use a real `SpyreSharedOffloadingManager` with a fake empty directory. Construct `OffloadingConnectorScheduler` through `object.__new__` with only the fields exercised by `_maximal_prefix_lookup`; because the first result is a miss, no event field is read:
+Index fake entries and claim outcomes by page hash, allow claim results to return arbitrary slots, and make pins release-observable. Instantiate the manager with `pool_name="shared.data"`, `component_count=4`, and `max_pool_slots=16`; expose a registered pool with `slot_count=8` so the local logical policy capacity must become two blocks.
+
+- [ ] **Step 2: Write a fragmented complete-hit test**
+
+Publish four page entries for one `OffloadKey` at slots `(7, 2, 6, 1)`. Require four lookup and pin calls, one logical `HIT`, and this exact load spec:
 
 ```python
-scheduler = object.__new__(OffloadingConnectorScheduler)
-scheduler.manager = manager
-matched = scheduler._maximal_prefix_lookup(
-    [OFFLOAD_KEY], ReqContext("request-1"), MagicMock(), MagicMock(), 0
+assert [
+    (page.component_id, page.location.pool_id, page.location.slot_id)
+    for page in manager.prepare_load([OFFLOAD_KEY], ctx).transfers[0].pages
+] == [(0, 10, 7), (1, 10, 2), (2, 10, 6), (3, 10, 1)]
+```
+
+Every pin remains live through `prepare_load` and is released only by `complete_load`.
+
+- [ ] **Step 3: Write all partial-hit rollback tests**
+
+Parameterize a missing page and a failed pin at component indices `0, 1, 2, 3`. Require `LookupResult.MISS`, no pending block state, and every earlier `PinRecord.released is True`. Add a page whose slot carries another `pool_id`; require a normal miss and no DMA spec. Preserve tests for `prepare_load` releasing scanned-but-unselected block pins and `on_request_finished` releasing pending but not active pins.
+
+- [ ] **Step 4: Write per-page claim and non-contiguous reservation tests**
+
+Return reservations at `(7, 2, 6, 1)` for the four component keys. Require one `SharedBlockTransfer` containing four store pages in component order and no arithmetic relationship among slots. Add a mixed case where components 0 and 2 are existing valid pages while 1 and 3 reserve slots; require the worker spec to contain only components 1 and 3.
+
+- [ ] **Step 5: Write claim rollback and ownership tests**
+
+Inject `ExistingClaim(valid=False)`, `NoSpace`, and `Unavailable` at each component after at least one prior reservation. Reserved/NoSpace outcomes must abort reservations for that logical block, remove its upstream policy admission, and return no store transfer. `Unavailable` must additionally abort all reservations retained earlier in the same batch and raise.
+
+After successful publication of a mixed existing/new page set, require `_owned_entries[OFFLOAD_KEY]` to contain only the entries created by this manager. Local logical eviction and `reset_cache()` must evict every locally owned page, preserve peer-owned pages, release pins before eviction, and abort only still-live local reservations.
+
+- [ ] **Step 6: Run manager tests and observe failures from anchor-only behavior**
+
+```bash
+uv run --no-sync pytest tests/kv_offload/test_shared_manager.py -q
+```
+
+Expected before implementation: failures show one directory lookup/claim and one anchor slot instead of the complete page set.
+
+- [ ] **Step 7: Implement lazy pool attach and lazy local-policy sizing**
+
+Make `SpyreSharedOffloadingManager` implement `OffloadingManager` and compose a `CPUOffloadingManager` after the worker has registered the pool. Attach metadata with the exact common capacity:
+
+```python
+SharedMetadataConfig(
+    1,
+    [],
+    SharedMetadataCapacity(1, max_pool_slots, 1),
 )
-assert matched == 0
-assert manager.directory.pin_calls == []
 ```
 
-Then invoke `update_state_after_alloc(request, blocks, num_external_tokens=0)` on an object whose `manager.prepare_load` raises if called. Assert it returns without creating a load job. This targets the connector decision, not lower-level race correctness.
+Find `pool_name`, require `registered.slot_count % component_count == 0`, require `registered.slot_count <= max_pool_slots`, and construct the local policy with `num_blocks=registered.slot_count // component_count`. Delegate `on_new_request`, `touch`, `take_events`, and `get_stats` to that local manager. This is the only scheduler capacity; do not use the older logical-byte `self.num_blocks` as the shared policy capacity.
 
-- [ ] **Step 2: Verify the test fails for any accidental hit translation**
+- [ ] **Step 8: Implement all-page lookup and pin lifetime**
 
-Temporarily configure the fake directory lookup to return a published entry and confirm the first assertion changes from `0` to `1`; restore the empty-directory setup before proceeding.
+For `component_id in range(component_count)`, build:
 
-- [ ] **Step 3: Run the final miss test**
+```python
+page_key = runtime.CompatibleBlockKey(
+    registered.compatibility,
+    shared_page_hash(key, component_id),
+)
+```
+
+Look up, validate the returned pool ref, and pin each page. On any miss or failed validation, clear the acquired page-pin tuple before returning `MISS`. Store complete pending and active page bundles per request. Call the local manager's load lifecycle only for locally admitted logical keys.
+
+Call `local_manager.lookup(key, req_context)` before the directory scan so upstream threshold accounting remains active. Preserve `HIT_PENDING` for an in-flight local store; for an upstream `HIT`, still scan and pin every shared page before reporting a usable hit.
+
+- [ ] **Step 9: Implement claims, publication verification, and rollback**
+
+Claim every page key from the same `registered.pool_ref` in component order. Carry each reservation's exact slot into `SharedPageTransfer` and reject any `ExistingClaim` that names another pool. Existing valid pages are reused and omitted from D2H; existing reserved pages and NoSpace skip that logical store after aborting its new reservations. On successful worker completion, look up all page keys, require a complete valid set, and record ownership only for page keys reserved by this attempt. If that final verification is incomplete, evict every newly published entry found for this attempt, roll back logical admission, and preserve pre-existing peer pages. On failed worker completion, drop pending ownership and call the local manager with `success=False`; the worker already quiesced DMA and rolled back reservations.
+
+- [ ] **Step 10: Run manager, connector-miss, and policy tests**
 
 ```bash
-uv run --no-sync pytest tests/kv_offload/test_connector_miss_recompute.py tests/kv_offload/test_shared_manager.py -q
+uv run --no-sync pytest tests/kv_offload/test_shared_manager.py tests/kv_offload/test_connector_miss_recompute.py -q
 ```
 
-Expected: PASS, with no worker or Spyre device needed.
+Expected: all-page and rollback tests pass for both LRU and ARC; a partial shared set still schedules zero external tokens and normal recomputation.
 
-- [ ] **Step 4: Run pre-commit and commit**
-
-```bash
-SKIP=markdownlint pre-commit run --files tests/kv_offload/test_connector_miss_recompute.py spyre_inference/v1/kv_offload/shared_manager.py
-git add tests/kv_offload/test_connector_miss_recompute.py spyre_inference/v1/kv_offload/shared_manager.py
-git commit -s -m "Test shared offload miss recomputation"
-```
-
-### Task 7: Run the Single-Chunk Gate and Shared-Pool Hardware Round Trip
+### Task 4: Register One Pool and Route Every Physical Page Explicitly
 
 **Files:**
 
-- Create: `tests/kv_offload/test_shared_pool_round_trip.py`
-- Modify if the real integration exposes a shared-worker contract defect: `spyre_inference/v1/kv_offload/shared_worker.py`
-- Modify its mock-safe regression if needed: `tests/kv_offload/test_shared_worker_dispatch.py`
-- Modify only if the gate proves it necessary: `/home/yzhu/dt-inductor/flex/include/flex/runtime_stream/runtime_stream.hpp`
-- Modify only if the gate proves it necessary: `/home/yzhu/dt-inductor/flex/src/runtime_stream/runtime_stream.cpp`
-- Modify only if the gate proves it necessary: `/home/yzhu/dt-inductor/flex/tests/runtime_stream/stream/runtime_stream_copy_raw_test.cpp`
-- Modify only if the gate proves it necessary: `/home/yzhu/dt-inductor/torch-spyre/.worktrees/kvc-offload-m2/tests/distributed/test_kv_offload_distributed.py`
+- Modify: `spyre_inference/v1/kv_offload/shared_worker.py`
+- Modify: `tests/kv_offload/test_shared_worker_dispatch.py`
 
 **Interfaces:**
 
-- Consumes: real Spyre `get_composite_address`, shared directory bindings, shared worker, and the existing bit-exact helpers in `tests/kv_offload/hw_helpers.py`.
-- Produces: a bit-exact connector-level shared-slot round trip, or hard evidence that M2-F3 must be implemented first.
+- Consumes: `SharedPoolGeometry`, ordered `SharedComponentDescriptor` values, and page-level load/store specs.
+- Produces: one `SharedHostPool` registration and page-by-page D2H/H2D through `copy_kv_page_raw`.
 
-- [ ] **Step 1: Add and run the real-allocation chunk gate**
+- [ ] **Step 1: Replace fake family pools with one registered/resolved pool**
 
-Allocate both token-major and head-major KV caches through their production `allocate_pages()`. For every K and V tensor, record `total_size`, `num_chunks`, and `[(domain_id, size)]`, and require `num_chunks == 1`:
+Make the fake runtime record one `SharedDataPoolConfig`. Assert:
 
 ```python
-address = get_composite_address(pages)
-assert address.num_chunks == 1, (
-    f"M2-F3 required: {layout_kind} {role} allocation has "
-    f"{address.num_chunks} chunks: {address.chunks()}"
+assert directory.config == (
+    "shared-meta",
+    FakeMetadataConfig(1, (), FakeCapacity(1, 16, 1)),
+)
+assert directory.configs == [
+    FakeDataPoolConfig(
+        "shared.data",
+        "host",
+        8,
+        4096,
+        FakeCompatibilityDescriptor(2, tuple(DIGEST)),
+    )
+]
+```
+
+The worker must reject a resolved pool whose returned slot count or slot bytes differs from `SharedPoolGeometry`, a mismatched compatibility descriptor, a multi-chunk component allocation, a non-divisible allocation, or a runtime page size that differs from its manifest.
+
+- [ ] **Step 2: Write non-contiguous page routing tests**
+
+For one device block and page slots `(7, 2, 6, 1)`, require exactly:
+
+```python
+assert copy_events == [
+    ("k0", 3, "shared.data", 7, False, True),
+    ("v0", 3, "shared.data", 2, False, True),
+    ("k1", 3, "shared.data", 6, False, True),
+    ("v1", 3, "shared.data", 1, False, True),
+]
+```
+
+Repeat with `to_device=True`. A load block must contain every component exactly once; a store block may contain a non-empty subset of newly reserved components. Unknown/duplicate component IDs, foreign pool IDs, out-of-range slots, wrong block counts, and wrong reservation mode must fail before any copy.
+
+- [ ] **Step 3: Write synchronization, descriptor, and byte-count tests**
+
+Require one fence before copies and one fence after all copies. After the second fence, publish each reservation with that component's own single-chunk descriptor `(domain_id, page_bytes)`. A four-page load returns `sum(PAGE_BYTES)`; a two-page partial store returns only those two page sizes.
+
+- [ ] **Step 4: Write transfer and publish rollback tests**
+
+Fail on the third copy and require the final sequence to synchronize, abort every unpublished reservation, and leave no entry. Fail on the third publish and require the first two published entries to be evicted, the remaining reservations to be aborted, and pre-existing peer entries to remain. The inherited result queue must report `success=False` and no successful transfer size.
+
+- [ ] **Step 5: Run worker tests and observe family-routing failures**
+
+```bash
+uv run --no-sync pytest tests/kv_offload/test_shared_worker_dispatch.py -q
+```
+
+Expected before implementation: registration creates multiple component pools and every component reuses one anchor slot.
+
+- [ ] **Step 6: Implement physical component binding and one-pool registration**
+
+Build a private `component_id -> (tensor, page_bytes, domain_id)` map from the ordered physical caches. Validate each complete allocation and its one chunk. Create metadata with `(max_chunks=1, max_pools=1, max_slots_per_pool=max_pool_slots, max_compatibilities=1)`, then register exactly:
+
+```python
+pool_config = runtime.SharedDataPoolConfig(
+    pool_name,
+    runtime.SharedPoolKind.HOST,
+    geometry.slot_count,
+    geometry.slot_bytes,
+    runtime.CompatibilityDescriptor(
+        COMPATIBILITY_FORMAT_VERSION,
+        list(compatibility_digest),
+    ),
+)
+registered = directory.register_or_attach_pool(pool_config)
+pool = directory.resolve_pool(registered.pool_ref)
+```
+
+Validate `registered.slot_count`, `registered.slot_bytes`, and resolved pool before accepting jobs. Log component count, logical block capacity, slot count, slot bytes, actual bytes, budget padding loss, and pool name.
+
+- [ ] **Step 7: Implement explicit page transfer and rollback**
+
+For each device block and each page transfer, resolve the component record and issue:
+
+```python
+runtime.copy_kv_page_raw(
+    component.tensor,
+    device_block,
+    pool,
+    page.location.slot_id,
+    to_device,
+    True,
 )
 ```
 
-Run serially:
+Never call `copy_kv_page_pair` from M2 because K and V may occupy unrelated slots. Synchronize before and after the copy batch. Publish only after the second synchronization. On exception, synchronize first, evict entries published by the attempt, abort the still-unpublished reservations, and re-raise for `_run()` to report failure.
+
+- [ ] **Step 8: Run worker and M1 dispatch tests**
 
 ```bash
-uv run --no-sync pytest tests/kv_offload/test_shared_pool_round_trip.py::test_real_kv_allocations_are_single_chunk -q -s
+uv run --no-sync pytest tests/kv_offload/test_shared_worker_dispatch.py tests/kv_offload/test_worker_dispatch.py tests/kv_offload/test_spyre_kv_offload.py -q
 ```
 
-Expected: PASS for every production KV allocation used by the test.
+Expected: the M2 worker uses one pool and arbitrary slots; M1 retains its existing per-cache K/V pairing and slot mapping.
 
-- [ ] **Step 2: If and only if Step 1 reports multiple chunks, complete M2-F3 on the lower-layer branches**
+### Task 5: Prove One-Pool Round Trip and Cross-Instance Reuse
 
-Stop spyre-inference work. In Flex `kvc-offload-m2`, change `RuntimeStream::copyRawImpl` to iterate the requested `CompositeAddress` range across chunks, issuing each DMA against the next contiguous host sub-offset, and validate `sum(selected_chunk_bytes) == Range.length` before issuing the first copy. Replace the existing `MultiChunkDeviceAddressThrows` test with D2H/H2D round trips for two unequal chunks plus the existing single-chunk regressions and host-capacity guards.
+**Files:**
 
-In torch-spyre `kvc-offload-m2`, preserve both public copy signatures. Add a spawned two-process test in `tests/distributed/test_kv_offload_distributed.py`: process A copies a multi-chunk tensor into one shared slot and publishes all `ChunkDescriptorEntry(domain_id, size)` records; process B looks up, pins, allocates the same shape/dtype, reloads, and asserts raw bytes. Rebuild using the repository scripts, run the focused Flex and torch-spyre tests serially, commit each repository with `-s`, reinstall the local torch-spyre wheel, and rerun Step 1. Do not continue until the gate passes.
+- Modify: `tests/kv_offload/test_shared_pool_round_trip.py`
+- Modify: `tests/kv_offload/test_cross_instance.py`
 
-- [ ] **Step 3: Write the shared-worker round-trip test**
+**Interfaces:**
 
-Create a unique metadata name and two-family configuration. Store a known nonzero device block through `SpyreSharedOffloadingWorker`, drain a successful result, attach a second shared worker to the same names, overwrite its destination device block, lookup and pin through a second manager, reload into that block, drain completion, release the pin, and compare every K/V component with `_assert_bit_exact`. Repeat for token-major and head-major layouts. Assert the stored and loaded `TransferResult.transfer_size` equals the complete logical block size and both times are positive.
+- Consumes: completed one-pool manager/worker, real Spyre allocations, two vLLM instances, and existing offload metrics.
+- Produces: byte-exact token-major/head-major page reload and the automated A -> A -> B functional acceptance.
 
-Flex's published chunk descriptor describes the claimed `c0.k` anchor slot,
-not the aggregate bytes in its sibling component pools. The worker must publish
-that anchor descriptor only after all K/V component copies synchronize; add a
-mock-safe regression that rejects an aggregate descriptor larger than the
-anchor slot.
+- [ ] **Step 1: Rewrite the hardware round trip for one pool**
 
-- [ ] **Step 4: Run the round trip serially**
+Use one pool name, a geometry computed from the real cache, and page-level manager/worker constructors. Before the measured store, claim and publish four dummy keys, record their returned slot IDs, then evict the maximum-ID entry followed by the minimum-ID entry. Because Flex pushes each freed slot onto the free-list head, the next two component claims must return the recorded minimum and maximum IDs, which are non-adjacent. Assert the actual store spec carries those exact locations and is not an arithmetic `base_slot + component_id` sequence.
+
+Store a known pattern from source block 3, attach a second worker to the same pool, load into destination block 6, and compare every K/V page bit-exactly for token-major and head-major layouts. Require both `TransferResult.transfer_size` values to equal the sum of the physical component page sizes.
+
+- [ ] **Step 2: Preserve the existing physical-allocation gate**
+
+Keep `test_real_kv_allocations_are_single_chunk` unchanged in meaning. It must print each layout/role's `total_size`, `num_chunks`, and chunk list, then require `num_chunks == 1`. A failure is an explicit scope violation, not authorization to change Flex or torch-spyre in this milestone.
+
+- [ ] **Step 3: Replace cross-instance families with one pool name**
+
+Change the server command's extra configuration to:
+
+```python
+"kv_connector_extra_config": {
+    "spec_name": "SpyreSharedOffloadingSpec",
+    "shared_metadata_name": metadata_name,
+    "pool_name": pool_name,
+    "cpu_bytes_to_use": CPU_BYTES,
+}
+```
+
+Use one unique `pool_name = f"{metadata_name}.data"` for A and B. The isolate-B negative control must change both B's metadata and pool name.
+
+- [ ] **Step 4: Add one-pool topology assertions**
+
+After A and B are ready and after A publishes, inspect the registered directory and `/dev/shm`. Require `pool_count() == 1`, `find_pool(pool_name)` to succeed, and exactly one generated backing plus its `.ctl` object for this metadata version. Require the pool's runtime geometry to equal the logged component count, slot size, slot count, and total bytes. Do not count unrelated `flex_kv_*` objects owned by other tests.
+
+- [ ] **Step 5: Preserve the functional A -> A -> B assertions**
+
+Keep prefix caching disabled. A's first request must have positive store bytes. A's second and B's first measured requests must have positive load bytes/time, identical token IDs, byte-identical text, and server logs showing external offloaded-token hits. Keep the isolate-B negative control: generation succeeds by recomputation but its positive peer-load assertion fails.
+
+- [ ] **Step 6: Run mock-safe integration tests**
+
+```bash
+uv run --no-sync pytest tests/kv_offload/test_shared_types.py tests/kv_offload/test_shared_spec.py tests/kv_offload/test_shared_manager.py tests/kv_offload/test_shared_worker_dispatch.py tests/kv_offload/test_connector_miss_recompute.py -q
+```
+
+Expected: all pass without a physical card.
+
+- [ ] **Step 7: Run the hardware page round trip serially**
 
 ```bash
 uv run --no-sync pytest tests/kv_offload/test_shared_pool_round_trip.py -q -s
 ```
 
-Expected: PASS on real hardware; CPU-only and `FLEX_DEVICE=MOCK*` environments skip rather than claim byte fidelity.
+Expected on real hardware: single-chunk gate and bit-exact token-major/head-major one-pool round trips pass. A CPU/mock environment must skip the byte-fidelity cases rather than report a hardware pass.
 
-- [ ] **Step 5: Run pre-commit and commit the spyre-inference test**
+- [ ] **Step 8: Run the two-instance test**
 
 ```bash
-SKIP=markdownlint pre-commit run --files tests/kv_offload/test_shared_pool_round_trip.py
-git add tests/kv_offload/test_shared_pool_round_trip.py
-git commit -s -m "Test shared KV pool round trip"
+RUN_SPYRE_SHARED_KV_E2E=1 \
+LD_LIBRARY_PATH=/opt/ibm/spyre/spyre-comms/lib:/home/yzhu/dt-inductor/sentient/runtime/lib:/opt/ibm/spyre/runtime/lib:$LD_LIBRARY_PATH \
+uv run --no-sync pytest tests/kv_offload/test_cross_instance.py -q -s
 ```
 
-### Task 8: Add the Two-Instance Functional Acceptance and A/B Timing
+Expected: A stores, A reloads, B peer-reloads, deterministic output matches, and the clean test namespace contains one metadata object and one data/control pair.
+
+### Task 6: Update Launch, Visual Demo, Namespace Cleanup, and Documentation
 
 **Files:**
 
-- Create: `tests/kv_offload/test_cross_instance.py`
-- Create after a successful run: `docs/superpowers/results/2026-09-29-spyre-shared-kv-offload.md`
+- Modify: `scripts/start_shared_kv_instance_a.sh`
+- Modify: `scripts/start_shared_kv_instance_b.sh`
+- Modify: `scripts/cleanup_shared_kv_demo.py`
+- Modify: `tests/kv_offload/test_cleanup_shared_kv_demo.py`
+- Verify/modify: `scripts/warmup_shared_kv_demo.py`
+- Verify/modify: `tests/kv_offload/test_warmup_shared_kv_demo.py`
+- Verify/modify: `scripts/shared_kv_two_instance_demo.py`
+- Verify/modify: `tests/kv_offload/test_shared_kv_two_instance_demo.py`
+- Modify: `docs/superpowers/results/2026-09-30-spyre-shared-kv-manual-demo.md`
 
 **Interfaces:**
 
-- Consumes: `vllm serve`, `SpyreOffloadingConnector`, lazy `SpyreSharedOffloadingSpec`, two distinct Spyre cards, Prometheus offload counters, and the OpenAI-compatible completions endpoint.
-- Produces: an opt-in two-process test plus recorded A self-reload and B peer-reload duration/throughput.
+- Consumes: explicit demo namespace `spyre_manual_4096`, one pool `spyre_manual_4096.data`, legacy M2 names, streaming TTFT, and Prometheus request deltas.
+- Produces: repeatable three-terminal visual demo, safe complete cleanup, inspectable one-pool topology, and recorded evidence.
 
-- [ ] **Step 1: Write the opt-in test harness and lifecycle guards**
+- [ ] **Step 1: Write cleanup tests for every demo-owned registered pool**
 
-Gate collection with `RUN_SPYRE_SHARED_KV_E2E=1`, require at least two real devices, and mark the test `uses_subprocess`. Start two server subprocesses with unique ports and log files. Use these invariant settings for both:
+Cover two layouts:
 
 ```python
-common = {
-    "model": "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-    "enforce_eager": True,
-    "enable_prefix_caching": False,
-    "tensor_parallel_size": 1,
-    "distributed_executor_backend": "uni",
-}
-
-extra = {
-    "spec_name": "SpyreSharedOffloadingSpec",
-    "shared_metadata_name": metadata_name,
-    "shared_pool_families": [f"{metadata_name}.a", f"{metadata_name}.b"],
-    "cpu_bytes_to_use": 512 * 1024 * 1024,
-}
+CURRENT_NAMES = ("demo.data",)
+LEGACY_NAMES = tuple(
+    f"demo.{family}.c{cache_index}.{role}"
+    for family in ("a", "b")
+    for cache_index in range(4)
+    for role in ("k", "v")
+)
 ```
 
-Pass `kv_connector="SpyreOffloadingConnector"`, `kv_role="kv_both"`, and `kv_connector_module_path="spyre_inference.v1.kv_offload.connector"`. Set `PYTHONHASHSEED=0` for both; set `SPYRE_DEVICES=0` for A and `SPYRE_DEVICES=1` for B. Poll `/health` with a bounded timeout. On every exit path, terminate both servers, wait for their child workers, then retire all named component pools and unlink the metadata directory.
+For the current directory, assert the data backing, `.ctl`, and metadata are removed. For a legacy directory, register all 16 historical component-pool names and assert all 16 backing/control pairs and metadata are removed. Add an explicit extra demo-owned `--pool-name` and require it is removed too. Preserve tests that refuse a matching live vLLM process or mapped metadata object, refuse a directory containing an unrecognized registered pool, restore temporary mock-runtime environment variables, and return success when metadata is absent.
 
-The generated server command contains these explicit flags in addition to the
-JSON connector configuration:
-
-```text
---enforce-eager --no-enable-prefix-caching --tensor-parallel-size 1
---distributed-executor-backend uni
-```
-
-- [ ] **Step 2: Add metric snapshot helpers**
-
-Parse these cumulative Prometheus counters from each server's `/metrics` endpoint:
-
-```text
-vllm:kv_offload_load_bytes_total
-vllm:kv_offload_load_time_total
-vllm:kv_offload_store_bytes_total
-```
-
-For each measured request, snapshot before and after, compute deltas, require positive load bytes and time, and report `bytes / seconds`. Poll A's store-byte counter after its first request so B is never released before publication is observable.
-
-- [ ] **Step 3: Implement the functional sequence with prefix caching disabled**
-
-Use one prompt containing at least two complete 128-token blocks and fixed greedy generation. Execute:
-
-1. A baseline request computes and publishes; record returned token IDs and text.
-2. Wait until A reports a positive store-byte delta and the original request has completed, releasing its device KV blocks.
-3. Snapshot A metrics, send the same prompt to A, and require a positive host-to-device load delta; record A self-reload seconds and bytes/second.
-4. Snapshot B metrics, send the same prompt as B's first request, and require a positive host-to-device load delta; record B peer-reload seconds and bytes/second.
-5. Require A-self and B-peer token IDs and text to be byte-identical to the baseline.
-6. Require server logs to contain shared host-tier hit/load records and no disk-tier load; prefix caching remains explicitly false in the emitted engine configuration.
-
-The assertions are functional. Do not compare A against B, M2 against M1, or either result against a performance threshold.
-
-- [ ] **Step 4: Verify the test catches an absent peer path**
-
-Run once with B assigned a different metadata name and confirm B's positive load-delta assertion fails while generation still succeeds by recomputation. Restore the common name before the acceptance run.
-
-- [ ] **Step 5: Run the two-instance acceptance**
+- [ ] **Step 2: Run cleanup tests and observe failures from the fixed 16-pool assumption**
 
 ```bash
-RUN_SPYRE_SHARED_KV_E2E=1 uv run --no-sync pytest tests/kv_offload/test_cross_instance.py -q -s
+uv run --no-sync pytest tests/kv_offload/test_cleanup_shared_kv_demo.py -q
 ```
 
-Expected: one cross-instance test passes; A and B each report positive shared-pool load bytes/time, B loads A's block on its first request, and all deterministic outputs match.
+Expected before implementation: the current one-pool case is not discoverable and the old CLI requires family/cache geometry.
 
-- [ ] **Step 6: Record the actual functional evidence and timing**
+- [ ] **Step 3: Implement current and legacy namespace discovery**
 
-Create the result document with the tested spyre-inference, torch-spyre, and Flex commit hashes; model; device identifiers; exact command; prefix-caching setting; prompt and shared block bytes; A self-reload seconds and bytes/second; B peer-reload seconds and bytes/second; and pass/fail evidence for peer hit and output identity. State explicitly that no M1 comparison or performance threshold was run.
+Replace `pool_families`, `cache_count`, and `total_host_blocks` as the primary interface with:
 
-- [ ] **Step 7: Run pre-commit and commit the acceptance artifacts**
+```python
+def cleanup_shared_kv_demo(
+    *,
+    metadata_name: str = "spyre_manual_4096",
+    pool_names: tuple[str, ...] | None = None,
+    component_count: int = 8,
+    max_pool_slots: int = 2048,
+    legacy_cache_count: int = 4,
+    legacy_total_host_blocks: int = 256,
+    proc_root: Path = Path("/proc"),
+    shm_root: Path = Path("/dev/shm"),
+    runtime: Any | None = None,
+) -> list[str]:
+```
+
+Default candidates are the current `f"{metadata_name}.data"` plus every historical `f"{metadata_name}.{a|b}.c{0..legacy_cache_count-1}.{k|v}"`. Repeated `--pool-name` values extend that owned candidate set. Try the exact current metadata capacity `(1, max_pool_slots, 1)` with `max_chunks=1`; if attachment reports a configuration mismatch, try the exact legacy capacity `(2 * legacy_cache_count, ceil(legacy_total_host_blocks / 2), 1)` with `max_chunks=2 * legacy_cache_count`.
+
+Find every candidate registered in the attached directory and require `metadata.pool_count() == len(found)` before changing anything. Capture each generated backing name from its `PoolRef`, unlink every backing and `.ctl`, unlink metadata, and verify all paths are absent. Do not call `retire_pool`: retirement intentionally rejects a stale `RESERVED` slot, while this operator-only cleanup runs only after the live-owner guard and must recover interrupted runs. This removes every pool the current or historical demo registered, not merely the one expected in a clean new run, while an unknown pool causes a safe refusal.
+
+- [ ] **Step 4: Update both launchers to one shared pool**
+
+Use identical extra configuration in A and B:
+
+```json
+{
+  "spec_name": "SpyreSharedOffloadingSpec",
+  "shared_metadata_name": "spyre_manual_4096",
+  "pool_name": "spyre_manual_4096.data",
+  "cpu_bytes_to_use": 536870912
+}
+```
+
+Preserve TP1, `uni`, `--no-enable-prefix-caching`, `--max-num-batched-tokens 512`, `--max-num-seqs 1`, `PYTHONHASHSEED=0`, distinct default devices, and worktree-first `PYTHONPATH`.
+
+- [ ] **Step 5: Retest the visual scripts without weakening their output**
+
+Keep the warmup prompt visibly unrelated to the measured prompt. Before every request, print instance name, host/port endpoint, identifier, prompt preview, and exact token count. After every request, print path classification, TTFT, end-to-end wall time, local-compute/external-transfer tokens, store/load bytes, store/load copy time, output token IDs, and output text.
+
+Run:
 
 ```bash
-SKIP=markdownlint pre-commit run --files tests/kv_offload/test_cross_instance.py docs/superpowers/results/2026-09-29-spyre-shared-kv-offload.md
-git add tests/kv_offload/test_cross_instance.py docs/superpowers/results/2026-09-29-spyre-shared-kv-offload.md
-git commit -s -m "Test cross-instance shared KV reload"
+uv run --no-sync pytest tests/kv_offload/test_cleanup_shared_kv_demo.py tests/kv_offload/test_warmup_shared_kv_demo.py tests/kv_offload/test_shared_kv_two_instance_demo.py -q
 ```
 
-### Task 9: Run the Full M1/M2 Regression Gate
+Expected: all script tests pass, including metric families that are absent before their first sample being treated as zero rather than as a fatal missing metric.
+
+- [ ] **Step 6: Rewrite the manual guide's topology and inspection section**
+
+Replace every statement about 16 component pools or two families. Document the clean live topology as:
+
+```text
+/dev/shm/spyre_manual_4096
+/dev/shm/flex_kv_<metadata-version>_<pool-id>_<pool-version>
+/dev/shm/flex_kv_<metadata-version>_<pool-id>_<pool-version>.ctl
+```
+
+Include this inspection command while both servers are running:
+
+```bash
+strings /dev/shm/spyre_manual_4096 \
+  | grep '^/flex_kv_' \
+  | sort -u \
+  | while read -r pool; do
+      stat -c '%n  %s bytes' "/dev/shm/${pool#/}"
+      stat -c '%n  %s bytes' "/dev/shm/${pool#/}.ctl"
+    done
+```
+
+State that one unique base name is expected. The metadata object is not a data pool; the `.ctl` object belongs to the same one data backing.
+
+- [ ] **Step 7: Run the manual A -> A -> B visual sequence and save logs**
+
+After stopping old servers:
+
+```bash
+cd /home/yzhu/dt-inductor/spyre-inference-kvc-offload-m2
+uv run --no-sync python scripts/cleanup_shared_kv_demo.py
+```
+
+Start A and B with the documented launchers. In terminal C, save unrelated warmup and each measured request separately:
+
+```bash
+set -o pipefail
+LD_LIBRARY_PATH=/opt/ibm/spyre/spyre-comms/lib:/home/yzhu/dt-inductor/sentient/runtime/lib:/opt/ibm/spyre/runtime/lib:$LD_LIBRARY_PATH \
+uv run --no-sync python -u scripts/warmup_shared_kv_demo.py \
+  --instance-a-host 127.0.0.1 --instance-a-port 18100 \
+  --instance-b-host 127.0.0.1 --instance-b-port 18101 2>&1 \
+  | tee /tmp/spyre-shared-kv-one-pool-warmup.log
+
+LD_LIBRARY_PATH=/opt/ibm/spyre/spyre-comms/lib:/home/yzhu/dt-inductor/sentient/runtime/lib:/opt/ibm/spyre/runtime/lib:$LD_LIBRARY_PATH \
+uv run --no-sync python -u scripts/shared_kv_two_instance_demo.py \
+  --instance A --host 127.0.0.1 --port 18100 2>&1 \
+  | tee /tmp/spyre-shared-kv-one-pool-a-cold.log
+
+LD_LIBRARY_PATH=/opt/ibm/spyre/spyre-comms/lib:/home/yzhu/dt-inductor/sentient/runtime/lib:/opt/ibm/spyre/runtime/lib:$LD_LIBRARY_PATH \
+uv run --no-sync python -u scripts/shared_kv_two_instance_demo.py \
+  --instance A --host 127.0.0.1 --port 18100 2>&1 \
+  | tee /tmp/spyre-shared-kv-one-pool-a-reload.log
+
+LD_LIBRARY_PATH=/opt/ibm/spyre/spyre-comms/lib:/home/yzhu/dt-inductor/sentient/runtime/lib:/opt/ibm/spyre/runtime/lib:$LD_LIBRARY_PATH \
+uv run --no-sync python -u scripts/shared_kv_two_instance_demo.py \
+  --instance B --host 127.0.0.1 --port 18101 2>&1 \
+  | tee /tmp/spyre-shared-kv-one-pool-b-reload.log
+```
+
+Use the same identifier for A, A, and B. Require 4,096 prompt tokens, 16 output tokens, one cold compute/store, two external reloads, identical output, equal expected KV bytes, and reload TTFT shorter than cold TTFT. Record performance; do not encode a timing threshold into unit tests.
+
+- [ ] **Step 8: Stop both servers, clean every owned pool, and record post-cleanup evidence**
+
+```bash
+uv run --no-sync python scripts/cleanup_shared_kv_demo.py \
+  | tee /tmp/spyre-shared-kv-one-pool-cleanup.log
+test ! -e /dev/shm/spyre_manual_4096
+```
+
+Verify every backing/control name printed by the pre-cleanup inspection is absent afterward and unrelated `/dev/shm` objects remain.
+
+- [ ] **Step 9: Update the result document with the fresh one-pool run**
+
+Record the three repository commit hashes, model, vLLM version, device IDs, pool geometry, `/dev/shm` object list, exact commands/log paths, prompt/output token counts, cold/reload TTFT, end-to-end wall time, computed/loaded token counts, KV bytes, copy time, and output equality. Keep the earlier reference result clearly labeled as historical; do not present its 16-pool topology as current.
+
+### Task 7: Run Final Regression Gates, Review, and Sign Only After Success
 
 **Files:**
 
-- Verify: all changed files on `kvc-offload-m2`
+- Verify: every changed file in `spyre-inference-kvc-offload-m2`
+- Verify only: `/home/yzhu/dt-inductor/flex` M1/M2 lower-layer tests
+- Verify only: `/home/yzhu/dt-inductor/torch-spyre/.worktrees/kvc-offload-m2` M1/M2 lower-layer tests
 
 **Interfaces:**
 
-- Consumes: every deliverable from Tasks 1-8.
-- Produces: final evidence that M2 works and M1 remains unchanged.
+- Consumes: all deliverables from Tasks 1-6.
+- Produces: evidence-backed final branch, one signed redesign commit, and no remote mutation.
 
-- [ ] **Step 1: Run all mock-safe KV-offload tests**
-
-```bash
-uv run --no-sync pytest tests/kv_offload/test_spec.py tests/kv_offload/test_canonicalize_paged.py tests/kv_offload/test_worker_dispatch.py tests/kv_offload/test_shared_types.py tests/kv_offload/test_shared_manager.py tests/kv_offload/test_shared_worker_dispatch.py tests/kv_offload/test_shared_spec.py tests/kv_offload/test_connector_miss_recompute.py -m "not upstream" -q
-```
-
-Expected: all pass without importing the M2 runtime during ordinary plugin import.
-
-- [ ] **Step 2: Run real-hardware tests serially**
+- [ ] **Step 1: Run the complete mock-safe spyre-inference KV-offload gate**
 
 ```bash
-uv run --no-sync pytest tests/kv_offload/test_spyre_kv_offload_hw.py tests/kv_offload/test_worker_hw.py tests/kv_offload/test_shared_pool_round_trip.py -q -s
+uv run --no-sync pytest \
+  tests/kv_offload/test_spec.py \
+  tests/kv_offload/test_canonicalize_paged.py \
+  tests/kv_offload/test_worker_dispatch.py \
+  tests/kv_offload/test_spyre_kv_offload.py \
+  tests/kv_offload/test_shared_types.py \
+  tests/kv_offload/test_shared_spec.py \
+  tests/kv_offload/test_shared_manager.py \
+  tests/kv_offload/test_shared_worker_dispatch.py \
+  tests/kv_offload/test_connector_miss_recompute.py \
+  tests/kv_offload/test_cleanup_shared_kv_demo.py \
+  tests/kv_offload/test_warmup_shared_kv_demo.py \
+  tests/kv_offload/test_shared_kv_two_instance_demo.py \
+  -m "not upstream" -q
 ```
 
-Expected: M1 and M2 page round trips pass byte-exactly on a real card.
+Expected: all pass with no M2 runtime import during ordinary plugin import.
 
-- [ ] **Step 3: Repeat the two-instance acceptance after the regression suite**
+- [ ] **Step 2: Run lower-layer M1 regression tests without modifying their APIs**
+
+Run the existing Flex shared-metadata, shared-host-pool, and raw-copy suites, including the range/bounds cases. Then run torch-spyre's shared metadata and KV page validator suites:
 
 ```bash
-RUN_SPYRE_SHARED_KV_E2E=1 uv run --no-sync pytest tests/kv_offload/test_cross_instance.py -q -s
+FLEX_DEVICE=MOCK1p0 FLEX_COMPUTE=NULL \
+LD_LIBRARY_PATH=/home/yzhu/dt-inductor/sentient/runtime/lib:/opt/ibm/spyre/runtime/lib:$LD_LIBRARY_PATH \
+/home/yzhu/dt-inductor/build/flex/tests/flex_unit_test \
+  --gtest_filter='SharedHostPoolTest.*:SharedMetadata*.*:RuntimeStreamCopyRawUnittest.*'
+
+cd /home/yzhu/dt-inductor/torch-spyre/.worktrees/kvc-offload-m2
+uv run --no-sync pytest tests/test_shared_metadata.py tests/test_kv_page_validator.py -q -s
 ```
 
-Expected: deterministic output identity and positive A/B shared-load measurements remain reproducible.
+Expected: independent slot allocation, `copyRaw(..., Range)`, token-major bounds, and head-major bounds remain green. No lower-layer production diff is expected.
 
-- [ ] **Step 4: Run formatting and repository checks**
+- [ ] **Step 3: Run all real Spyre tests serially**
+
+```bash
+cd /home/yzhu/dt-inductor/spyre-inference-kvc-offload-m2
+uv run --no-sync pytest \
+  tests/kv_offload/test_spyre_kv_offload_hw.py \
+  tests/kv_offload/test_worker_hw.py \
+  tests/kv_offload/test_shared_pool_round_trip.py \
+  -q -s
+```
+
+Expected: M1 and one-pool M2 page transfers pass byte-exactly. Do not start either vLLM server while this command owns a card.
+
+- [ ] **Step 4: Repeat automated and manual two-instance acceptance**
+
+Run the Task 5 cross-instance command, then the Task 6 cleanup/warmup/A/A/B/cleanup sequence. Expected: one data pool, positive store/load metrics, identical deterministic outputs, and both reload TTFT values shorter than cold TTFT.
+
+- [ ] **Step 5: Run formatting, static checks, and diff checks**
 
 ```bash
 bash format.sh
-SKIP=markdownlint pre-commit run --all-files
 uv run --no-sync ty
 git diff --check
+SKIP=markdownlint pre-commit run --all-files
 ```
 
-Treat the known unresolved local torch-spyre import failure as an environment blocker only if it is unchanged from baseline; all new-file diagnostics must be fixed.
+Fix every diagnostic introduced by this branch. Record any unchanged environment-only type diagnostic separately with its baseline evidence; do not weaken checks.
 
-- [ ] **Step 5: Audit branch isolation and lower-layer pins**
+- [ ] **Step 6: Audit scope and branch isolation**
 
 ```bash
 git status --short --branch
-git log --oneline --decorate 86f56ed..HEAD
-git -C /home/yzhu/dt-inductor/flex branch --show-current
-git -C /home/yzhu/dt-inductor/torch-spyre/.worktrees/kvc-offload-m2 branch --show-current
+git diff --stat
+git diff -- spyre_inference/v1/kv_offload tests/kv_offload scripts docs/superpowers
+git -C /home/yzhu/dt-inductor/flex status --short --branch
+git -C /home/yzhu/dt-inductor/torch-spyre/.worktrees/kvc-offload-m2 status --short --branch
 ```
 
-Expected: spyre-inference is on `kvc-offload-m2`; any conditional lower-layer commits are on their own `kvc-offload-m2` branches; no files from the dirty `kvc-offload-poc` worktree appear in the diff.
+Expected: only the intended spyre-inference redesign/demo files changed; unrelated existing Flex and torch-spyre work remains untouched.
 
-- [ ] **Step 6: Request final code review before integration**
+- [ ] **Step 7: Use the requesting-code-review skill on the complete uncommitted diff**
 
-Use the `requesting-code-review` skill against the complete `86f56ed..HEAD` diff. Resolve findings with focused tests, rerun the affected gates, and leave the branch unpushed until the user explicitly authorizes a GitHub write.
+Review specifically for page-key compatibility, pin lifetime, reservation ownership, fragmented-slot routing, worker failure quiescence, cleanup safety, M1 behavior, and acceptance coverage. Resolve findings with focused tests, then rerun every affected gate and `git diff --check`.
+
+- [ ] **Step 8: Create the signed commit only after all gates and review pass**
+
+```bash
+git add \
+  spyre_inference/v1/kv_offload/shared_types.py \
+  spyre_inference/v1/kv_offload/shared_spec.py \
+  spyre_inference/v1/kv_offload/shared_manager.py \
+  spyre_inference/v1/kv_offload/shared_worker.py \
+  tests/kv_offload/test_shared_types.py \
+  tests/kv_offload/test_shared_spec.py \
+  tests/kv_offload/test_shared_manager.py \
+  tests/kv_offload/test_shared_worker_dispatch.py \
+  tests/kv_offload/test_shared_pool_round_trip.py \
+  tests/kv_offload/test_cross_instance.py \
+  tests/kv_offload/test_cleanup_shared_kv_demo.py \
+  tests/kv_offload/test_warmup_shared_kv_demo.py \
+  tests/kv_offload/test_shared_kv_two_instance_demo.py \
+  scripts/start_shared_kv_instance_a.sh \
+  scripts/start_shared_kv_instance_b.sh \
+  scripts/cleanup_shared_kv_demo.py \
+  scripts/warmup_shared_kv_demo.py \
+  scripts/shared_kv_two_instance_demo.py \
+  docs/superpowers/specs/2026-09-29-spyre-shared-kv-offload-design.md \
+  docs/superpowers/plans/2026-09-29-spyre-shared-kv-offload.md \
+  docs/superpowers/results/2026-09-30-spyre-shared-kv-manual-demo.md
+git commit -s -m "Fix shared KV page placement"
+```
+
+If commit signing requires an unavailable interactive prompt, leave the verified changes staged and run this exact command in the user's terminal instead. Do not push, force-push, or open a pull request in this plan; obtain explicit final authorization after presenting the commit and test evidence.
