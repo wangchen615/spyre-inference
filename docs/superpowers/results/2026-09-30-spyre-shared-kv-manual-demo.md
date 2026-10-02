@@ -41,6 +41,23 @@ identifies its one data pool. The 512-MiB budget produces eight physical page
 components per logical block, 256-KiB slots, 2,048 slots, and capacity for 256
 logical blocks.
 
+## Runtime library order
+
+Commands that start a server or run native shared-memory cleanup prepend this
+library order:
+
+```text
+/opt/ibm/spyre/spyre-comms/lib
+/home/yzhu/dt-inductor/sentient/runtime/lib
+/opt/ibm/spyre/runtime/lib
+```
+
+Directory order matters even when all three directories already appear in
+`LD_LIBRARY_PATH`. The packaged Spyre Comms library must precede the
+incompatible copy under `sentient/spyre_comms/lib`; the local runtime directory
+selects the rebuilt M2 Flex library. The warmup and measurement scripts are
+HTTP clients, so they do not load torch-spyre and need no library-path prefix.
+
 ## Clean stale demo objects
 
 Stop both demo servers before cleanup. The command refuses to unlink the
@@ -48,6 +65,7 @@ namespace while a vLLM process references it.
 
 ```bash
 cd /home/yzhu/dt-inductor/spyre-inference-kvc-offload-m2
+LD_LIBRARY_PATH=/opt/ibm/spyre/spyre-comms/lib:/home/yzhu/dt-inductor/sentient/runtime/lib:/opt/ibm/spyre/runtime/lib:$LD_LIBRARY_PATH \
 uv run --no-sync python scripts/cleanup_shared_kv_demo.py
 ```
 
@@ -108,50 +126,53 @@ the backing and control objects for the same single data pool.
 ## Warm both instances with unrelated data
 
 The warmup prompt is visibly different from the measured incident prompt. It
-first computes one unique prompt on each server, then exercises A's self-load
-and B's peer-load paths.
+only cold-computes and stores one unique junk prompt on each server:
+
+1. Junk prompt A to instance A: cold compute and store.
+2. Junk prompt B to instance B: cold compute and store.
+
+The warmup does not issue reload requests. The first self- and peer-reloads are
+the measured requests later in the procedure.
 
 ```bash
 cd /home/yzhu/dt-inductor/spyre-inference-kvc-offload-m2
 set -o pipefail
-LD_LIBRARY_PATH=/opt/ibm/spyre/spyre-comms/lib:/home/yzhu/dt-inductor/sentient/runtime/lib:/opt/ibm/spyre/runtime/lib:$LD_LIBRARY_PATH \
 uv run --no-sync python -u scripts/warmup_shared_kv_demo.py \
   --instance-a-host 127.0.0.1 --instance-a-port 18100 \
   --instance-b-host 127.0.0.1 --instance-b-port 18101 2>&1 \
-  | tee /tmp/spyre-shared-kv-one-pool-warmup.log
+  | tee /tmp/spyre-shared-kv-cold-only-warmup.log
 ```
 
 ## Send the measured request to A, A, and B
 
 Each invocation prints its instance and endpoint, stable identifier, prompt
 preview, exact token count, path classification, TTFT, E2E time, prompt-source
-tokens, KV bytes/copy time, output token IDs, and output text.
+tokens, KV bytes/copy time, output token IDs, and output text. Default output is
+formatted for the visual demo; add `--show-json` when complete machine-readable
+results are also needed.
 
 First send the cold request to A:
 
 ```bash
-LD_LIBRARY_PATH=/opt/ibm/spyre/spyre-comms/lib:/home/yzhu/dt-inductor/sentient/runtime/lib:/opt/ibm/spyre/runtime/lib:$LD_LIBRARY_PATH \
 uv run --no-sync python -u scripts/shared_kv_two_instance_demo.py \
   --instance A --host 127.0.0.1 --port 18100 2>&1 \
-  | tee /tmp/spyre-shared-kv-one-pool-a-cold.log
+  | tee /tmp/spyre-shared-kv-cold-only-a-cold.log
 ```
 
 Send the identical request to A again:
 
 ```bash
-LD_LIBRARY_PATH=/opt/ibm/spyre/spyre-comms/lib:/home/yzhu/dt-inductor/sentient/runtime/lib:/opt/ibm/spyre/runtime/lib:$LD_LIBRARY_PATH \
 uv run --no-sync python -u scripts/shared_kv_two_instance_demo.py \
   --instance A --host 127.0.0.1 --port 18100 2>&1 \
-  | tee /tmp/spyre-shared-kv-one-pool-a-reload.log
+  | tee /tmp/spyre-shared-kv-cold-only-a-reload.log
 ```
 
 Finally, send the same request to B:
 
 ```bash
-LD_LIBRARY_PATH=/opt/ibm/spyre/spyre-comms/lib:/home/yzhu/dt-inductor/sentient/runtime/lib:/opt/ibm/spyre/runtime/lib:$LD_LIBRARY_PATH \
 uv run --no-sync python -u scripts/shared_kv_two_instance_demo.py \
   --instance B --host 127.0.0.1 --port 18101 2>&1 \
-  | tee /tmp/spyre-shared-kv-one-pool-b-reload.log
+  | tee /tmp/spyre-shared-kv-cold-only-b-reload.log
 ```
 
 Keep the default identifier `spyre-shared-kv-visual-demo-v1`, or pass the same
@@ -163,13 +184,16 @@ The 2026-10-02 run produced:
 
 | Request | TTFT | E2E wall time | Prompt source | KV copy time | KV bytes |
 | --- | ---: | ---: | --- | ---: | ---: |
-| A cold compute/store | 3.386 s | 12.142 s | 4,096 local-compute tokens | 0.010332 s | 67,108,864 stored |
-| A self reload | 0.575 s | 9.244 s | 4,096 external-transfer tokens | 0.006399 s | 67,108,864 loaded |
-| B peer reload | 0.574 s | 9.302 s | 4,096 external-transfer tokens | 0.005588 s | 67,108,864 loaded |
+| A cold compute/store | 3.282 s | 12.014 s | 4,096 local-compute tokens | 0.008741 s | 67,108,864 stored |
+| A first self reload | 8.038 s | 16.688 s | 4,096 external-transfer tokens | 0.006692 s | 67,108,864 loaded |
+| B first peer reload | 8.127 s | 16.892 s | 4,096 external-transfer tokens | 0.005804 s | 67,108,864 loaded |
 
-Self-reload reduced TTFT by 83.0%, and peer reload reduced TTFT by 83.0%.
-Their E2E reductions were 23.9% and 23.4%. All requests generated 16 output
-tokens. The measured token IDs were identical:
+Because the warmup no longer primes either reload path, each first measured
+reload includes its instance's one-time external-load initialization. The KV
+copies themselves took only 5.8--6.7 ms. Diagnostic second reloads reached
+0.655 s TTFT on A and 0.585 s on B, but they are not part of the three-request
+measurement above. All measured requests generated 16 output tokens with
+identical token IDs:
 
 ```text
 [203, 203, 1397, 44, 10720, 3303, 518, 322, 15872, 2582, 11385, 39171, 461, 7624, 8019, 26322]
@@ -181,14 +205,13 @@ They decoded byte-identically to:
 "\n\nResponse: Summarize the recurring symptoms and give three concrete"
 ```
 
-The warmup also proved both paths before measurement:
+The warmup cold-computed unrelated prompts without populating the measured
+prompt:
 
-| Warmup request | TTFT | E2E wall time | Prompt source | KV bytes |
-| --- | ---: | ---: | --- | ---: |
-| A junk compute/store | 82.518 s | 131.801 s | 4,096 local-compute tokens | 67,108,864 stored |
-| B distinct junk compute/store | 81.636 s | 132.506 s | 4,096 local-compute tokens | 67,108,864 stored |
-| A junk self reload | 8.449 s | 17.292 s | 4,096 external-transfer tokens | 67,108,864 loaded |
-| B junk peer reload | 8.414 s | 17.303 s | 4,096 external-transfer tokens | 67,108,864 loaded |
+| Warmup request | TTFT | E2E wall time | Prompt source | KV copy time | KV bytes |
+| --- | ---: | ---: | --- | ---: | ---: |
+| A junk compute/store | 84.003 s | 131.961 s | 4,096 local-compute tokens | 0.016263 s | 67,108,864 stored |
+| B distinct junk compute/store | 80.619 s | 128.734 s | 4,096 local-compute tokens | 0.013781 s | 67,108,864 stored |
 
 ## Stop and clean up
 
@@ -196,8 +219,9 @@ Stop B and then A with Ctrl-C. Run:
 
 ```bash
 cd /home/yzhu/dt-inductor/spyre-inference-kvc-offload-m2
+LD_LIBRARY_PATH=/opt/ibm/spyre/spyre-comms/lib:/home/yzhu/dt-inductor/sentient/runtime/lib:/opt/ibm/spyre/runtime/lib:$LD_LIBRARY_PATH \
 uv run --no-sync python scripts/cleanup_shared_kv_demo.py \
-  | tee /tmp/spyre-shared-kv-one-pool-cleanup.log
+  | tee /tmp/spyre-shared-kv-cold-only-cleanup.log
 test ! -e /dev/shm/spyre_manual_4096
 ```
 
@@ -212,15 +236,18 @@ unrelated `flex_kv_*` objects remained.
 
 ## Artifacts
 
-- `/tmp/spyre-shared-kv-one-pool-a-server.log`
-- `/tmp/spyre-shared-kv-one-pool-b-server.log`
-- `/tmp/spyre-shared-kv-one-pool-topology.log`
-- `/tmp/spyre-shared-kv-one-pool-topology-after.log`
-- `/tmp/spyre-shared-kv-one-pool-warmup.log`
-- `/tmp/spyre-shared-kv-one-pool-a-cold.log`
-- `/tmp/spyre-shared-kv-one-pool-a-reload.log`
-- `/tmp/spyre-shared-kv-one-pool-b-reload.log`
-- `/tmp/spyre-shared-kv-one-pool-cleanup.log`
+The captured cold-only run produced:
+
+- `/tmp/spyre-shared-kv-cold-only-a-server.log`
+- `/tmp/spyre-shared-kv-cold-only-b-server.log`
+- `/tmp/spyre-shared-kv-cold-only-warmup.log`
+- `/tmp/spyre-shared-kv-cold-only-a-cold.log`
+- `/tmp/spyre-shared-kv-cold-only-a-reload.log`
+- `/tmp/spyre-shared-kv-cold-only-b-reload.log`
+
+The latency investigation also produced the non-acceptance diagnostic logs
+`/tmp/spyre-shared-kv-cold-only-a-second-reload-diagnostic.log` and
+`/tmp/spyre-shared-kv-cold-only-b-second-reload-diagnostic.log`.
 
 ## Historical pre-redesign reference
 

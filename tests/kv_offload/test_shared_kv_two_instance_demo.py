@@ -16,6 +16,8 @@ import json
 import os
 import shlex
 import subprocess
+import sys
+from argparse import Namespace
 
 import pytest
 
@@ -47,6 +49,23 @@ def test_launcher_configures_the_one_shared_data_pool(launcher, port, device):
     extra_config = transfer_config["kv_connector_extra_config"]
     assert extra_config["pool_name"] == "spyre_manual_4096.data"
     assert "shared_pool_families" not in extra_config
+
+
+def test_measurement_help_preserves_cleanup_command_line_continuation():
+    result = subprocess.run(
+        [sys.executable, "scripts/shared_kv_two_instance_demo.py", "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        "LD_LIBRARY_PATH=/opt/ibm/spyre/spyre-comms/lib:"
+        "/home/yzhu/dt-inductor/sentient/runtime/lib:"
+        "/opt/ibm/spyre/runtime/lib:$LD_LIBRARY_PATH \\\n"
+        "        uv run --no-sync python scripts/cleanup_shared_kv_demo.py" in result.stdout
+    )
 
 
 def test_complete_assembles_stream_and_measures_first_token(monkeypatch):
@@ -159,10 +178,12 @@ def test_run_request_shows_target_and_prompt_before_sending(monkeypatch, capsys)
     assert "Prompt tokens: 4" in shown_before_send[0]
     assert "visible measured prompt" in shown_before_send[0]
     output = capsys.readouterr().out
-    assert "Path: local compute + shared-pool store" in output
-    assert "TTFT: 3.250 seconds" in output
-    assert "E2E wall time: 11.750 seconds" in output
-    assert "KV stored: 64 bytes" in output
+    assert "=== Result: instance A measured request ===" in output
+    assert "Outcome        COLD COMPUTE + STORE" in output
+    assert "Prompt source  4 local-compute tokens" in output
+    assert "TTFT           3.250 s" in output
+    assert "E2E            11.750 s" in output
+    assert "KV transfer    STORE 64 bytes in 125.000 ms" in output
     assert result["path"] == "local_compute_store"
     assert result["computed_prompt_tokens"] == 4
 
@@ -200,10 +221,41 @@ def test_run_request_reports_external_reload(monkeypatch, capsys):
     )
 
     output = capsys.readouterr().out
-    assert "Path: external shared-pool reload" in output
-    assert "KV loaded: 64 bytes" in output
+    assert "Outcome        EXTERNAL KV RELOAD" in output
+    assert "Prompt source  4 external-transfer tokens" in output
+    assert "KV transfer    LOAD 64 bytes in 62.500 ms" in output
     assert result["path"] == "external_kv_reload"
     assert result["loaded_prompt_tokens"] == 4
+
+
+@pytest.mark.parametrize("show_json", (False, True))
+def test_main_shows_machine_readable_result_only_when_requested(monkeypatch, capsys, show_json):
+    monkeypatch.setattr(
+        demo,
+        "_parse_args",
+        lambda: Namespace(
+            instance="A",
+            host="127.0.0.1",
+            port=18100,
+            model="model",
+            identifier="visual-demo-v1",
+            prompt_tokens=4,
+            output_tokens=1,
+            request_timeout=1,
+            metric_timeout=1,
+            show_json=show_json,
+        ),
+    )
+    monkeypatch.setattr(
+        demo,
+        "run_request",
+        lambda **kwargs: {"instance": kwargs["instance_name"], "path": "local_compute_store"},
+    )
+
+    demo.main()
+
+    output = capsys.readouterr().out
+    assert ("=== Machine-readable result ===" in output) is show_json
 
 
 def test_measured_prompt_is_identical_for_a_a_and_b(monkeypatch):

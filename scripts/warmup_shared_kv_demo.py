@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Warm both instances with prompts unrelated to the measured demo prompt."""
+"""Cold-warm both instances with prompts unrelated to the measured prompt."""
 
 from __future__ import annotations
 
@@ -30,8 +30,8 @@ else:
 WARMUP_PROMPT = """
 This is unrelated warmup material for the Spyre shared-KV visual demo. It does
 not contain the measured incident prompt. The request fills the configured
-prefill buckets, generates deterministic output, and exercises device-to-host
-and host-to-device transfer paths before anyone records performance results.
+prefill buckets, generates deterministic output, and stores completed key and
+value pages in shared host memory before anyone records performance results.
 Every sentence in this paragraph is disposable warmup data.
 """.strip()
 
@@ -53,6 +53,7 @@ def run_warmup(
     output_tokens: int,
     request_timeout: float,
     metric_timeout: float,
+    show_json: bool = False,
 ) -> dict[str, Any]:
     if (
         instance_a_host.strip().lower(),
@@ -72,9 +73,9 @@ def run_warmup(
     print(f"Warmup identifier: {warmup_id}")
     print(f"Instance A: http://{instance_a_host}:{instance_a_port}")
     print(f"Instance B: http://{instance_b_host}:{instance_b_port}")
-    print("The warmup prompts are unrelated to the measured demo prompt.")
+    print("Each instance cold-computes and stores one unrelated junk prompt.")
 
-    common = {
+    common: dict[str, Any] = {
         "model": model,
         "response_instruction": demo.WARMUP_RESPONSE_INSTRUCTION,
         "prompt_tokens": prompt_tokens,
@@ -84,7 +85,7 @@ def run_warmup(
     }
     requests = [
         demo.execute_request(
-            label="A warmup compute/store",
+            label="A junk cold compute/store",
             instance_name="A",
             host=instance_a_host,
             port=instance_a_port,
@@ -94,7 +95,7 @@ def run_warmup(
             **common,
         ),
         demo.execute_request(
-            label="B warmup compute/store",
+            label="B junk cold compute/store",
             instance_name="B",
             host=instance_b_host,
             port=instance_b_port,
@@ -103,30 +104,13 @@ def run_warmup(
             expected_source=demo.LOCAL_COMPUTE,
             **common,
         ),
-        demo.execute_request(
-            label="A warmup self reload",
-            instance_name="A",
-            host=instance_a_host,
-            port=instance_a_port,
-            identifier=identifier_a,
-            prompt_source=prompt_a,
-            expected_source=demo.EXTERNAL_TRANSFER,
-            **common,
-        ),
-        demo.execute_request(
-            label="B warmup peer reload",
-            instance_name="B",
-            host=instance_b_host,
-            port=instance_b_port,
-            identifier=identifier_a,
-            prompt_source=prompt_a,
-            expected_source=demo.EXTERNAL_TRANSFER,
-            **common,
-        ),
     ]
     result = {"warmup_id": warmup_id, "requests": requests}
-    print("\n=== Warmup complete ===")
-    print(json.dumps(result, indent=2, sort_keys=True))
+    demo.print_request_summary("Warmup summary", requests)
+    print("Warmup complete: 2/2 requests cold-computed and stored shared KV.")
+    if show_json:
+        print("\n=== Machine-readable warmup result ===")
+        print(json.dumps(result, indent=2, sort_keys=True))
     return result
 
 
@@ -145,6 +129,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-tokens", type=int, default=16)
     parser.add_argument("--request-timeout", type=float, default=900)
     parser.add_argument("--metric-timeout", type=float, default=120)
+    parser.add_argument(
+        "--show-json",
+        action="store_true",
+        help="also print the complete machine-readable warmup result",
+    )
     return parser.parse_args()
 
 
@@ -161,6 +150,7 @@ def main() -> None:
         output_tokens=args.output_tokens,
         request_timeout=args.request_timeout,
         metric_timeout=args.metric_timeout,
+        show_json=args.show_json,
     )
 
 

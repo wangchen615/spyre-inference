@@ -49,7 +49,12 @@ content, reload those pages, and continue generation without recomputing the
 cached prefix. Review the incident, preserve the important component names,
 and explain the expected recovery behavior in plain language.
 """.strip()
-SETUP_HELP = """Requirements:
+CLEANUP_LIBRARY_PATH = (
+    "/opt/ibm/spyre/spyre-comms/lib:"
+    "/home/yzhu/dt-inductor/sentient/runtime/lib:"
+    "/opt/ibm/spyre/runtime/lib"
+)
+SETUP_HELP = f"""Requirements:
   - Start two already-running vLLM servers on separate Spyre devices.
   - Configure both with SpyreSharedOffloadingSpec, the same shared-pool
     metadata name and one data-pool name, and the same PYTHONHASHSEED.
@@ -57,7 +62,8 @@ SETUP_HELP = """Requirements:
     and a model length of at least prompt tokens plus output tokens.
   - Keep both servers dedicated: send no other requests during this demo.
   - Before a new A -> A -> B sequence, stop both servers and clean the pools:
-      uv run --no-sync python scripts/cleanup_shared_kv_demo.py
+      LD_LIBRARY_PATH={CLEANUP_LIBRARY_PATH}:$LD_LIBRARY_PATH \\
+        uv run --no-sync python scripts/cleanup_shared_kv_demo.py
 
 Run this command once against A, again against A, and then against B. Keep the
 identifier unchanged so all three invocations create exactly the same prompt.
@@ -333,7 +339,7 @@ def _prepare_prompt(
         },
         request_timeout,
     )
-    response_instruction = _post_json(
+    response_instruction_tokens = _post_json(
         f"{server}/tokenize",
         {
             "model": model,
@@ -345,7 +351,7 @@ def _prepare_prompt(
     prompt = select_prompt_token_ids(
         tokenized["tokens"],
         prompt_tokens,
-        suffix_token_ids=response_instruction["tokens"],
+        suffix_token_ids=response_instruction_tokens["tokens"],
     )
     max_model_len = int(tokenized["max_model_len"])
     if prompt_tokens + output_tokens > max_model_len:
@@ -387,6 +393,59 @@ def _prompt_preview(prompt_text: str, limit: int = 800) -> str:
         "... [prompt shortened for display] ...\n"
         f"{prompt_text[-tail:]}"
     )
+
+
+def _format_bytes(byte_count: int) -> str:
+    if byte_count >= 1024 * 1024:
+        return f"{byte_count / (1024 * 1024):.1f} MiB ({byte_count:,} bytes)"
+    return f"{byte_count:,} bytes"
+
+
+def _transfer_summary(result: dict[str, Any]) -> str:
+    if result["path"] == "local_compute_store":
+        action = "STORE"
+        byte_count = result["store_bytes"]
+        copy_seconds = result["store_copy_seconds"]
+    else:
+        action = "LOAD"
+        byte_count = result["load_bytes"]
+        copy_seconds = result["load_copy_seconds"]
+    return f"{action} {_format_bytes(byte_count)} in {copy_seconds * 1000:.3f} ms"
+
+
+def _print_result(result: dict[str, Any]) -> None:
+    if result["path"] == "local_compute_store":
+        outcome = "COLD COMPUTE + STORE"
+        source = f"{result['computed_prompt_tokens']:,} local-compute tokens"
+    else:
+        outcome = "EXTERNAL KV RELOAD"
+        source = f"{result['loaded_prompt_tokens']:,} external-transfer tokens"
+
+    print(f"\n=== Result: {result['label']} ===")
+    print(f"{'Target':<15}{result['instance']} @ {result['endpoint']}")
+    print(f"{'Identifier':<15}{result['identifier']}")
+    print(f"{'Outcome':<15}{outcome}")
+    print(f"{'Prompt source':<15}{source}")
+    print(f"{'TTFT':<15}{result['ttft_seconds']:.3f} s")
+    print(f"{'E2E':<15}{result['wall_seconds']:.3f} s")
+    print(f"{'KV transfer':<15}{_transfer_summary(result)}")
+    print(f"{'Output':<15}{result['output_tokens']} tokens")
+    print(f"{'Token IDs':<15}{result['token_ids']}")
+    print(f"{'Text':<15}{json.dumps(result['text'], ensure_ascii=False)}")
+
+
+def print_request_summary(title: str, requests: list[dict[str, Any]]) -> None:
+    print(f"\n=== {title} ===")
+    for index, result in enumerate(requests, start=1):
+        if result["path"] == "local_compute_store":
+            outcome = f"COLD COMPUTE + STORE ({result['computed_prompt_tokens']:,} tokens)"
+        else:
+            outcome = f"EXTERNAL KV RELOAD ({result['loaded_prompt_tokens']:,} tokens)"
+        print(f"{index}. {result['label']}")
+        print(f"   Target       {result['instance']} @ {result['endpoint']}")
+        print(f"   Outcome      {outcome}")
+        print(f"   TTFT / E2E   {result['ttft_seconds']:.3f} s / {result['wall_seconds']:.3f} s")
+        print(f"   KV transfer  {_transfer_summary(result)}")
 
 
 def execute_request(
@@ -466,18 +525,17 @@ def execute_request(
         actual_source = LOCAL_COMPUTE
         _require_prompt_source(label, deltas, len(prompt), actual_source)
         path = "local_compute_store"
-        path_label = "local compute + shared-pool store"
     else:
         actual_source = EXTERNAL_TRANSFER
         _require_prompt_source(label, deltas, len(prompt), actual_source)
         path = "external_kv_reload"
-        path_label = "external shared-pool reload"
     if expected_source is not None and actual_source != expected_source:
         raise AssertionError(
             f"{label} expected prompt source {expected_source}, got {actual_source}"
         )
 
     result: dict[str, Any] = {
+        "label": label,
         "instance": instance_name,
         "endpoint": server,
         "identifier": identifier,
@@ -495,21 +553,7 @@ def execute_request(
         "token_ids": list(completion.token_ids),
         "text": completion.text,
     }
-
-    print("\n=== Result ===")
-    print(f"Path: {path_label}")
-    print(f"TTFT: {completion.ttft_seconds:.3f} seconds")
-    print(f"E2E wall time: {completion.wall_seconds:.3f} seconds")
-    print(f"Prompt source: {int(computed)} local-compute tokens")
-    print(f"Prompt source: {int(loaded)} external-transfer tokens")
-    if path == "local_compute_store":
-        print(f"KV stored: {int(deltas[STORE_BYTES])} bytes")
-        print(f"KV store copy time: {deltas[STORE_TIME]:.6f} seconds")
-    else:
-        print(f"KV loaded: {int(deltas[LOAD_BYTES])} bytes")
-        print(f"KV load copy time: {deltas[LOAD_TIME]:.6f} seconds")
-    print(f"Output token IDs: {list(completion.token_ids)}")
-    print(f"Output text: {json.dumps(completion.text, ensure_ascii=False)}")
+    _print_result(result)
     return result
 
 
@@ -560,6 +604,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-tokens", type=int, default=16)
     parser.add_argument("--request-timeout", type=float, default=900)
     parser.add_argument("--metric-timeout", type=float, default=120)
+    parser.add_argument(
+        "--show-json",
+        action="store_true",
+        help="also print the complete machine-readable result",
+    )
     return parser.parse_args()
 
 
@@ -576,8 +625,9 @@ def main() -> None:
         request_timeout=args.request_timeout,
         metric_timeout=args.metric_timeout,
     )
-    print("\n=== Machine-readable result ===")
-    print(json.dumps(result, indent=2, sort_keys=True))
+    if args.show_json:
+        print("\n=== Machine-readable result ===")
+        print(json.dumps(result, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
