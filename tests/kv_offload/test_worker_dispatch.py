@@ -234,3 +234,36 @@ def test_zero_host_blocks_is_rejected_at_construction(calls):
         worker_mod.SpyreOffloadingWorker(
             physical=_physical(), num_host_blocks=0, pool_prefix=PREFIX
         )
+
+
+@pytest.mark.parametrize("direction", ["store", "load"])
+def test_copies_are_enqueued_non_blocking_then_the_job_waits_once(calls, monkeypatch, direction):
+    """No per-page wait: every copy is non-blocking, then one synchronize for the job.
+
+    A blocking copy synchronizes the stream after every K and every V page, which
+    cost a host round trip per page (about 64 us against about 7 us of transfer).
+    The job must still be complete when submit_* returns, so the last event has
+    to be a synchronize that follows every copy.
+    """
+    events: list[tuple] = []
+    monkeypatch.setattr(worker_mod.torch.spyre, "synchronize", lambda: events.append(("sync",)))
+    worker = _worker()
+    for off in worker._offloaders:
+        off.offload = lambda blk, slot, non_blocking=False, _n=off.pool_name: events.append(
+            ("offload", _n, non_blocking))
+        off.reload = lambda slot, blk, non_blocking=False, _n=off.pool_name: events.append(
+            ("reload", _n, non_blocking))
+
+    if direction == "store":
+        worker.submit_store(10, _gpu_spec([1, 2]), CPULoadStoreSpec([0, 3]))
+    else:
+        worker.submit_load(10, CPULoadStoreSpec([0, 3]), _gpu_spec([1, 2]))
+
+    copies = [e for e in events if e[0] != "sync"]
+    assert len(copies) == 2 * NUM_CACHES
+    assert all(non_blocking for _, _, non_blocking in copies)
+    # The entry fence, every copy, then exactly one closing wait.
+    assert events[0] == ("sync",) and events[-1] == ("sync",)
+    assert [e for e in events[1:-1] if e[0] == "sync"] == []
+    (result,) = worker.get_finished()
+    assert result.success is True
