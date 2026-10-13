@@ -80,9 +80,16 @@ they write pages before anything reads them.
 
 Stores are not, because they are deferred one step -- `get_finished` calls
 `prepare_store_kv`, which queues them for the *next* step's `start_load_kv`. The
-pages being read were written by the previous forward, and a blocking
-`copy_kv_page_raw` waits only on its own DMA. So `_transfer` calls
-`torch.spyre.synchronize()` once per job before issuing anything.
+pages being read were written by the previous forward, and `copy_kv_page_raw`
+waits at most on its own DMA. So `_transfer` calls `torch.spyre.synchronize()`
+once per job before issuing anything.
+
+Within a job, every page copy is enqueued non-blocking and the job waits once,
+at the end. A blocking copy synchronizes the stream after every K and every V
+page, which made a reload one host round trip per page (about 64 us each,
+against about 7 us of transfer for a 256 KiB page). The end-of-job synchronize
+keeps the contract `wait()` and `get_finished()` rely on: the job is complete
+when `submit_*` returns.
 
 ## Single KV cache group only
 
@@ -223,12 +230,21 @@ class SpyreOffloadingWorker(OffloadingWorker):
                     f"host block {host_block} out of range [0, {self._num_host_blocks})"
                 )
 
+        # Enqueue every page copy without waiting, then wait once for the job.
+        # Nothing reads a reloaded page before this job reports finished: vLLM
+        # schedules the request's forward only after get_finished() returns the
+        # job, and a stored page is read only by a later load. So the per-copy
+        # stream.synchronize() of a blocking copy_kv_page_raw bought no safety
+        # here, only a host round trip per K and per V page. Copies on one stream
+        # still execute in order, and the single synchronize below makes the
+        # whole job complete before submit_* returns, as before.
         for offloader in self._offloaders:
             for device_block, host_block in zip(device_blocks, host_blocks, strict=True):
                 if to_device:
-                    offloader.reload(host_block, device_block)
+                    offloader.reload(host_block, device_block, non_blocking=True)
                 else:
-                    offloader.offload(device_block, host_block)
+                    offloader.offload(device_block, host_block, non_blocking=True)
+        torch.spyre.synchronize()
 
         return len(device_blocks) * self._bytes_per_block
 
