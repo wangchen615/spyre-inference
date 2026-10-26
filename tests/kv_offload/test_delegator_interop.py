@@ -1,0 +1,245 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+import pytest
+
+from scripts.cleanup_shared_kv_demo import cleanup_pool
+from scripts.shared_kv_two_instance_demo import prepare_demo_pool
+
+GENERATION = "ab" * 16
+
+
+class FakeCtl:
+    def __init__(self):
+        self.calls = []
+
+    def create(self, config):
+        self.calls.append(("create", config))
+        return {
+            "result": "OK",
+            "descriptor": {
+                "name": config["name"],
+                "generation": GENERATION,
+                "state": "READY",
+                "effectiveConfig": config,
+            },
+        }
+
+    def destroy(self, name, generation):
+        self.calls.append(("destroy", name, generation))
+        return {"result": "OK"}
+
+
+def test_demo_passes_exact_delegator_identity_to_both_instances():
+    ctl = FakeCtl()
+
+    result = prepare_demo_pool(
+        ctl=ctl,
+        pool_name="deployment-root",
+        data_pool_name="host-0",
+        model="granite-test",
+        cpu_bytes_to_use=512 * 1024 * 1024,
+    )
+
+    assert result.extra_config == {
+        "spec_name": "SpyreSharedOffloadingSpec",
+        "pool_name": "deployment-root",
+        "pool_generation": GENERATION,
+        "data_pool_name": "host-0",
+        "cpu_bytes_to_use": 512 * 1024 * 1024,
+    }
+    assert result.instance_a_extra_config == result.instance_b_extra_config
+    [(_, config)] = ctl.calls
+    assert config["metadata"] == {"maxChunks": 1}
+    assert config["dataPools"] == [
+        {
+            "name": "host-0",
+            "backend": "HOST_DRAM",
+            "numSlots": "2048",
+            "slotBytes": "262144",
+            "compatibility": {
+                "model": "granite-test",
+                "kvDtype": "float16",
+                "blockSize": "128",
+                "tensorParallelSize": 1,
+            },
+        }
+    ]
+
+
+def test_existing_name_with_different_effective_config_is_rejected():
+    class MismatchedCtl(FakeCtl):
+        def create(self, config):
+            result = super().create(config)
+            result["result"] = "ALREADY_EXISTS"
+            result["descriptor"]["effectiveConfig"] = {
+                **config,
+                "dataPools": [
+                    {
+                        **config["dataPools"][0],
+                        "compatibility": {
+                            **config["dataPools"][0]["compatibility"],
+                            "model": "another-model",
+                        },
+                    }
+                ],
+            }
+            return result
+
+    with pytest.raises(RuntimeError, match="effective configuration"):
+        prepare_demo_pool(
+            ctl=MismatchedCtl(),
+            pool_name="deployment-root",
+            data_pool_name="host-0",
+            model="granite-test",
+            cpu_bytes_to_use=512 * 1024 * 1024,
+        )
+
+
+def test_cleanup_uses_generation_checked_destroy():
+    ctl = FakeCtl()
+
+    result = cleanup_pool("deployment-root", GENERATION, ctl=ctl)
+
+    assert result == {"result": "OK"}
+    assert ctl.calls == [("destroy", "deployment-root", GENERATION)]
+
+
+@pytest.mark.parametrize("code", ["POOL_BUSY", "STALE_GENERATION", "NOT_FOUND"])
+def test_cleanup_does_not_treat_non_ok_lifecycle_result_as_success(code):
+    class FailingCtl(FakeCtl):
+        def destroy(self, name, generation):
+            self.calls.append(("destroy", name, generation))
+            return {"result": code, "detail": "structured failure"}
+
+    with pytest.raises(RuntimeError, match=code):
+        cleanup_pool("deployment-root", GENERATION, ctl=FailingCtl())
+
+
+def _external_artifacts():
+    build = Path(os.environ.get("DELEGATOR_BUILD_DIR", ""))
+    daemon = build / "shared-pool-delegator"
+    ctl = build / "shared-poolctl"
+    return build, daemon, ctl
+
+
+def _wait_for_daemon(ctl: Path, socket: Path, process: subprocess.Popen) -> None:
+    for _ in range(100):
+        if process.poll() is not None:
+            raise RuntimeError("shared-pool-delegator exited before becoming ready")
+        result = subprocess.run(
+            [str(ctl), "--socket", str(socket), "health"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return
+        time.sleep(0.05)
+    raise RuntimeError("shared-pool-delegator did not become ready")
+
+
+def test_external_delegator_pool_attaches_and_detaches_through_torch_spyre(tmp_path):
+    _, daemon, ctl_binary = _external_artifacts()
+    if not daemon.is_file() or not ctl_binary.is_file():
+        pytest.skip("DELEGATOR_BUILD_DIR does not contain shared-pool-delegator and shared-poolctl")
+
+    from scripts.shared_pool_delegator import SharedPoolCtl
+
+    socket = tmp_path / "delegator.sock"
+    process = subprocess.Popen(
+        [str(daemon), "--socket-path", str(socket)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    prepared = None
+    try:
+        _wait_for_daemon(ctl_binary, socket, process)
+        ctl = SharedPoolCtl(binary=ctl_binary, socket_path=socket)
+        pool_name = f"/spyre-inference-{os.getpid()}-{uuid.uuid4().hex}"
+        prepared = prepare_demo_pool(
+            ctl=ctl,
+            pool_name=pool_name,
+            data_pool_name="host-0",
+            model="interop-test",
+            cpu_bytes_to_use=8192,
+            slot_bytes=4096,
+        )
+        worker = """
+import sys
+from torch_spyre import _C
+name, generation_hex, child = sys.argv[1:]
+attached = _C.SharedPool.attach_pool(name, bytes.fromhex(generation_hex))
+assert attached.code is _C.PoolResultCode.OK, (attached.code, attached.detail)
+metadata = attached.metadata
+registered = metadata.find_pool(child)
+assert registered is not None
+assert metadata.resolve_pool(registered.pool_ref) is not None
+_C.SharedPool.detach_pool(metadata)
+print("attached-detached")
+"""
+        attached = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                worker,
+                prepared.pool_name,
+                prepared.generation,
+                prepared.data_pool_name,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+                "FLEX_DEVICE": "MOCK1p0",
+                "FLEX_COMPUTE": "NULL",
+                "AIU_WORLD_SIZE": "1",
+                "LOCAL_RANK": "0",
+            },
+        )
+        assert attached.returncode == 0, attached.stderr or attached.stdout
+        assert attached.stdout.strip().splitlines()[-1] == "attached-detached"
+        assert cleanup_pool(prepared.pool_name, prepared.generation, ctl=ctl)["result"] == "OK"
+        prepared = None
+    finally:
+        if prepared is not None:
+            subprocess.run(
+                [
+                    str(ctl_binary),
+                    "--socket",
+                    str(socket),
+                    "destroy",
+                    "--name",
+                    prepared.pool_name,
+                    "--generation",
+                    prepared.generation,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        process.terminate()
+        process.wait(timeout=10)
