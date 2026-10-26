@@ -12,27 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Lazy access to the torch-spyre persistent shared-pool API."""
+"""Lazy access to the torch-spyre persistent shared-KV runtime surface."""
 
 from __future__ import annotations
 
 from importlib import import_module
 from types import ModuleType
 
+REQUIRED_SHARED_SYMBOLS = (
+    "ChunkDescriptorEntry",
+    "CompatibleBlockKey",
+    "ExistingClaim",
+    "NoSpace",
+    "PoolResultCode",
+    "Reservation",
+    "SharedPool",
+    "Unavailable",
+    "copy_kv_page_raw",
+    "get_composite_address",
+)
+
 
 def load_shared_runtime() -> ModuleType:
     """Load the M4 symbols only in processes that attach shared pools."""
 
     try:
-        runtime = import_module("torch_spyre._C")
-    except ImportError as error:
+        package = import_module("torch_spyre")
+        runtime = package._C
+    except (AttributeError, ImportError) as error:
         raise RuntimeError(
             "torch-spyre with persistent SharedPool lifecycle support is required"
         ) from error
 
-    missing = [name for name in ("SharedPool", "PoolResultCode") if not hasattr(runtime, name)]
+    missing = [name for name in REQUIRED_SHARED_SYMBOLS if not hasattr(runtime, name)]
     if missing:
         raise RuntimeError(
-            "torch-spyre is missing persistent SharedPool lifecycle symbols: " + ", ".join(missing)
+            "torch-spyre M4 shared runtime surface is incomplete; missing: " + ", ".join(missing)
         )
     return runtime

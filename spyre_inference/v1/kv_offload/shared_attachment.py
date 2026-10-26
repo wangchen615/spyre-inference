@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import suppress
 from typing import Any
 
 from spyre_inference.v1.kv_offload.shared_identity import SharedPoolIdentity
@@ -93,5 +92,7 @@ class SharedPoolAttachment:
         runtime.SharedPool.detach_pool(metadata)
 
     def __del__(self) -> None:
-        with suppress(BaseException):
+        try:  # noqa: SIM105 - globals may be cleared during interpreter teardown
             self.close()
+        except BaseException:
+            pass

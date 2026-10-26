@@ -189,3 +189,12 @@ def test_attachment_path_never_invokes_management_calls(fake_runtime):
     assert "create" not in operation_names
     assert "open" not in operation_names
     assert "destroy" not in operation_names
+
+
+def test_finalizer_stays_no_throw_during_module_teardown(fake_runtime, monkeypatch):
+    attachment = SharedPoolAttachment.attach(IDENTITY, lambda: fake_runtime)
+    monkeypatch.setattr(attachment, "close", lambda: (_ for _ in ()).throw(RuntimeError("late")))
+
+    attachment.__del__()
+
+    assert fake_runtime.calls.count(("detach", fake_runtime.metadata)) == 0
