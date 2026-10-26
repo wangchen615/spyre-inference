@@ -59,7 +59,11 @@ def _config(
     worker_kv_bytes_per_block: int = KV_BYTES_PER_BLOCK,
     enable_kv_cache_events: bool = False,
 ) -> OffloadingConfig:
-    extra_config = {"cpu_bytes_to_use": 32 * KV_BYTES_PER_BLOCK}
+    extra_config = {
+        "cpu_bytes_to_use": 32 * KV_BYTES_PER_BLOCK,
+        "pool_name": "test-root",
+        "pool_generation": "11" * 16,
+    }
     if extra is not None:
         extra_config = {**extra_config, **extra}
         # a None value means "remove this key", so a test can drop a required one
@@ -111,6 +115,16 @@ def test_subclasses_offloading_spec_not_the_cpu_spec():
 def test_num_blocks_divides_budget_by_kv_bytes_per_block():
     spec = SpyreOffloadingSpec(_config())
     assert spec.num_blocks == 32
+
+
+def test_spec_loads_the_persistent_pool_identity():
+    spec = SpyreOffloadingSpec(
+        _config(extra={"data_pool_name": "data-child", "pool_generation": "AA" * 16})
+    )
+
+    assert spec.shared_pool_identity.pool_name == "test-root"
+    assert spec.shared_pool_identity.generation == bytes.fromhex("AA" * 16)
+    assert spec.shared_pool_identity.data_pool_name == "data-child"
 
 
 def test_num_blocks_accounts_for_world_size():

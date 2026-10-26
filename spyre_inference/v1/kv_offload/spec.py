@@ -41,6 +41,8 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
+from spyre_inference.v1.kv_offload.shared_identity import load_shared_pool_identity
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
@@ -86,6 +88,7 @@ class SpyreOffloadingSpec(OffloadingSpec):
 
     def __init__(self, config: OffloadingConfig) -> None:
         super().__init__(config)
+        self.shared_pool_identity = load_shared_pool_identity(self.extra_config)
 
         # One host block must map to exactly one device block. With chunking,
         # upstream's host page is gpu_page_size * blocks_per_chunk and a host
