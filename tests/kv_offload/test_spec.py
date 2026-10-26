@@ -243,11 +243,28 @@ def test_connector_binds_vllm_config_before_initializing_worker(monkeypatch):
     ]
 
 
-def test_pool_prefix_is_unique_per_engine_and_rank():
-    """Two ranks on one host must not collide on a POSIX shared-memory name."""
-    prefixes = {SpyreOffloadingSpec(_config(rank=r, world_size=2))._pool_prefix for r in (0, 1)}
-    assert len(prefixes) == 2
-    assert all("eng0" in p for p in prefixes)
+def test_worker_factory_uses_the_configured_persistent_identity(monkeypatch):
+    from spyre_inference.v1.kv_offload import worker as worker_mod
+
+    calls = []
+    physical = object()
+
+    def build_worker(**kwargs):
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(worker_mod, "SpyreOffloadingWorker", build_worker)
+    spec = SpyreOffloadingSpec(_config())
+
+    spec._create_worker(physical)
+
+    assert calls == [
+        {
+            "physical": physical,
+            "num_host_blocks": 32,
+            "identity": spec.shared_pool_identity,
+        }
+    ]
 
 
 def test_get_worker_before_binding_raises_naming_the_method():

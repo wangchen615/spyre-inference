@@ -53,18 +53,11 @@ correct if a future layout makes logical page order differ from physical.
 
 ## Slot indexing
 
-One `SpyreKvPageOffloader` -- hence one `SharedHostPool` -- per physical cache:
-
-    (cache c, host block h) -> offloaders[c].offload(block_id=dev_blk, slot=h)
-                                -> pool "{prefix}_c{c}", slot 2h   (K)
-                                -> pool "{prefix}_c{c}", slot 2h+1 (V)
-
-This is the identity mapping because upstream's host block ids are
-per-canonical-tensor, not global: `CPUOffloadingWorker` allocates one
-`(num_cpu_blocks, page_size)` buffer per canonical tensor, so host block `h`
-means "slot `h` of every tensor". Per-cache pools also keep one `PageSignature`
-per pool, which a single shared pool would collapse -- wrong the moment two
-layers differ in `head_size`.
+The delegator creates one fixed child for every physical K/V component. If a
+model has `C` components, logical host block `h` owns the consecutive run
+`[h*C, (h+1)*C)`. Cache `c` uses component ids `2*c` for K and `2*c+1` for V.
+This preserves upstream's meaning of one host block across every canonical
+tensor while ensuring that layers and K/V allocations never share a slot.
 
 ## Why `_transfer` fences first
 
@@ -108,7 +101,12 @@ from vllm.v1.kv_offload.base import (
 )
 
 from spyre_inference.v1.kv_offload.connector import SpyrePhysicalCaches
-from spyre_inference.v1.worker.spyre_kv_offload import SpyreKvPageOffloader
+from spyre_inference.v1.kv_offload.shared_attachment import SharedPoolAttachment
+from spyre_inference.v1.kv_offload.shared_identity import SharedPoolIdentity
+from spyre_inference.v1.worker.spyre_kv_offload import (
+    SpyreKvPageOffloader,
+    page_signature,
+)
 
 logger = init_logger(__name__)
 
@@ -124,39 +122,66 @@ class SpyreOffloadingWorker(OffloadingWorker):
         self,
         physical: SpyrePhysicalCaches,
         num_host_blocks: int,
-        pool_prefix: str,
+        identity: SharedPoolIdentity,
     ) -> None:
         if num_host_blocks <= 0:
             raise ValueError(f"num_host_blocks must be positive, got {num_host_blocks}")
+        if not physical.caches:
+            raise ValueError("at least one physical KV cache is required")
 
         self._finished_jobs: list[TransferResult] = []
         self._physical = physical
         self._num_host_blocks = num_host_blocks
 
-        # One offloader per physical cache. Constructed eagerly so a geometry or
-        # shared-memory problem surfaces at registration, not mid-serve.
-        self._offloaders: list[SpyreKvPageOffloader] = [
-            SpyreKvPageOffloader(
-                cache=cache,
-                pool_name=f"{pool_prefix}_c{cache_idx}",
-                num_slots=num_host_blocks,
-                layout_kind=layout_kind,
-            )
-            for cache_idx, (cache, layout_kind) in enumerate(
-                zip(physical.caches, physical.layout_kinds, strict=True)
-            )
-        ]
-        # K + V per logical page.
-        self._bytes_per_block = 2 * sum(offloader.page_size_bytes for offloader in self._offloaders)
+        cache_layouts = tuple(zip(physical.caches, physical.layout_kinds, strict=True))
+        signatures = tuple(page_signature(cache, layout) for cache, layout in cache_layouts)
+        component_count = 2 * len(cache_layouts)
+        expected_slots = num_host_blocks * component_count
+        largest_page = max(signature.page_bytes for signature in signatures)
+
+        attachment = SharedPoolAttachment.attach(identity)
+        self._attachment = attachment
+        try:
+            if attachment.registered.slot_count != expected_slots:
+                raise ValueError(
+                    f"data pool {identity.data_pool_name!r} has slot_count="
+                    f"{attachment.registered.slot_count}, expected {expected_slots} "
+                    f"({num_host_blocks} blocks x {component_count} components)"
+                )
+            if attachment.registered.slot_bytes < largest_page:
+                raise ValueError(
+                    f"data pool {identity.data_pool_name!r} has slot_bytes="
+                    f"{attachment.registered.slot_bytes}, smaller than the largest "
+                    f"physical KV page ({largest_page})"
+                )
+
+            self._offloaders = [
+                SpyreKvPageOffloader(
+                    cache=cache,
+                    pool=attachment.data_pool,
+                    num_slots=num_host_blocks,
+                    layout_kind=layout_kind,
+                    component_count=component_count,
+                    component_offset=2 * cache_idx,
+                    signature=signatures[cache_idx],
+                )
+                for cache_idx, (cache, layout_kind) in enumerate(cache_layouts)
+            ]
+        except BaseException:
+            attachment.close()
+            raise
+
+        self._component_count = component_count
+        self._bytes_per_block = 2 * sum(signature.page_bytes for signature in signatures)
         logger.info(
-            "Spyre offloading worker: %d cache(s), %d host block(s), "
-            "%d bytes per block, pools %s_c0..%s_c%d",
+            "Spyre offloading worker: %d cache(s), %d host block(s), %d components, "
+            "%d bytes per block, shared child %s/%s",
             len(self._offloaders),
             num_host_blocks,
+            component_count,
             self._bytes_per_block,
-            pool_prefix,
-            pool_prefix,
-            len(self._offloaders) - 1,
+            identity.pool_name,
+            identity.data_pool_name,
         )
 
     def _validate_gpu_spec(self, gpu_spec: GPULoadStoreSpec) -> None:
@@ -271,5 +296,10 @@ class SpyreOffloadingWorker(OffloadingWorker):
         """No-op: transfers complete synchronously before `submit_*` returns."""
 
     def shutdown(self) -> None:
-        """Release the synchronous worker's completed-result state."""
-        self._finished_jobs.clear()
+        """Fence outstanding DMA and release this worker's root lock lease."""
+        try:
+            torch.spyre.synchronize()
+        finally:
+            self._finished_jobs.clear()
+            self._offloaders.clear()
+            self._attachment.close()

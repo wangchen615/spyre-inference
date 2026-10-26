@@ -34,14 +34,11 @@ from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
 from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
     SpyreHeadMajorAttentionImpl,
 )
-from spyre_inference.v1.worker import spyre_kv_offload as offload_mod
 from spyre_inference.v1.worker.spyre_kv_offload import (
     PageSignature,
     SpyreKvPageOffloader,
-    k_slot,
     page_bytes,
     page_signature,
-    v_slot,
 )
 
 DTYPE = torch.float16
@@ -77,37 +74,38 @@ def _cache(impl_cls, num_blocks=NUM_BLOCKS, **spec_kwargs):
 # --- pairing logic: no device needed ---------------------------------------
 
 
-def test_k_and_v_slots_are_disjoint():
-    """K and V are separate allocations, so one logical page needs two slots."""
-    assert [k_slot(s) for s in range(4)] == [0, 2, 4, 6]
-    assert [v_slot(s) for s in range(4)] == [1, 3, 5, 7]
-    used = [k_slot(s) for s in range(32)] + [v_slot(s) for s in range(32)]
-    assert len(set(used)) == 64, "K/V host slots collide"
-
-
-def test_page_pair_copy_preserves_m1_k_then_v_slot_routing():
-    """A refactor must retain K-before-V and the paired M1 slot indices."""
+def test_fixed_child_routes_k_and_v_to_disjoint_component_slots():
+    """Each logical block owns a consecutive run spanning every K/V component."""
     calls = []
     cache = (object(), object())
     pool = object()
+    signature = PageSignature(
+        layout_kind="token-major",
+        device_dtype="torch.float16",
+        block_size=128,
+        local_kv_heads=8,
+        head_size=128,
+        page_bytes=4096,
+    )
 
     def copy_fn(*args):
         calls.append(args)
 
-    offload_mod.copy_kv_page_pair(
-        copy_fn,
+    offloader = SpyreKvPageOffloader(
         cache,
-        7,
-        pool,
-        k_slot(3),
-        pool,
-        v_slot(3),
-        False,
+        pool=pool,
+        num_slots=4,
+        layout_kind="token-major",
+        component_count=6,
+        component_offset=2,
+        signature=signature,
+        copy_fn=copy_fn,
     )
+    offloader.offload(block_id=7, slot=3, non_blocking=True)
 
     assert calls == [
-        (cache[0], 7, pool, 6, False, False),
-        (cache[1], 7, pool, 7, False, False),
+        (cache[0], 7, pool, 20, False, True),
+        (cache[1], 7, pool, 21, False, True),
     ]
 
 

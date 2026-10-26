@@ -31,9 +31,9 @@ has to route the right tensor, block and slot. Nothing here computes offsets.
 
 What `copy_kv_page_raw` cannot check is whether the *host slot* holds a page of
 the same shape as the cache being restored into: a slot is an untyped byte
-window, so a token-major page and a head-major page of identical size are
-indistinguishable to it. Two offloaders sharing a pool name therefore agree on
-a `PageSignature` (see below), which is compared on attach.
+window. `PageSignature` records that physical geometry for callers that need
+to compare layouts, while the M4 worker validates that the delegator-created
+child has enough fixed slots and that each slot holds its largest component.
 """
 
 from __future__ import annotations
@@ -63,16 +63,6 @@ def _import_runtime():
     )
 
     return SharedHostPool, copy_kv_page_raw, get_composite_address
-
-
-def k_slot(slot: int) -> int:
-    """Host slot holding the K half of logical page slot `slot`."""
-    return 2 * slot
-
-
-def v_slot(slot: int) -> int:
-    """Host slot holding the V half of logical page slot `slot`."""
-    return 2 * slot + 1
 
 
 def copy_kv_page_pair(
@@ -183,25 +173,39 @@ def page_signature(cache: SpyrePagedKVCache, layout_kind: str) -> PageSignature:
 
 
 class SpyreKvPageOffloader:
-    """Moves whole K/V page pairs between Spyre pages and one shared host pool.
-
-    One offloader serves one layer's cache. `num_slots` is the number of
-    *logical* pages the pool holds; the pool itself is created with twice that
-    many slots so K and V each get their own.
-    """
+    """Moves one cache's K/V pages through assigned slots in a fixed child."""
 
     def __init__(
         self,
         cache: SpyrePagedKVCache,
-        pool_name: str,
+        pool,
         num_slots: int,
         layout_kind: str,
+        component_count: int,
+        component_offset: int,
+        signature: PageSignature | None = None,
+        copy_fn=None,
         expect_signature: PageSignature | None = None,
     ) -> None:
-        SharedHostPool, copy_kv_page_raw, _ = _import_runtime()
-        self._copy = copy_kv_page_raw
+        if num_slots <= 0:
+            raise ValueError(f"num_slots must be positive, got {num_slots}")
+        if component_count <= 0:
+            raise ValueError(f"component_count must be positive, got {component_count}")
+        if component_offset < 0 or component_offset + 1 >= component_count:
+            raise ValueError(
+                f"component pair [{component_offset}, {component_offset + 1}] "
+                f"is outside component_count={component_count}"
+            )
+        if copy_fn is None:
+            _, copy_fn, _ = _import_runtime()
+        self._copy = copy_fn
         self._cache = cache
-        self._signature = page_signature(cache, layout_kind)
+        self._signature = signature or page_signature(cache, layout_kind)
+        if self._signature.layout_kind != layout_kind:
+            raise ValueError(
+                f"precomputed signature layout {self._signature.layout_kind!r} "
+                f"does not match {layout_kind!r}"
+            )
         # Check 8 of the contract: a caller that shares a pool with another
         # process passes the signature it expects the slots to hold. Mismatches
         # are rejected here, before any page is written or read, because the
@@ -209,19 +213,21 @@ class SpyreKvPageOffloader:
         if expect_signature is not None and expect_signature != self._signature:
             raise ValueError(
                 "KV page signature mismatch for pool "
-                f"{pool_name!r}: slots hold {expect_signature.describe()}, "
+                f"{getattr(pool, 'name', lambda: '<fixed-child>')()!r}: "
+                f"slots hold {expect_signature.describe()}, "
                 f"this cache is {self._signature.describe()}"
             )
         self._page_bytes = self._signature.page_bytes
         self._num_slots = num_slots
-        # Two host slots per logical page: one for K, one for V.
-        self._pool = SharedHostPool.create_or_attach(
-            pool_name, num_slots=2 * num_slots, slot_bytes=self._page_bytes
-        )
+        self._pool = pool
+        self._component_count = component_count
+        self._component_offset = component_offset
         logger.debug(
-            "SpyreKvPageOffloader(%s): %d logical slots, %s",
-            pool_name,
+            "SpyreKvPageOffloader: %d logical slots, components %d/%d of %d, %s",
             num_slots,
+            component_offset,
+            component_offset + 1,
+            component_count,
             self._signature.describe(),
         )
 
@@ -232,6 +238,10 @@ class SpyreKvPageOffloader:
     @property
     def page_size_bytes(self) -> int:
         return self._page_bytes
+
+    @property
+    def num_slots(self) -> int:
+        return self._num_slots
 
     @property
     def signature(self) -> PageSignature:
@@ -246,6 +256,9 @@ class SpyreKvPageOffloader:
         if not 0 <= slot < self._num_slots:
             raise IndexError(f"host slot {slot} out of range [0, {self._num_slots})")
 
+    def _component_slot(self, slot: int, component_id: int) -> int:
+        return slot * self._component_count + component_id
+
     def offload(self, block_id: int, slot: int, non_blocking: bool = False) -> None:
         """Copy device page `block_id` (K and V) out to host slot `slot`."""
         self._check_slot(slot)
@@ -254,9 +267,9 @@ class SpyreKvPageOffloader:
             self._cache,
             block_id,
             self._pool,
-            k_slot(slot),
+            self._component_slot(slot, self._component_offset),
             self._pool,
-            v_slot(slot),
+            self._component_slot(slot, self._component_offset + 1),
             False,
             non_blocking,
         )
@@ -273,9 +286,9 @@ class SpyreKvPageOffloader:
             self._cache,
             block_id,
             self._pool,
-            k_slot(slot),
+            self._component_slot(slot, self._component_offset),
             self._pool,
-            v_slot(slot),
+            self._component_slot(slot, self._component_offset + 1),
             True,
             non_blocking,
         )

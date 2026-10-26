@@ -131,20 +131,17 @@ class SpyreOffloadingSpec(OffloadingSpec):
             "cache_policy_module_path"
         )
 
-        # Pool names are per engine and per rank: two ranks on one host must not
-        # collide on a POSIX shared-memory name.
-        self._pool_prefix = f"spyre_kv_{config.engine_id}_r{config.parallel.rank}"
-
         # scheduler-side
         self._manager: OffloadingManager | None = None
         # worker-side, bound by the connector before get_worker()
         self._physical: SpyrePhysicalCaches | None = None
 
         logger.info(
-            "SpyreOffloadingSpec: %d host block(s) of %d logical KV bytes, pool prefix %s",
+            "SpyreOffloadingSpec: %d host block(s) of %d logical KV bytes, shared child %s/%s",
             self.num_blocks,
             kv_bytes_per_block,
-            self._pool_prefix,
+            self.shared_pool_identity.pool_name,
+            self.shared_pool_identity.data_pool_name,
         )
 
     def bind_physical_caches(self, physical: "SpyrePhysicalCaches") -> None:
@@ -180,7 +177,7 @@ class SpyreOffloadingSpec(OffloadingSpec):
         return SpyreOffloadingWorker(
             physical=physical,
             num_host_blocks=self.num_blocks,
-            pool_prefix=self._pool_prefix,
+            identity=self.shared_pool_identity,
         )
 
     def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
