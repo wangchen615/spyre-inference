@@ -159,7 +159,7 @@ def _wait_for_daemon(ctl: Path, socket: Path, process: subprocess.Popen) -> None
     raise RuntimeError("shared-pool-delegator did not become ready")
 
 
-def test_external_delegator_pool_attaches_and_detaches_through_torch_spyre(tmp_path):
+def test_external_delegator_reports_busy_until_torch_spyre_detaches(tmp_path):
     _, daemon, ctl_binary = _external_artifacts()
     if not daemon.is_file() or not ctl_binary.is_file():
         pytest.skip("DELEGATOR_BUILD_DIR does not contain shared-pool-delegator and shared-poolctl")
@@ -174,6 +174,7 @@ def test_external_delegator_pool_attaches_and_detaches_through_torch_spyre(tmp_p
         text=True,
     )
     prepared = None
+    attached_process = None
     try:
         _wait_for_daemon(ctl_binary, socket, process)
         ctl = SharedPoolCtl(binary=ctl_binary, socket_path=socket)
@@ -196,10 +197,12 @@ metadata = attached.metadata
 registered = metadata.find_pool(child)
 assert registered is not None
 assert metadata.resolve_pool(registered.pool_ref) is not None
+print("attached", flush=True)
+assert sys.stdin.readline().strip() == "detach"
 _C.SharedPool.detach_pool(metadata)
-print("attached-detached")
+print("detached", flush=True)
 """
-        attached = subprocess.run(
+        attached_process = subprocess.Popen(
             [
                 sys.executable,
                 "-c",
@@ -208,8 +211,9 @@ print("attached-detached")
                 prepared.generation,
                 prepared.data_pool_name,
             ],
-            check=False,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             env={
                 **os.environ,
@@ -220,11 +224,27 @@ print("attached-detached")
                 "LOCAL_RANK": "0",
             },
         )
-        assert attached.returncode == 0, attached.stderr or attached.stdout
-        assert attached.stdout.strip().splitlines()[-1] == "attached-detached"
+        assert attached_process.stdout is not None
+        assert attached_process.stderr is not None
+        ready = attached_process.stdout.readline().strip()
+        assert ready == "attached"
+
+        busy = ctl.destroy(prepared.pool_name, prepared.generation)
+        assert busy.get("result") == "POOL_BUSY", busy
+
+        assert attached_process.stdin is not None
+        attached_process.stdin.write("detach\n")
+        attached_process.stdin.flush()
+        assert attached_process.wait(timeout=20) == 0, attached_process.stderr.read()
+        assert attached_process.stdout.read().strip().splitlines()[-1] == "detached"
+        attached_process = None
+
         assert cleanup_pool(prepared.pool_name, prepared.generation, ctl=ctl)["result"] == "OK"
         prepared = None
     finally:
+        if attached_process is not None and attached_process.poll() is None:
+            attached_process.terminate()
+            attached_process.wait(timeout=10)
         if prepared is not None:
             subprocess.run(
                 [

@@ -58,6 +58,7 @@ from tests.kv_offload.hw_helpers import (  # noqa: F401 - fixtures used by name
     _spec,
     _zero_pages,
     offloader,
+    persistent_pool,
     requires_hardware,
 )
 

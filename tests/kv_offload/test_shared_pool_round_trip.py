@@ -14,18 +14,19 @@
 
 """Real-device one-pool shared KV transfer tests."""
 
+# ruff: noqa: F811 - imported pytest fixtures are intentionally used by name
+
 from __future__ import annotations
 
 import gc
 import mmap
-import os
-import uuid
 
 import pytest
 import torch
 from vllm.v1.kv_offload.base import GPULoadStoreSpec, LookupResult, ReqContext, make_offload_key
 
 from spyre_inference.v1.kv_offload.connector import SpyrePhysicalCaches
+from spyre_inference.v1.kv_offload.shared_identity import SharedPoolIdentity
 from spyre_inference.v1.kv_offload.shared_manager import SpyreSharedOffloadingManager
 from spyre_inference.v1.kv_offload.shared_spec import component_manifest
 from spyre_inference.v1.kv_offload.shared_types import compute_shared_pool_geometry
@@ -40,6 +41,7 @@ from tests.kv_offload.hw_helpers import (  # noqa: F401 - fixture used by name
     _cache,
     _fill_all,
     _init_device,
+    persistent_pool,
     requires_hardware,
 )
 
@@ -74,10 +76,9 @@ def _physical(cache, impl_cls) -> SpyrePhysicalCaches:
     )
 
 
-def _manager(metadata_name, pool_name, max_pool_slots):
+def _manager(identity: SharedPoolIdentity, max_pool_slots: int):
     return SpyreSharedOffloadingManager(
-        metadata_name=metadata_name,
-        pool_name=pool_name,
+        identity=identity,
         component_count=2,
         max_pool_slots=max_pool_slots,
         cache_policy="lru",
@@ -101,17 +102,15 @@ def _assert_transfer_ok(result, expected_bytes):
 
 @requires_hardware
 @pytest.mark.parametrize("impl_cls", IMPLS, ids=IMPL_IDS)
-def test_shared_worker_round_trip_is_bit_exact_through_fragmented_one_pool(impl_cls):
+def test_shared_worker_round_trip_is_bit_exact_through_fragmented_one_pool(
+    impl_cls, persistent_pool
+):
     from torch_spyre._C import (
         ChunkDescriptorEntry,
         CompatibleBlockKey,
-        SharedMetadata,
         get_composite_address,
     )
 
-    metadata_name = f"kv_shared_{os.getpid()}_{uuid.uuid4().hex}"
-    pool_name = f"{metadata_name}.data"
-    SharedMetadata.unlink_by_name(metadata_name)
     manager_a = manager_b = worker_a = worker_b = directory = registered = None
     dummy_entries = []
     try:
@@ -131,14 +130,17 @@ def test_shared_worker_round_trip_is_bit_exact_through_fragmented_one_pool(impl_
             tuple(item.page_bytes for item in manifest),
             mmap.PAGESIZE,
         )
+        identity = persistent_pool(
+            num_slots=geometry.slot_count,
+            slot_bytes=geometry.slot_bytes,
+            block_size=manifest[0].block_size,
+        )
         expected_bytes = sum(item.page_bytes for item in manifest)
         worker_a = SpyreSharedOffloadingWorker(
             physical=source_physical,
-            metadata_name=metadata_name,
-            pool_name=pool_name,
+            identity=identity,
             geometry=geometry,
             manifest=manifest,
-            compatibility_digest=bytes(range(32)),
             max_pool_slots=geometry.slot_count,
         )
         directory = worker_a._directory
@@ -162,7 +164,7 @@ def test_shared_worker_round_trip_is_bit_exact_through_fragmented_one_pool(impl_
         directory.evict(min_entry)
         dummy_entries = [entry for entry in dummy_entries if entry not in (max_entry, min_entry)]
 
-        manager_a = _manager(metadata_name, pool_name, geometry.slot_count)
+        manager_a = _manager(identity, geometry.slot_count)
         store_context = ReqContext("store")
         store = manager_a.prepare_store([OFFLOAD_KEY], store_context)
         assert store is not None and store.keys_to_store == [OFFLOAD_KEY]
@@ -182,14 +184,12 @@ def test_shared_worker_round_trip_is_bit_exact_through_fragmented_one_pool(impl_
         destination_physical = _physical(destination, impl_cls)
         worker_b = SpyreSharedOffloadingWorker(
             physical=destination_physical,
-            metadata_name=metadata_name,
-            pool_name=pool_name,
+            identity=identity,
             geometry=geometry,
             manifest=component_manifest(destination_physical),
-            compatibility_digest=bytes(range(32)),
             max_pool_slots=geometry.slot_count,
         )
-        manager_b = _manager(metadata_name, pool_name, geometry.slot_count)
+        manager_b = _manager(identity, geometry.slot_count)
         load_context = ReqContext("load")
         assert manager_b.lookup(OFFLOAD_KEY, load_context) is LookupResult.HIT
         load = manager_b.prepare_load([OFFLOAD_KEY], load_context)
@@ -207,16 +207,16 @@ def test_shared_worker_round_trip_is_bit_exact_through_fragmented_one_pool(impl_
         _assert_bit_exact(destination.k_pages[6], expected_k, "shared K reload")
         _assert_bit_exact(destination.v_pages[6], expected_v, "shared V reload")
     finally:
-        if manager_b is not None:
-            manager_b.reset_cache()
-        if manager_a is not None:
-            manager_a.reset_cache()
         if directory is not None:
             for entry in dummy_entries:
                 directory.evict(entry)
-        torch.spyre.synchronize()
-        if directory is not None and registered is not None:
-            directory.retire_pool(registered.pool_ref)
-        del manager_a, manager_b, worker_a, worker_b, directory
+        if manager_b is not None:
+            manager_b.shutdown()
+        if manager_a is not None:
+            manager_a.shutdown()
+        if worker_b is not None:
+            worker_b.shutdown()
+        if worker_a is not None:
+            worker_a.shutdown()
+        del manager_a, manager_b, worker_a, worker_b, directory, registered
         gc.collect()
-        SharedMetadata.unlink_by_name(metadata_name)

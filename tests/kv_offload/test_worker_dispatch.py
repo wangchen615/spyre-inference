@@ -226,6 +226,24 @@ def test_offloader_exception_yields_failure_not_a_raised_submit(calls):
     assert result.success is False
 
 
+def test_failure_log_serializes_traceback_without_retaining_native_handles(calls, monkeypatch):
+    messages = []
+    worker = _worker()
+    monkeypatch.setattr(
+        worker_mod,
+        "logger",
+        SimpleNamespace(error=lambda message, *args: messages.append(message % args)),
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("dma refused")
+
+    worker._offloaders[0].offload = boom
+    worker.submit_store(5, _gpu_spec([0]), CPULoadStoreSpec([0]))
+
+    assert "RuntimeError: dma refused" in messages[0]
+
+
 def test_successful_result_carries_size_and_time_for_benchmarking(calls):
     """Upstream reads both fields; populating them is free instrumentation."""
     worker = _worker()

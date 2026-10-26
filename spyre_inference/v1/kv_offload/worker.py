@@ -90,6 +90,7 @@ rather than silently offloading a hybrid model's layers against the wrong blocks
 """
 
 import time
+import traceback
 
 import torch
 from vllm.logger import init_logger
@@ -258,9 +259,10 @@ class SpyreOffloadingWorker(OffloadingWorker):
         except Exception:
             # Upstream asserts `transfer_result.success` in its get_finished(),
             # so a failure here surfaces as an assertion there rather than a
-            # silently dropped page. Log with the traceback so the real cause is
-            # in the serve log.
-            logger.exception("Spyre KV offload job %d failed", job_id)
+            # silently dropped page. Serialize the traceback before logging so
+            # handlers cannot retain native pool handles through its frames.
+            failure = traceback.format_exc()
+            logger.error("Spyre KV offload job %d failed:\n%s", job_id, failure)
             self._finished_jobs.append(TransferResult(job_id=job_id, success=False))
         else:
             self._finished_jobs.append(
@@ -301,5 +303,7 @@ class SpyreOffloadingWorker(OffloadingWorker):
             torch.spyre.synchronize()
         finally:
             self._finished_jobs.clear()
+            for offloader in self._offloaders:
+                offloader.close()
             self._offloaders.clear()
             self._attachment.close()

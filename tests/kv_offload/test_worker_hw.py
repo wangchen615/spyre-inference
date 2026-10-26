@@ -44,10 +44,11 @@ Sizing stays at the proven conservative shape -- a few 256 KiB pages, moved
 synchronously with a synchronize() between phases.
 """
 
+# ruff: noqa: F811 - imported pytest fixtures are intentionally used by name
+
 from __future__ import annotations
 
-import os
-from contextlib import suppress
+import gc
 
 import pytest
 import torch
@@ -56,6 +57,7 @@ from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 
 from spyre_inference.v1.kv_offload.connector import SpyrePhysicalCaches
 from spyre_inference.v1.kv_offload.worker import SpyreOffloadingWorker
+from spyre_inference.v1.worker.spyre_kv_offload import page_signature
 from tests.kv_offload.hw_helpers import (  # noqa: F401 - fixtures used by name
     IMPL_IDS,
     IMPLS,
@@ -66,6 +68,7 @@ from tests.kv_offload.hw_helpers import (  # noqa: F401 - fixtures used by name
     _fill_all,
     _init_device,
     _zero_pages,
+    persistent_pool,
     requires_hardware,
 )
 
@@ -97,35 +100,33 @@ def _physical(caches, impl_cls) -> SpyrePhysicalCaches:
 
 
 @pytest.fixture
-def worker(request):
-    """A worker whose pools are unlinked on both ends.
+def worker(persistent_pool):
+    """A worker attached to one complete persistent generation per call."""
 
-    Stale POSIX SHM segments outlive a crashed run, and `create_or_attach` will
-    happily attach one whose geometry matches -- its bytes then read back as a
-    "valid" page. Unlinking on the way in as well as out keeps a previous
-    failure from masking the next one.
-    """
-    from torch_spyre._C import SharedHostPool
-
-    prefixes: list[tuple[str, int]] = []
+    workers: list[SpyreOffloadingWorker] = []
 
     def _make(caches, impl_cls, num_host_blocks=NUM_HOST_BLOCKS):
-        prefix = f"kv_work_{os.getpid()}_{abs(hash(request.node.name)) % 10**6}"
-        for c_idx in range(len(caches)):
-            SharedHostPool.unlink_by_name(f"{prefix}_c{c_idx}")
-        prefixes.append((prefix, len(caches)))
-        return SpyreOffloadingWorker(
-            physical=_physical(caches, impl_cls),
-            num_host_blocks=num_host_blocks,
-            pool_prefix=prefix,
+        physical = _physical(caches, impl_cls)
+        signatures = [page_signature(cache, LAYOUT_KIND[impl_cls]) for cache in caches]
+        component_count = 2 * len(caches)
+        identity = persistent_pool(
+            num_slots=num_host_blocks * component_count,
+            slot_bytes=max(signature.page_bytes for signature in signatures),
+            block_size=signatures[0].block_size,
         )
+        work = SpyreOffloadingWorker(
+            physical=physical,
+            num_host_blocks=num_host_blocks,
+            identity=identity,
+        )
+        workers.append(work)
+        return work
 
     yield _make
 
-    for prefix, count in prefixes:
-        for c_idx in range(count):
-            with suppress(Exception):  # noqa: BLE001 - teardown must not mask a failure
-                SharedHostPool.unlink_by_name(f"{prefix}_c{c_idx}")
+    for work in reversed(workers):
+        work.shutdown()
+    gc.collect()
 
 
 def _drain_ok(work: SpyreOffloadingWorker, expect_bytes: int | None = None) -> None:

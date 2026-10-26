@@ -22,17 +22,26 @@ differently -- see the individual docstrings.
 
 from __future__ import annotations
 
+import gc
 import os
-from contextlib import suppress
+import subprocess
+import time
+import uuid
+from pathlib import Path
 
 import pytest
 import torch
 
+from scripts.cleanup_shared_kv_demo import cleanup_pool
+from scripts.shared_kv_two_instance_demo import PreparedDemoPool, prepare_demo_pool
+from scripts.shared_pool_delegator import SharedPoolCtl
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
 from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
     SpyreHeadMajorAttentionImpl,
 )
-from spyre_inference.v1.worker.spyre_kv_offload import SpyreKvPageOffloader
+from spyre_inference.v1.kv_offload.shared_attachment import SharedPoolAttachment
+from spyre_inference.v1.kv_offload.shared_identity import SharedPoolIdentity
+from spyre_inference.v1.worker.spyre_kv_offload import SpyreKvPageOffloader, page_signature
 
 DTYPE = torch.float16
 NUM_BLOCKS = 8
@@ -63,6 +72,79 @@ requires_hardware = pytest.mark.skipif(
 )
 
 
+def _delegator_artifacts() -> tuple[Path, Path]:
+    build = Path(os.environ.get("DELEGATOR_BUILD_DIR", ""))
+    return build / "shared-pool-delegator", build / "shared-poolctl"
+
+
+def _wait_for_delegator(ctl: Path, socket: Path, process: subprocess.Popen) -> None:
+    for _ in range(200):
+        if process.poll() is not None:
+            raise RuntimeError("shared-pool-delegator exited before becoming ready")
+        result = subprocess.run(
+            [str(ctl), "--socket", str(socket), "health"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return
+        time.sleep(0.05)
+    raise RuntimeError("shared-pool-delegator did not become ready")
+
+
+@pytest.fixture
+def persistent_pool(tmp_path):
+    """Create complete READY generations and destroy them after consumers detach."""
+
+    daemon, ctl_binary = _delegator_artifacts()
+    if not daemon.is_file() or not ctl_binary.is_file():
+        pytest.skip("DELEGATOR_BUILD_DIR does not contain delegator test artifacts")
+
+    socket = tmp_path / "delegator.sock"
+    process = subprocess.Popen(
+        [str(daemon), "--socket-path", str(socket)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    prepared_pools: list[PreparedDemoPool] = []
+    try:
+        _wait_for_delegator(ctl_binary, socket, process)
+        ctl = SharedPoolCtl(binary=ctl_binary, socket_path=socket)
+
+        def _create(
+            *,
+            num_slots: int,
+            slot_bytes: int,
+            block_size: int = BLOCK_SIZE,
+        ) -> SharedPoolIdentity:
+            prepared = prepare_demo_pool(
+                ctl=ctl,
+                pool_name=f"/spyre-kv-hw-{os.getpid()}-{uuid.uuid4().hex}",
+                data_pool_name="host-0",
+                model="spyre-kv-hardware-test",
+                cpu_bytes_to_use=num_slots * slot_bytes,
+                slot_bytes=slot_bytes,
+                block_size=block_size,
+            )
+            prepared_pools.append(prepared)
+            return SharedPoolIdentity(
+                prepared.pool_name,
+                bytes.fromhex(prepared.generation),
+                prepared.data_pool_name,
+            )
+
+        yield _create
+        gc.collect()
+        for prepared in reversed(prepared_pools):
+            cleanup_pool(prepared.pool_name, prepared.generation, ctl=ctl)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=10)
+
+
 @pytest.fixture(autouse=True)
 def _init_device():
     """Create the RuntimeContext before any device allocation.
@@ -72,6 +154,8 @@ def _init_device():
     because the mock path initializes lazily elsewhere; on a real card the
     context must exist first.
     """
+    if not _real_device():
+        return
     torch.spyre._impl._lazy_init()
 
 
@@ -209,28 +293,38 @@ def _zero_pages(cache, blocks) -> dict:
 
 
 @pytest.fixture
-def offloader(request):
-    """An offloader on a uniquely-named pool, unlinked before and after.
+def offloader(persistent_pool):
+    """Attach an offloader to a delegator-created persistent generation."""
 
-    Stale POSIX SHM segments survive a crashed run, so the name is unlinked on
-    the way in as well as out; otherwise a previous failure's segment would be
-    attached and its geometry check would mask the real error.
-    """
-    from torch_spyre._C import SharedHostPool
+    attachments: list[SharedPoolAttachment] = []
+    offloaders: list[SpyreKvPageOffloader] = []
 
-    made = []
-
-    def _make(cache, impl_cls, num_slots=2):
-        name = f"kv_e2e_{os.getpid()}_{abs(hash(request.node.name)) % 10**6}_{len(made)}"
-        SharedHostPool.unlink_by_name(name)
-        off = SpyreKvPageOffloader(
-            cache, name, num_slots=num_slots, layout_kind=LAYOUT_KIND[impl_cls]
+    def _make(cache, impl_cls, num_slots=2, expect_signature=None):
+        signature = page_signature(cache, LAYOUT_KIND[impl_cls])
+        identity = persistent_pool(
+            num_slots=num_slots * 2,
+            slot_bytes=signature.page_bytes,
+            block_size=signature.block_size,
         )
-        made.append(name)
-        return off
+        attachment = SharedPoolAttachment.attach(identity)
+        attachments.append(attachment)
+        offloader = SpyreKvPageOffloader(
+            cache=cache,
+            pool=attachment.data_pool,
+            num_slots=num_slots,
+            layout_kind=LAYOUT_KIND[impl_cls],
+            component_count=2,
+            component_offset=0,
+            signature=signature,
+            expect_signature=expect_signature,
+        )
+        offloaders.append(offloader)
+        return offloader
 
     yield _make
 
-    for name in made:
-        with suppress(Exception):  # noqa: BLE001 - teardown must not mask a test failure
-            SharedHostPool.unlink_by_name(name)
+    for offloader in reversed(offloaders):
+        offloader.close()
+    for attachment in reversed(attachments):
+        attachment.close()
+    gc.collect()

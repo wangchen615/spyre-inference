@@ -127,10 +127,11 @@ def test_spec_loads_the_persistent_pool_identity():
     assert spec.shared_pool_identity.data_pool_name == "data-child"
 
 
-def test_num_blocks_accounts_for_world_size():
-    """The budget is shared across workers, so more workers means fewer blocks."""
-    spec = SpyreOffloadingSpec(_config(world_size=4))
-    assert spec.num_blocks == 8
+def test_m1_rejects_multiple_ranks_until_pool_slots_are_rank_partitioned():
+    """Distinct TP shards must never map to the same persistent child slots."""
+
+    with pytest.raises(ValueError, match="world_size == 1 and TP1"):
+        SpyreOffloadingSpec(_config(world_size=2))
 
 
 def test_zero_blocks_raises_rather_than_offloading_nothing():

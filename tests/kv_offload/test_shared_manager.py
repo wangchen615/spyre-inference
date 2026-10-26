@@ -367,6 +367,31 @@ def test_fragmented_complete_hit_pins_every_page_until_complete_load(
     assert all(entry.pin_records[-1].released for entry in entries)
 
 
+def test_reused_request_state_is_tracked_for_shutdown_pin_release(
+    manager_directory_runtime,
+):
+    """A second load on one request must remain visible to shutdown cleanup."""
+
+    manager, directory, runtime = manager_directory_runtime
+    entries = _publish_complete(directory, runtime)
+    ctx = ReqContext("request-1")
+
+    assert manager.lookup(OFFLOAD_KEY, ctx) is LookupResult.HIT
+    manager.prepare_load([OFFLOAD_KEY], ctx)
+    manager.complete_load([OFFLOAD_KEY], ctx)
+    gc.collect()
+
+    assert manager.lookup(OFFLOAD_KEY, ctx) is LookupResult.HIT
+    manager.prepare_load([OFFLOAD_KEY], ctx)
+    second_pins = [entry.pin_records[-1] for entry in entries]
+    assert all(not pin.released for pin in second_pins)
+
+    manager.shutdown()
+    gc.collect()
+
+    assert all(pin.released for pin in second_pins)
+
+
 def test_shared_hit_reports_host_as_its_load_source(manager_directory_runtime):
     manager, _, _ = manager_directory_runtime
 

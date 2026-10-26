@@ -180,6 +180,7 @@ class SpyreSharedOffloadingManager(OffloadingManager):
         if state is None:
             state = _SharedRequestState()
             req_context.set_state(state)
+        if not any(tracked is state for tracked in self._request_states):
             self._request_states.append(state)
         return state
 

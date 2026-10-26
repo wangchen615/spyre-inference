@@ -252,6 +252,11 @@ class SpyreKvPageOffloader:
         """
         return self._signature
 
+    def close(self) -> None:
+        """Drop this helper's resolved child handle without changing pool state."""
+
+        self._pool = None
+
     def _check_slot(self, slot: int) -> None:
         if not 0 <= slot < self._num_slots:
             raise IndexError(f"host slot {slot} out of range [0, {self._num_slots})")

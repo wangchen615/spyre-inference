@@ -112,6 +112,11 @@ class SpyreOffloadingSpec(OffloadingSpec):
         # bytes; the pools are sized from the physical page size, which may be
         # larger because of stick padding (see get_worker).
         world_size = config.parallel.world_size
+        if world_size != 1 or config.parallel.tp_size != 1:
+            raise ValueError(
+                "Spyre KV offloading requires world_size == 1 and TP1 until "
+                "persistent child slots are partitioned by rank"
+            )
         kv_bytes_per_block = config.worker_kv_bytes_per_block * world_size
         if kv_bytes_per_block <= 0:
             raise ValueError(

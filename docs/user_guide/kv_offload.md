@@ -92,6 +92,12 @@ Both replicas receive the same three identity fields in
 delegator-created resource. A missing or stale identity fails attachment; a
 worker never creates a replacement.
 
+For launchers that cannot populate `kv_connector_extra_config`, the equivalent
+environment fallbacks are `SPYRE_KV_POOL_NAME`, `SPYRE_KV_POOL_GENERATION`, and
+`SPYRE_KV_DATA_POOL_NAME`. An explicitly configured field always takes
+precedence. If that explicit value is malformed, startup fails instead of
+silently using the environment value.
+
 For the demo, start one vLLM process per card after exporting the identity:
 
 ```bash
