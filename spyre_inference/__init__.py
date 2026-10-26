@@ -19,6 +19,8 @@ import os
 import signal
 import threading
 
+from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+
 __version__ = importlib.metadata.version("spyre_inference")
 
 
@@ -143,3 +145,9 @@ def _init_logging():
 
 
 _init_logging()
+
+OffloadingSpecFactory.register_spec(
+    "SpyreOffloadingSpec",
+    "spyre_inference.v1.kv_offload.spec",
+    "SpyreOffloadingSpec",
+)
