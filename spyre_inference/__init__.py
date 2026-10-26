@@ -151,3 +151,8 @@ OffloadingSpecFactory.register_spec(
     "spyre_inference.v1.kv_offload.spec",
     "SpyreOffloadingSpec",
 )
+OffloadingSpecFactory.register_spec(
+    "SpyreSharedOffloadingSpec",
+    "spyre_inference.v1.kv_offload.shared_spec",
+    "SpyreSharedOffloadingSpec",
+)
