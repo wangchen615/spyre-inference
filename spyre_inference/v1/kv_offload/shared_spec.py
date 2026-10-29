@@ -202,6 +202,22 @@ class SpyreSharedOffloadingSpec(SpyreOffloadingSpec):
         )
 
         manifest = component_manifest(physical)
+        if self.shared_pool_plan is not None:
+            tp_rank = self.config.parallel.rank % self.config.parallel.tp_size
+            local_component_count = len(self.shared_pool_plan.components_for_rank(tp_rank))
+            if len(manifest) != local_component_count:
+                raise ValueError(
+                    f"physical component count {len(manifest)} disagrees with "
+                    f"planned rank {tp_rank} component count {local_component_count}"
+                )
+            compatibility_digest(self.compatibility_payload(manifest))
+            return SpyreSharedOffloadingWorker(
+                physical=physical,
+                manifest=manifest,
+                plan=self.shared_pool_plan,
+                tp_rank=tp_rank,
+            )
+
         if len(manifest) != self.component_count:
             raise ValueError(
                 f"physical component count {len(manifest)} disagrees with "

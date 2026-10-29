@@ -58,6 +58,7 @@ def _config(
     group_count: int = 1,
     layer_count: int = 1,
     dtype: str = "float16",
+    rank: int = 0,
 ) -> OffloadingConfig:
     worker_kv_bytes_per_block = 2 * max(layer_count, 1) * PAGE_BYTES
     extra_config = {
@@ -85,7 +86,7 @@ def _config(
         model=OffloadingModelConfig(name="micro-g3.3-8b", dtype=dtype),
         cache=OffloadingCacheConfig(tokens_per_hash=128, blocks_per_chunk=1),
         parallel=OffloadingParallelConfig(
-            rank=0,
+            rank=rank,
             world_size=world_size,
             tp_size=world_size,
             pp_size=1,
@@ -445,6 +446,54 @@ def test_shared_factories_receive_one_pool_manifest_and_geometry(monkeypatch):
     assert worker_kwargs["geometry"].slot_count == 2048
     assert worker_kwargs["manifest"] == manifest
     assert worker_kwargs["max_pool_slots"] == 2048
+
+
+def test_planned_worker_factory_receives_complete_plan_and_tp_rank(monkeypatch):
+    """Passing global component geometry would make every rank map every partition."""
+
+    module = _shared_spec_module()
+    from spyre_inference.v1.kv_offload import shared_worker
+
+    plan = valid_planned_pool_document()
+    plan["plan"]["normalizedSpec"]["model"] = "micro-g3.3-8b"
+    plan["plan"]["normalizedSpec"]["blockSize"] = "128"
+    for config in (plan["plan"]["config"], plan["poolDescriptor"]["effectiveConfig"]):
+        compatibility = config["dataPools"][0]["compatibility"]
+        compatibility["model"] = "micro-g3.3-8b@revision-1"
+        compatibility["blockSize"] = "128"
+
+    worker_kwargs: dict[str, Any] = {}
+
+    class RecordingWorker:
+        _bytes_per_block = 6000
+
+        def __init__(self, **kwargs):
+            worker_kwargs.update(kwargs)
+
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    monkeypatch.setattr(
+        module,
+        "page_signature",
+        lambda *_: _signature(page_bytes=3000, local_kv_heads=4),
+    )
+    monkeypatch.setattr(shared_worker, "SpyreSharedOffloadingWorker", RecordingWorker)
+    spec = module.SpyreSharedOffloadingSpec(
+        _config(world_size=2, rank=1, extra={"pool_plan": plan})
+    )
+    spec.bind_vllm_config(
+        _vllm_config(
+            backend="external_launcher",
+            model="micro-g3.3-8b",
+            revision="revision-1",
+        )
+    )
+
+    spec._create_worker(_physical())
+
+    assert worker_kwargs["plan"] is spec.shared_pool_plan
+    assert worker_kwargs["tp_rank"] == 1
+    assert "identity" not in worker_kwargs
+    assert "geometry" not in worker_kwargs
 
 
 def test_worker_factory_rejects_physical_component_count_mismatch(monkeypatch):

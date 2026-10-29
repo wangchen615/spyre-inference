@@ -56,6 +56,17 @@ class PlannedComponent:
 
 
 @dataclass(frozen=True)
+class PlannedRankCache:
+    tp_rank: int
+    cache_index: int
+    physical_page_bytes: int
+    layout_kind: str
+    layout_version: int
+    local_kv_heads: int
+    head_size: int
+
+
+@dataclass(frozen=True)
 class PlannedArena:
     name: str
     backend: str
@@ -83,6 +94,7 @@ class PlannedPool:
     arena: PlannedArena
     partitions: tuple[PlannedPartition, ...]
     components: tuple[PlannedComponent, ...]
+    rank_caches: tuple[PlannedRankCache, ...] = ()
 
     def partitions_for_rank(self, tp_rank: int) -> tuple[PlannedPartition, ...]:
         if not 0 <= tp_rank < self.tensor_parallel_size:
@@ -94,6 +106,10 @@ class PlannedPool:
     def components_for_rank(self, tp_rank: int) -> tuple[PlannedComponent, ...]:
         self.partitions_for_rank(tp_rank)
         return tuple(item for item in self.components if item.tp_rank == tp_rank)
+
+    def caches_for_rank(self, tp_rank: int) -> tuple[PlannedRankCache, ...]:
+        self.partitions_for_rank(tp_rank)
+        return tuple(item for item in self.rank_caches if item.tp_rank == tp_rank)
 
 
 def _mapping(value: object, field: str) -> Mapping[str, object]:
@@ -329,26 +345,45 @@ def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
     if config_partitions != plan_partition_geometry:
         raise ValueError("arena partition geometry differs from the partition plan")
 
-    rank_caches = _sequence(spec.get("rankCaches"), "plan.normalizedSpec.rankCaches")
-    cache_geometry: dict[tuple[int, int], int] = {}
-    for index, raw_cache in enumerate(rank_caches):
+    raw_rank_caches = _sequence(spec.get("rankCaches"), "plan.normalizedSpec.rankCaches")
+    rank_caches = []
+    for index, raw_cache in enumerate(raw_rank_caches):
         cache = _mapping(raw_cache, f"rankCaches[{index}]")
-        key = (
-            _uint(cache.get("tpRank", 0), f"rankCaches[{index}].tpRank"),
-            _uint(cache.get("cacheIndex", 0), f"rankCaches[{index}].cacheIndex"),
+        rank_caches.append(
+            PlannedRankCache(
+                tp_rank=_uint(cache.get("tpRank", 0), f"rankCaches[{index}].tpRank"),
+                cache_index=_uint(cache.get("cacheIndex", 0), f"rankCaches[{index}].cacheIndex"),
+                physical_page_bytes=_uint(
+                    cache.get("physicalPageBytes"),
+                    f"rankCaches[{index}].physicalPageBytes",
+                    positive=True,
+                ),
+                layout_kind=_text(cache.get("layoutKind"), f"rankCaches[{index}].layoutKind"),
+                layout_version=_uint(
+                    cache.get("layoutVersion"),
+                    f"rankCaches[{index}].layoutVersion",
+                    positive=True,
+                ),
+                local_kv_heads=_uint(
+                    cache.get("localKvHeads"),
+                    f"rankCaches[{index}].localKvHeads",
+                    positive=True,
+                ),
+                head_size=_uint(
+                    cache.get("headSize"),
+                    f"rankCaches[{index}].headSize",
+                    positive=True,
+                ),
+            )
         )
-        if key in cache_geometry:
-            raise ValueError("duplicate normalized rank cache identity")
-        cache_geometry[key] = _uint(
-            cache.get("physicalPageBytes"),
-            f"rankCaches[{index}].physicalPageBytes",
-            positive=True,
-        )
-    if set(cache_geometry) != set(partition_keys):
+    cache_keys = [(item.tp_rank, item.cache_index) for item in rank_caches]
+    if len(set(cache_keys)) != len(cache_keys):
+        raise ValueError("duplicate normalized rank cache identity")
+    if cache_keys != partition_keys:
         raise ValueError("normalized rank caches do not match planned partitions")
     if any(
-        cache_geometry[key] != item.physical_page_bytes
-        for key, item in zip(partition_keys, partitions, strict=True)
+        cache.physical_page_bytes != partition.physical_page_bytes
+        for cache, partition in zip(rank_caches, partitions, strict=True)
     ):
         raise ValueError("partition physical page geometry differs from normalized cache rows")
 
@@ -427,6 +462,7 @@ def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
         arena=arena,
         partitions=partitions,
         components=components,
+        rank_caches=tuple(rank_caches),
     )
 
 
