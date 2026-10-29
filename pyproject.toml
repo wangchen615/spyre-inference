@@ -56,6 +56,9 @@ spyre_inference = "spyre_inference:register"
 # model adaptations in every process, before vLLM's first model lookup.
 spyre_inference = "spyre_inference:register_ops"
 
+[project.scripts]
+spyre-kv-pool-spec = "spyre_inference.v1.kv_offload.pool_cli:main"
+
 [tool.setuptools.packages.find]
 where = ["."]  # list of folders that contain the packages (["."] by default)
 include = ["spyre_inference*"]  # package names should match these glob patterns (["*"] by default)

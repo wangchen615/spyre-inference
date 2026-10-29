@@ -22,14 +22,36 @@ import torch
 INT32_ELEMS_PER_STICK = 32
 
 
+def kv_stick_geometry(dtype: torch.dtype, head_size: int) -> tuple[int, int]:
+    """Return ``(sticks, elements_per_stick)`` for one KV-cache row.
+
+    Spyre stores every innermost row in whole 128-byte sticks.  Keep this
+    arithmetic independent of torch-spyre so the control-plane planner can
+    compute the same physical extent without loading a device runtime.
+    """
+    element_sizes = {
+        torch.float16: 2,
+        torch.bfloat16: 2,
+        torch.float8_e4m3fn: 1,
+        # vLLM represents an fp8 KV-cache specification as byte storage.
+        torch.uint8: 1,
+    }
+    if dtype not in element_sizes:
+        raise ValueError(f"unsupported KV-cache dtype {dtype}")
+    if head_size <= 0:
+        raise ValueError(f"head_size must be positive, got {head_size}")
+    elements_per_stick = 128 // element_sizes[dtype]
+    sticks = (head_size + elements_per_stick - 1) // elements_per_stick
+    return sticks, elements_per_stick
+
+
 def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtype: torch.dtype):
     """Slot-axis-outermost layout. The default tiled layout spreads the slot index
     across two device dims, making the indirect store write to the wrong rows
     (torch-spyre#3705)."""
-    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype
 
-    eps = get_elem_in_stick(dtype)
-    sticks = (head_size + eps - 1) // eps
+    sticks, eps = kv_stick_geometry(dtype, head_size)
     return SpyreTensorLayout(
         device_size=[num_slots, num_kv_heads, sticks, eps],
         stride_map=[num_kv_heads * sticks * eps, sticks * eps, eps, 1],
@@ -68,11 +90,9 @@ def head_major_kv_layout(num_pages: int, block_size: int, head_size: int, dtype:
         ElementArrangement,
         SpyreTensorLayout,
         get_device_dtype,
-        get_elem_in_stick,
     )
 
-    eps = get_elem_in_stick(dtype)
-    sticks = (head_size + eps - 1) // eps
+    sticks, eps = kv_stick_geometry(dtype, head_size)
     return SpyreTensorLayout(
         device_size=[num_pages, block_size, sticks, eps],
         stride_map=[block_size * head_size, head_size, eps, 1],
