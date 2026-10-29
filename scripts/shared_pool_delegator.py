@@ -68,6 +68,13 @@ class SharedPoolCtl:
             file.flush()
             return self._run("create", "--config", file.name)
 
+    def create_model(self, model_spec: dict[str, Any]) -> dict[str, Any]:
+        """Plan and create one complete model pool through the delegator."""
+        with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8") as file:
+            json.dump(model_spec, file)
+            file.flush()
+            return self._run("create-model", "--spec", file.name)
+
     def open(self, name: str) -> dict[str, Any]:
         return self._run("open", "--name", name)
 

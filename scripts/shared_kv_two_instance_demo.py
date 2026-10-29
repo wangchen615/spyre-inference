@@ -24,6 +24,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 DEFAULT_MODEL = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
@@ -196,6 +197,27 @@ def prepare_pool_command(
         "dataPoolName": prepared.data_pool_name,
         "instanceAExtraConfig": prepared.instance_a_extra_config,
         "instanceBExtraConfig": prepared.instance_b_extra_config,
+    }
+    print(json.dumps(result, sort_keys=True))
+    return result
+
+
+def prepare_model_pool_command(*, ctl: Any, model_spec: dict[str, Any]) -> dict[str, Any]:
+    """Create a planned pool and print the complete plan consumed by every TP rank."""
+    from spyre_inference.v1.kv_offload.pool_plan import parse_planned_pool
+
+    document = ctl.create_model(model_spec)
+    plan = parse_planned_pool(document)
+    extra_config = {
+        "spec_name": "SpyreSharedOffloadingSpec",
+        "pool_plan": document,
+    }
+    result = {
+        "poolName": plan.identity.pool_name,
+        "poolGeneration": plan.identity.generation.hex(),
+        "dataPoolName": plan.arena.name,
+        "instanceAExtraConfig": dict(extra_config),
+        "instanceBExtraConfig": dict(extra_config),
     }
     print(json.dumps(result, sort_keys=True))
     return result
@@ -726,7 +748,34 @@ def _parse_prepare_pool_args() -> argparse.Namespace:
     return parser.parse_args(sys.argv[2:])
 
 
+def _parse_prepare_model_pool_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog=f"{sys.argv[0]} prepare-model-pool",
+        description="Ask the delegator to plan and create a versioned model pool.",
+    )
+    parser.add_argument("--spec", type=Path, required=True)
+    parser.add_argument("--ctl", default="shared-poolctl")
+    parser.add_argument("--socket", default=None)
+    return parser.parse_args(sys.argv[2:])
+
+
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "prepare-model-pool":
+        if __package__:
+            from scripts.shared_pool_delegator import SharedPoolCtl
+        else:
+            from shared_pool_delegator import SharedPoolCtl
+
+        args = _parse_prepare_model_pool_args()
+        model_spec = json.loads(args.spec.read_text(encoding="utf-8"))
+        if not isinstance(model_spec, dict):
+            raise ValueError("model pool specification must be a JSON object")
+        prepare_model_pool_command(
+            ctl=SharedPoolCtl(binary=args.ctl, socket_path=args.socket),
+            model_spec=model_spec,
+        )
+        return
+
     if len(sys.argv) > 1 and sys.argv[1] == "prepare-pool":
         if __package__:
             from scripts.shared_pool_delegator import SharedPoolCtl

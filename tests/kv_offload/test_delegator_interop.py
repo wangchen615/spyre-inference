@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -25,8 +26,25 @@ import pytest
 
 from scripts.cleanup_shared_kv_demo import cleanup_pool
 from scripts.shared_kv_two_instance_demo import prepare_demo_pool
+from scripts.shared_pool_delegator import SharedPoolCtl
 
 GENERATION = "ab" * 16
+
+
+def test_ctl_create_model_uses_versioned_planning_command(monkeypatch):
+    calls = []
+    ctl = SharedPoolCtl(binary="shared-poolctl", socket_path="/tmp/delegator.sock")
+
+    def run(*args):
+        calls.append(args)
+        spec_path = Path(args[-1])
+        assert json.loads(spec_path.read_text()) == {"planningVersion": 1}
+        return {"code": "OK"}
+
+    monkeypatch.setattr(ctl, "_run", run)
+
+    assert ctl.create_model({"planningVersion": 1}) == {"code": "OK"}
+    assert calls[0][0:2] == ("create-model", "--spec")
 
 
 class FakeCtl:

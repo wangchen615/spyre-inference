@@ -22,6 +22,7 @@ from argparse import Namespace
 import pytest
 
 from scripts import shared_kv_two_instance_demo as demo
+from tests.kv_offload.test_pool_plan import valid_planned_pool_document
 
 
 @pytest.mark.parametrize(
@@ -98,6 +99,28 @@ def test_prepare_pool_command_emits_one_identity_for_both_instances(capsys):
 
     assert result["instanceAExtraConfig"] == result["instanceBExtraConfig"]
     assert result["instanceAExtraConfig"]["pool_generation"] == "ab" * 16
+    assert json.loads(capsys.readouterr().out) == result
+
+
+def test_prepare_model_pool_passes_complete_plan_to_both_instances(capsys):
+    document = valid_planned_pool_document()
+    spec = document["plan"]["normalizedSpec"]
+
+    class Ctl:
+        def create_model(self, actual):
+            assert actual == spec
+            return document
+
+    result = demo.prepare_model_pool_command(ctl=Ctl(), model_spec=spec)
+
+    assert result["poolName"] == "/model-a"
+    assert result["poolGeneration"] == "11" * 16
+    assert result["dataPoolName"] == "host-0"
+    assert result["instanceAExtraConfig"] == result["instanceBExtraConfig"]
+    assert result["instanceAExtraConfig"] == {
+        "spec_name": "SpyreSharedOffloadingSpec",
+        "pool_plan": document,
+    }
     assert json.loads(capsys.readouterr().out) == result
 
 
