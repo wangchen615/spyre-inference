@@ -1,0 +1,467 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Strict immutable view of a delegator-created model pool plan."""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import json
+import os
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import cast
+
+from spyre_inference.v1.kv_offload.shared_identity import SharedPoolIdentity
+
+
+@dataclass(frozen=True)
+class PlannedPartition:
+    partition_id: int
+    arena_name: str
+    partition_name: str
+    tp_rank: int
+    cache_index: int
+    offset_bytes: int
+    num_slots: int
+    slot_bytes: int
+    physical_page_bytes: int
+
+
+@dataclass(frozen=True)
+class PlannedComponent:
+    global_component_id: int
+    tp_rank: int
+    cache_index: int
+    role: str
+    arena_name: str
+    partition_name: str
+    partition_id: int
+    partition_offset_bytes: int
+    partition_slot_bytes: int
+    physical_page_bytes: int
+
+
+@dataclass(frozen=True)
+class PlannedArena:
+    name: str
+    backend: str
+    model: str
+    kv_dtype: str
+    block_size: int
+    tensor_parallel_size: int
+    partitions: tuple[PlannedPartition, ...]
+
+
+@dataclass(frozen=True)
+class PlannedPool:
+    identity: SharedPoolIdentity
+    planning_version: int
+    model: str
+    model_revision: str
+    kv_dtype: str
+    block_size: int
+    tensor_parallel_size: int
+    cpu_bytes_to_use: int
+    bytes_per_complete_block: int
+    logical_block_capacity: int
+    allocated_bytes: int
+    unused_bytes: int
+    arena: PlannedArena
+    partitions: tuple[PlannedPartition, ...]
+    components: tuple[PlannedComponent, ...]
+
+    def partitions_for_rank(self, tp_rank: int) -> tuple[PlannedPartition, ...]:
+        if not 0 <= tp_rank < self.tensor_parallel_size:
+            raise ValueError(
+                f"tensor-parallel rank {tp_rank} is outside [0, {self.tensor_parallel_size})"
+            )
+        return tuple(item for item in self.partitions if item.tp_rank == tp_rank)
+
+    def components_for_rank(self, tp_rank: int) -> tuple[PlannedComponent, ...]:
+        self.partitions_for_rank(tp_rank)
+        return tuple(item for item in self.components if item.tp_rank == tp_rank)
+
+
+def _mapping(value: object, field: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field} must be an object")
+    return cast(Mapping[str, object], value)
+
+
+def _sequence(value: object, field: str) -> list[object]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be an array")
+    return cast(list[object], value)
+
+
+def _text(value: object, field: str, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str) or (not allow_empty and not value):
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
+
+
+def _uint(value: object, field: str, *, positive: bool = False) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an unsigned integer")
+    if isinstance(value, str):
+        if not value.isascii() or not value.isdecimal():
+            raise ValueError(f"{field} must be an unsigned integer")
+        result = int(value)
+    elif isinstance(value, int):
+        result = value
+    else:
+        raise ValueError(f"{field} must be an unsigned integer")
+    if result < 0 or (positive and result == 0):
+        qualifier = "positive " if positive else ""
+        raise ValueError(f"{field} must be a {qualifier}unsigned integer")
+    return result
+
+
+def _generation(value: object) -> bytes:
+    encoded = _text(value, "poolDescriptor.generation")
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("poolDescriptor.generation must be valid base64") from error
+    if len(decoded) != 16:
+        raise ValueError("poolDescriptor.generation must encode exactly 16 bytes")
+    return decoded
+
+
+def _parse_partition(value: object, field: str) -> PlannedPartition:
+    row = _mapping(value, field)
+    return PlannedPartition(
+        partition_id=_uint(row.get("partitionId"), f"{field}.partitionId"),
+        arena_name=_text(row.get("arenaName"), f"{field}.arenaName"),
+        partition_name=_text(row.get("partitionName"), f"{field}.partitionName"),
+        tp_rank=_uint(row.get("tpRank", 0), f"{field}.tpRank"),
+        cache_index=_uint(row.get("cacheIndex", 0), f"{field}.cacheIndex"),
+        offset_bytes=_uint(row.get("offsetBytes", 0), f"{field}.offsetBytes"),
+        num_slots=_uint(row.get("numSlots"), f"{field}.numSlots", positive=True),
+        slot_bytes=_uint(row.get("slotBytes"), f"{field}.slotBytes", positive=True),
+        physical_page_bytes=_uint(
+            row.get("physicalPageBytes"),
+            f"{field}.physicalPageBytes",
+            positive=True,
+        ),
+    )
+
+
+def _parse_component(value: object, field: str) -> PlannedComponent:
+    row = _mapping(value, field)
+    role_value = _text(row.get("role"), f"{field}.role")
+    roles = {
+        "COMPONENT_ROLE_K": "k",
+        "COMPONENT_ROLE_V": "v",
+        "K": "k",
+        "V": "v",
+    }
+    if role_value not in roles:
+        raise ValueError(f"{field}.role must identify K or V")
+    return PlannedComponent(
+        global_component_id=_uint(row.get("globalComponentId"), f"{field}.globalComponentId"),
+        tp_rank=_uint(row.get("tpRank", 0), f"{field}.tpRank"),
+        cache_index=_uint(row.get("cacheIndex", 0), f"{field}.cacheIndex"),
+        role=roles[role_value],
+        arena_name=_text(row.get("arenaName"), f"{field}.arenaName"),
+        partition_name=_text(row.get("partitionName"), f"{field}.partitionName"),
+        partition_id=_uint(row.get("partitionId"), f"{field}.partitionId"),
+        partition_offset_bytes=_uint(
+            row.get("partitionOffsetBytes", 0), f"{field}.partitionOffsetBytes"
+        ),
+        partition_slot_bytes=_uint(
+            row.get("partitionSlotBytes"),
+            f"{field}.partitionSlotBytes",
+            positive=True,
+        ),
+        physical_page_bytes=_uint(
+            row.get("physicalPageBytes"),
+            f"{field}.physicalPageBytes",
+            positive=True,
+        ),
+    )
+
+
+def _configuration_partition(row: object, field: str) -> tuple[object, ...]:
+    value = _mapping(row, field)
+    return (
+        _text(value.get("name"), f"{field}.name"),
+        _uint(value.get("tpRank", 0), f"{field}.tpRank"),
+        _uint(value.get("cacheIndex", 0), f"{field}.cacheIndex"),
+        _uint(value.get("offsetBytes", 0), f"{field}.offsetBytes"),
+        _uint(value.get("numSlots"), f"{field}.numSlots", positive=True),
+        _uint(value.get("slotBytes"), f"{field}.slotBytes", positive=True),
+    )
+
+
+def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
+    """Parse protobuf JSON and independently recheck every planning invariant."""
+    root = _mapping(document, "planned pool document")
+    if root.get("code") not in {"OK", "ALREADY_EXISTS"}:
+        raise ValueError(f"planned pool result is not attachable: {root.get('code')!r}")
+    descriptor = _mapping(root.get("poolDescriptor"), "poolDescriptor")
+    if descriptor.get("state") != "READY":
+        raise ValueError("poolDescriptor must be READY before workers attach")
+    plan = _mapping(root.get("plan"), "plan")
+    spec = _mapping(plan.get("normalizedSpec"), "plan.normalizedSpec")
+    version = _uint(spec.get("planningVersion"), "planning version", positive=True)
+    if version != 1:
+        raise ValueError(f"unsupported planning version {version}")
+
+    pool_name = _text(spec.get("name"), "plan.normalizedSpec.name")
+    descriptor_name = _text(descriptor.get("name"), "poolDescriptor.name")
+    plan_config = _mapping(plan.get("config"), "plan.config")
+    config_name = _text(plan_config.get("name"), "plan.config.name")
+    if len({pool_name, descriptor_name, config_name}) != 1:
+        raise ValueError("descriptor, specification, and plan config name mismatch")
+    effective = _mapping(descriptor.get("effectiveConfig"), "effective config")
+    if effective != plan_config:
+        raise ValueError("descriptor effective config differs from the planned config")
+
+    tp_size = _uint(
+        spec.get("tensorParallelSize"),
+        "plan.normalizedSpec.tensorParallelSize",
+        positive=True,
+    )
+    model = _text(spec.get("model"), "plan.normalizedSpec.model")
+    revision = _text(
+        spec.get("modelRevision", ""),
+        "plan.normalizedSpec.modelRevision",
+        allow_empty=True,
+    )
+    kv_dtype = _text(spec.get("kvDtype"), "plan.normalizedSpec.kvDtype")
+    block_size = _uint(spec.get("blockSize"), "plan.normalizedSpec.blockSize", positive=True)
+    budget = _uint(
+        spec.get("cpuBytesToUse"),
+        "plan.normalizedSpec.cpuBytesToUse",
+        positive=True,
+    )
+
+    arenas = _sequence(plan_config.get("dataPools"), "plan.config.dataPools")
+    if len(arenas) != 1:
+        raise ValueError("a planned shared pool must contain exactly one data arena")
+    arena_row = _mapping(arenas[0], "plan.config.dataPools[0]")
+    arena_name = _text(arena_row.get("name"), "planned arena name")
+    backend = _text(arena_row.get("backend"), "planned arena backend")
+    if backend != "HOST_DRAM":
+        raise ValueError(f"unsupported planned arena backend {backend!r}")
+    compatibility = _mapping(arena_row.get("compatibility"), "arena compatibility")
+    expected_model = model if not revision else f"{model}@{revision}"
+    if _text(compatibility.get("model"), "compatibility.model") != expected_model:
+        raise ValueError("arena model compatibility does not match the normalized spec")
+    if _text(compatibility.get("kvDtype"), "compatibility.kvDtype") != kv_dtype:
+        raise ValueError("arena KV dtype compatibility does not match the normalized spec")
+    if _uint(compatibility.get("blockSize"), "compatibility.blockSize") != block_size:
+        raise ValueError("arena block size compatibility does not match the normalized spec")
+    if (
+        _uint(
+            compatibility.get("tensorParallelSize"),
+            "compatibility.tensorParallelSize",
+        )
+        != tp_size
+    ):
+        raise ValueError("arena tensor parallel compatibility does not match the plan")
+
+    partitions = tuple(
+        _parse_partition(value, f"plan.partitions[{index}]")
+        for index, value in enumerate(_sequence(plan.get("partitions"), "plan.partitions"))
+    )
+    partition_ids = [item.partition_id for item in partitions]
+    partition_names = [item.partition_name for item in partitions]
+    partition_keys = [(item.tp_rank, item.cache_index) for item in partitions]
+    if (
+        len(set(partition_ids)) != len(partitions)
+        or len(set(partition_names)) != len(partitions)
+        or len(set(partition_keys)) != len(partitions)
+    ):
+        raise ValueError("duplicate planned partition identity")
+    if partition_ids != list(range(len(partitions))):
+        raise ValueError("planned partition IDs must be contiguous and ordered")
+    if partition_keys != sorted(partition_keys):
+        raise ValueError("planned partitions must be sorted by rank and cache index")
+    if {item.tp_rank for item in partitions} != set(range(tp_size)):
+        raise ValueError("planned partitions must include every tensor-parallel rank")
+    for rank in range(tp_size):
+        cache_indices = [item.cache_index for item in partitions if item.tp_rank == rank]
+        if cache_indices != list(range(len(cache_indices))):
+            raise ValueError(f"planned cache indices for rank {rank} are not contiguous")
+
+    expected_offset = 0
+    for item in partitions:
+        if item.arena_name != arena_name:
+            raise ValueError(f"partition {item.partition_name!r} refers to a foreign arena")
+        if item.offset_bytes != expected_offset:
+            raise ValueError(
+                f"partition {item.partition_name!r} offset {item.offset_bytes} "
+                f"does not equal exact prefix {expected_offset}"
+            )
+        expected_offset += item.num_slots * item.slot_bytes
+
+    config_partitions = tuple(
+        _configuration_partition(value, f"arena.partitions[{index}]")
+        for index, value in enumerate(_sequence(arena_row.get("partitions"), "arena.partitions"))
+    )
+    plan_partition_geometry = tuple(
+        (
+            item.partition_name,
+            item.tp_rank,
+            item.cache_index,
+            item.offset_bytes,
+            item.num_slots,
+            item.slot_bytes,
+        )
+        for item in partitions
+    )
+    if config_partitions != plan_partition_geometry:
+        raise ValueError("arena partition geometry differs from the partition plan")
+
+    rank_caches = _sequence(spec.get("rankCaches"), "plan.normalizedSpec.rankCaches")
+    cache_geometry: dict[tuple[int, int], int] = {}
+    for index, raw_cache in enumerate(rank_caches):
+        cache = _mapping(raw_cache, f"rankCaches[{index}]")
+        key = (
+            _uint(cache.get("tpRank", 0), f"rankCaches[{index}].tpRank"),
+            _uint(cache.get("cacheIndex", 0), f"rankCaches[{index}].cacheIndex"),
+        )
+        if key in cache_geometry:
+            raise ValueError("duplicate normalized rank cache identity")
+        cache_geometry[key] = _uint(
+            cache.get("physicalPageBytes"),
+            f"rankCaches[{index}].physicalPageBytes",
+            positive=True,
+        )
+    if set(cache_geometry) != set(partition_keys):
+        raise ValueError("normalized rank caches do not match planned partitions")
+    if any(
+        cache_geometry[key] != item.physical_page_bytes
+        for key, item in zip(partition_keys, partitions, strict=True)
+    ):
+        raise ValueError("partition physical page geometry differs from normalized cache rows")
+
+    capacity = _uint(plan.get("logicalBlockCapacity"), "logicalBlockCapacity", positive=True)
+    if any(item.num_slots != 2 * capacity for item in partitions):
+        raise ValueError("partition geometry does not match logicalBlockCapacity")
+    bytes_per_block = 2 * sum(item.slot_bytes for item in partitions)
+    if _uint(plan.get("bytesPerCompleteBlock"), "bytesPerCompleteBlock") != bytes_per_block:
+        raise ValueError("bytesPerCompleteBlock does not match partition geometry")
+    allocated = bytes_per_block * capacity
+    if _uint(plan.get("allocatedBytes"), "allocatedBytes") != allocated:
+        raise ValueError("allocatedBytes does not match capacity arithmetic")
+    if expected_offset != allocated:
+        raise ValueError("partition extents do not match allocatedBytes")
+    if budget < allocated:
+        raise ValueError("planned allocation exceeds cpuBytesToUse")
+    unused = budget - allocated
+    if _uint(plan.get("unusedBytes"), "unusedBytes") != unused:
+        raise ValueError("unusedBytes does not match budget arithmetic")
+
+    components = tuple(
+        _parse_component(value, f"plan.components[{index}]")
+        for index, value in enumerate(_sequence(plan.get("components"), "plan.components"))
+    )
+    component_ids = [item.global_component_id for item in components]
+    if len(set(component_ids)) != len(components):
+        raise ValueError("duplicate global component ID")
+    if component_ids != list(range(len(components))):
+        raise ValueError("global component IDs must be contiguous and ordered")
+    partitions_by_id = {item.partition_id: item for item in partitions}
+    roles_by_partition: dict[int, set[str]] = {item.partition_id: set() for item in partitions}
+    for component in components:
+        partition = partitions_by_id.get(component.partition_id)
+        if partition is None or (
+            component.partition_name != partition.partition_name
+            or component.arena_name != partition.arena_name
+            or component.tp_rank != partition.tp_rank
+            or component.cache_index != partition.cache_index
+            or component.partition_offset_bytes != partition.offset_bytes
+            or component.partition_slot_bytes != partition.slot_bytes
+            or component.physical_page_bytes != partition.physical_page_bytes
+        ):
+            raise ValueError(
+                f"component {component.global_component_id} has a foreign partition reference"
+            )
+        if component.role in roles_by_partition[partition.partition_id]:
+            raise ValueError("duplicate component role for one partition")
+        roles_by_partition[partition.partition_id].add(component.role)
+    if any(roles != {"k", "v"} for roles in roles_by_partition.values()):
+        raise ValueError("every planned partition requires one complete K/V component pair")
+
+    arena = PlannedArena(
+        name=arena_name,
+        backend=backend,
+        model=expected_model,
+        kv_dtype=kv_dtype,
+        block_size=block_size,
+        tensor_parallel_size=tp_size,
+        partitions=partitions,
+    )
+    return PlannedPool(
+        identity=SharedPoolIdentity(
+            pool_name, _generation(descriptor.get("generation")), arena_name
+        ),
+        planning_version=version,
+        model=model,
+        model_revision=revision,
+        kv_dtype=kv_dtype,
+        block_size=block_size,
+        tensor_parallel_size=tp_size,
+        cpu_bytes_to_use=budget,
+        bytes_per_complete_block=bytes_per_block,
+        logical_block_capacity=capacity,
+        allocated_bytes=allocated,
+        unused_bytes=unused,
+        arena=arena,
+        partitions=partitions,
+        components=components,
+    )
+
+
+def _decode_inline(value: object, field: str) -> Mapping[str, object]:
+    if isinstance(value, Mapping):
+        return _mapping(value, field)
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a JSON object or encoded JSON string")
+    try:
+        return _mapping(json.loads(value), field)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{field} is not valid JSON: {error.msg}") from error
+
+
+def load_planned_pool(
+    extra_config: Mapping[str, object], environ: Mapping[str, str] = os.environ
+) -> PlannedPool:
+    """Load inline protobuf JSON first, then a configured JSON file path."""
+    if "pool_plan" in extra_config:
+        return parse_planned_pool(_decode_inline(extra_config["pool_plan"], "pool_plan"))
+    if "SPYRE_KV_POOL_PLAN" in environ:
+        return parse_planned_pool(
+            _decode_inline(environ["SPYRE_KV_POOL_PLAN"], "SPYRE_KV_POOL_PLAN")
+        )
+    path_value = extra_config.get("pool_plan_path")
+    if path_value is None:
+        path_value = environ.get("SPYRE_KV_POOL_PLAN_PATH")
+    if not isinstance(path_value, str) or not path_value:
+        raise ValueError(
+            "pool_plan or pool_plan_path must be specified in "
+            "kv_connector_extra_config or the Spyre KV pool environment"
+        )
+    path = Path(path_value)
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot load pool_plan_path {path}: {error}") from error
+    return parse_planned_pool(_mapping(value, "pool_plan_path document"))

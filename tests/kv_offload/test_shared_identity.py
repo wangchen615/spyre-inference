@@ -16,7 +16,11 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from spyre_inference.v1.kv_offload.shared_identity import load_shared_pool_identity
+from spyre_inference.v1.kv_offload.shared_identity import (
+    load_shared_pool_configuration,
+    load_shared_pool_identity,
+)
+from tests.kv_offload.test_pool_plan import valid_planned_pool_document
 
 GENERATION_HEX = "11" * 16
 
@@ -130,3 +134,16 @@ def test_identity_is_immutable():
 
     with pytest.raises(FrozenInstanceError):
         identity.pool_name = "replacement"
+
+
+def test_complete_plan_takes_precedence_over_legacy_identity():
+    configuration = load_shared_pool_configuration(
+        {
+            "pool_plan": valid_planned_pool_document(),
+            "pool_name": "legacy-root",
+            "pool_generation": GENERATION_HEX,
+        },
+        environ={},
+    )
+
+    assert configuration.identity.pool_name == "/model-a"

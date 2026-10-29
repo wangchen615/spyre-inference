@@ -102,3 +102,16 @@ def load_shared_pool_identity(
         generation=_generation_bytes(generation),
         data_pool_name=_logical_name(data_pool_name, "data_pool_name"),
     )
+
+
+def load_shared_pool_configuration(
+    extra_config: Mapping[str, object], environ: Mapping[str, str] = os.environ
+):
+    """Prefer a complete plan, retaining the TP1 identity-only fallback."""
+    plan_keys = {"pool_plan", "pool_plan_path"}
+    plan_environment = {"SPYRE_KV_POOL_PLAN", "SPYRE_KV_POOL_PLAN_PATH"}
+    if plan_keys.intersection(extra_config) or plan_environment.intersection(environ):
+        from spyre_inference.v1.kv_offload.pool_plan import load_planned_pool
+
+        return load_planned_pool(extra_config, environ)
+    return load_shared_pool_identity(extra_config, environ)

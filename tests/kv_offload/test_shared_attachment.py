@@ -19,8 +19,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from spyre_inference.v1.kv_offload.shared_attachment import SharedPoolAttachment
+from spyre_inference.v1.kv_offload.pool_plan import parse_planned_pool
+from spyre_inference.v1.kv_offload.shared_attachment import (
+    SharedMetadataAttachment,
+    SharedPoolAttachment,
+)
 from spyre_inference.v1.kv_offload.shared_identity import SharedPoolIdentity
+from tests.kv_offload.test_pool_plan import valid_planned_pool_document
 
 GENERATION = bytes.fromhex("11" * 16)
 IDENTITY = SharedPoolIdentity("root", GENERATION, "host-0")
@@ -198,3 +203,49 @@ def test_finalizer_stays_no_throw_during_module_teardown(fake_runtime, monkeypat
     attachment.__del__()
 
     assert fake_runtime.calls.count(("detach", fake_runtime.metadata)) == 0
+
+
+def test_metadata_attachment_registers_every_partition_without_mapping(fake_runtime):
+    plan = parse_planned_pool(valid_planned_pool_document())
+    registrations = {
+        partition.partition_name: SimpleNamespace(
+            pool_ref=object(),
+            slot_count=partition.num_slots,
+            slot_bytes=partition.slot_bytes,
+        )
+        for partition in plan.partitions
+    }
+    fake_runtime.metadata.find_pool = lambda name: (
+        fake_runtime.calls.append(("find", name)) or registrations.get(name)
+    )
+
+    attachment = SharedMetadataAttachment.attach(plan, lambda: fake_runtime)
+
+    assert set(attachment.registered) == set(registrations)
+    assert all(call[0] != "resolve" for call in fake_runtime.calls)
+    attachment.close()
+
+
+def test_rank_resolver_maps_only_local_partitions(fake_runtime):
+    plan = parse_planned_pool(valid_planned_pool_document())
+    registrations = {
+        partition.partition_name: SimpleNamespace(
+            pool_ref=partition.partition_name,
+            slot_count=partition.num_slots,
+            slot_bytes=partition.slot_bytes,
+        )
+        for partition in plan.partitions
+    }
+    fake_runtime.metadata.find_pool = registrations.get
+    fake_runtime.metadata.resolve_pool = lambda pool_ref: (
+        fake_runtime.calls.append(("resolve", pool_ref)) or f"view:{pool_ref}"
+    )
+    attachment = SharedMetadataAttachment.attach(plan, lambda: fake_runtime)
+
+    resolved = attachment.resolve_rank(1)
+
+    assert [item.partition.tp_rank for item in resolved] == [1]
+    assert [call for call in fake_runtime.calls if call[0] == "resolve"] == [
+        ("resolve", "host-r1-c0")
+    ]
+    attachment.close()
