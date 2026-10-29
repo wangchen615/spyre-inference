@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
@@ -111,6 +112,13 @@ def _tp4_document() -> dict:
                     }
                 )
             offset += 4 * stride
+    canonical_layout = "".join(
+        f"{row['tpRank']}:{row['cacheIndex']}:{row['physicalPageBytes']}:"
+        f"{row['layoutKind']}:{row['layoutVersion']}:{row['localKvHeads']}:"
+        f"{row['headSize']};"
+        for row in rank_caches
+    )
+    layout_signature = hashlib.sha1(canonical_layout.encode()).hexdigest()
     arena = {
         "name": "host-0",
         "backend": "HOST_DRAM",
@@ -119,6 +127,7 @@ def _tp4_document() -> dict:
             "kvDtype": "float16",
             "blockSize": "128",
             "tensorParallelSize": 4,
+            "layoutSignature": layout_signature,
         },
         "partitions": [
             {
@@ -138,13 +147,16 @@ def _tp4_document() -> dict:
         "metadata": {"maxChunks": 1},
         "dataPools": [arena],
     }
+    effective_config = copy.deepcopy(config)
+    effective_config["dataPools"][0]["numSlots"] = str(offset // 4096)
+    effective_config["dataPools"][0]["slotBytes"] = "4096"
     return {
         "code": "OK",
         "poolDescriptor": {
             "name": config["name"],
             "generation": base64.b64encode(GENERATION).decode(),
             "state": "READY",
-            "effectiveConfig": copy.deepcopy(config),
+            "effectiveConfig": effective_config,
         },
         "plan": {
             "normalizedSpec": {

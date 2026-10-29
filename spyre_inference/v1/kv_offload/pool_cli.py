@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -75,6 +77,25 @@ def _arch_for_layer(model_config, layer_index: int):
         return architecture
 
 
+def _shared_layer_targets(model_config, num_layers: int) -> dict[int, int]:
+    text_config = model_config.hf_text_config
+    shared_count = int(getattr(text_config, "num_kv_shared_layers", 0))
+    if shared_count == 0:
+        return {}
+    first_shared = num_layers - shared_count
+    layer_types = tuple(getattr(text_config, "layer_types", ()))
+    if first_shared <= 0 or len(layer_types) != num_layers:
+        raise ValueError("cannot resolve shared KV layers from the model configuration")
+    targets = {}
+    for layer_index in range(first_shared, num_layers):
+        layer_type = layer_types[layer_index]
+        candidates = [index for index in range(first_shared) if layer_types[index] == layer_type]
+        if not candidates:
+            raise ValueError(f"shared KV layer {layer_index} has no physical {layer_type!r} target")
+        targets[layer_index] = candidates[-1]
+    return targets
+
+
 def _default_resolve_inputs(arguments):
     from vllm.engine.arg_utils import EngineArgs
 
@@ -91,6 +112,7 @@ def _default_resolve_inputs(arguments):
     model = config.model_config
     parallel = config.parallel_config
     num_layers = model.get_num_layers(parallel)
+    block_size = int(config.cache_config.block_size)
     dtype = _cache_dtype(arguments.kv_cache_dtype, model.dtype)
     layout_kind = {
         "token_major": "token-major",
@@ -101,12 +123,13 @@ def _default_resolve_inputs(arguments):
 
     specs: dict[str, KVCacheSpec] = {}
     static_context = {}
+    shared_targets = _shared_layer_targets(model, num_layers)
     for layer_index in range(num_layers):
         layer_name = f"layers.{layer_index}"
         architecture = _arch_for_layer(model, layer_index)
         head_size = int(architecture.head_size)
         specs[layer_name] = FullAttentionSpec(
-            block_size=arguments.block_size,
+            block_size=block_size,
             num_kv_heads=model.get_num_kv_heads(parallel, architecture),
             head_size=head_size,
             dtype=dtype,
@@ -116,12 +139,14 @@ def _default_resolve_inputs(arguments):
                 kv_layout_kind=layout_kind,
                 kv_layout_version=1,
             ),
-            kv_sharing_target_layer_name=None,
+            kv_sharing_target_layer_name=(
+                f"layers.{shared_targets[layer_index]}" if layer_index in shared_targets else None
+            ),
         )
 
     layer_names = list(specs)
     group_spec = UniformTypeKVCacheSpecs(
-        block_size=arguments.block_size,
+        block_size=block_size,
         kv_cache_specs=specs,
     )
     kv_cache_config = KVCacheConfig(
@@ -140,7 +165,8 @@ def main(
 ) -> int:
     arguments = _parser().parse_args(argv)
     resolver = resolve_inputs or _default_resolve_inputs
-    vllm_config, kv_cache_config = resolver(arguments)
+    with redirect_stdout(sys.stderr):
+        vllm_config, kv_cache_config = resolver(arguments)
     spec = build_model_pool_spec(
         vllm_config,
         kv_cache_config,

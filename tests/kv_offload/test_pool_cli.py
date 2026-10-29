@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
 )
 
+from spyre_inference.v1.kv_offload import pool_cli
 from spyre_inference.v1.kv_offload.pool_cli import main
 
 
@@ -109,3 +110,74 @@ def test_cli_writes_output_file_without_stdout(tmp_path, capsys):
     assert capsys.readouterr().out == ""
     payload = json.loads(output.read_text())
     assert payload["name"] == "/deployment-a"
+
+
+def test_default_resolver_uses_effective_block_size_and_marks_shared_layers(
+    monkeypatch,
+):
+    text_config = SimpleNamespace(
+        num_kv_shared_layers=2,
+        layer_types=[
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+        ],
+    )
+    model = SimpleNamespace(
+        dtype=torch.float16,
+        hf_text_config=text_config,
+        model_arch_config=SimpleNamespace(head_size=128),
+        get_num_layers=lambda _parallel: 4,
+        get_num_kv_heads=lambda _parallel, _architecture: 4,
+    )
+    config = SimpleNamespace(
+        model_config=model,
+        cache_config=SimpleNamespace(block_size=64),
+        parallel_config=SimpleNamespace(),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+
+    class FakeEngineArgs:
+        def __init__(self, **_kwargs):
+            pass
+
+        def create_engine_config(self, *, headless):
+            assert headless
+            return config
+
+    monkeypatch.setattr("vllm.engine.arg_utils.EngineArgs", FakeEngineArgs)
+    arguments = SimpleNamespace(
+        model="model-a",
+        revision=None,
+        tensor_parallel_size=1,
+        dtype="auto",
+        kv_cache_dtype="auto",
+        block_size=128,
+        trust_remote_code=False,
+    )
+
+    _, kv_cache_config = pool_cli._default_resolve_inputs(arguments)
+
+    group = kv_cache_config.kv_cache_groups[0]
+    assert group.kv_cache_spec.block_size == 64
+    assert (
+        config.compilation_config.static_forward_context["layers.2"].kv_sharing_target_layer_name
+        == "layers.0"
+    )
+    assert (
+        config.compilation_config.static_forward_context["layers.3"].kv_sharing_target_layer_name
+        == "layers.1"
+    )
+
+
+def test_cli_redirects_resolver_output_away_from_machine_json(capsys):
+    def noisy_resolver(arguments):
+        print("resolver diagnostic")
+        return _resolved_inputs(arguments)
+
+    assert main(_arguments(), resolve_inputs=noisy_resolver) == 0
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["name"] == "/deployment-a"
+    assert "resolver diagnostic" in captured.err

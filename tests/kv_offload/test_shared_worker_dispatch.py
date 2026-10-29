@@ -222,11 +222,59 @@ class FakePoolResultCode(Enum):
     OK = auto()
 
 
+class FakePoolBackend(Enum):
+    HOST_DRAM = auto()
+
+
+@dataclass(frozen=True)
+class FakePoolCompatibilityConfig:
+    model: str
+    kv_dtype: str
+    block_size: int
+    tensor_parallel_size: int
+    layout_signature: str
+
+
+@dataclass(frozen=True)
+class FakeDataPartitionConfig:
+    name: str
+    tp_rank: int
+    cache_index: int
+    num_slots: int
+    slot_bytes: int
+    offset_bytes: int
+
+
+@dataclass(frozen=True)
+class FakeDataPoolConfig:
+    name: str
+    backend: FakePoolBackend
+    num_slots: int
+    slot_bytes: int
+    partitions: list[FakeDataPartitionConfig]
+    compatibility: FakePoolCompatibilityConfig
+
+
+@dataclass(frozen=True)
+class FakeMetadataConfig:
+    max_chunks: int
+
+
+@dataclass(frozen=True)
+class FakePoolConfig:
+    name: str
+    metadata: FakeMetadataConfig
+    data_pools: list[FakeDataPoolConfig]
+
+
 def _runtime(directory, addresses, events):
     class FakeSharedPool:
         @staticmethod
-        def attach_pool(name, generation):
-            directory.attach_calls.append((name, generation))
+        def attach_pool(name, generation, expected_config=None):
+            call = (name, generation)
+            if expected_config is not None:
+                call += (expected_config,)
+            directory.attach_calls.append(call)
             directory.configure_geometry()
             return SimpleNamespace(
                 code=FakePoolResultCode.OK,
@@ -267,6 +315,12 @@ def _runtime(directory, addresses, events):
         SharedPool=FakeSharedPool,
         PoolResultCode=FakePoolResultCode,
         ChunkDescriptorEntry=FakeChunkDescriptorEntry,
+        PoolBackend=FakePoolBackend,
+        PoolCompatibility=FakePoolCompatibilityConfig,
+        SharedDataPartitionConfig=FakeDataPartitionConfig,
+        SharedDataPoolConfig=FakeDataPoolConfig,
+        MetadataConfig=FakeMetadataConfig,
+        PoolConfig=FakePoolConfig,
         copy_kv_page_raw=copy_kv_page_raw,
         get_composite_address=lambda tensor: addresses[tensor.name],
     )

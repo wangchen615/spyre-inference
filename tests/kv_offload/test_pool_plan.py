@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import json
 from dataclasses import FrozenInstanceError
 
@@ -43,6 +44,14 @@ def valid_planned_pool_document() -> dict:
         }
         for rank in range(2)
     ]
+    layout_signature = hashlib.sha1(
+        "".join(
+            f"{row['tpRank']}:{row['cacheIndex']}:{row['physicalPageBytes']}:"
+            f"{row['layoutKind']}:{row['layoutVersion']}:{row['localKvHeads']}:"
+            f"{row['headSize']};"
+            for row in rank_caches
+        ).encode()
+    ).hexdigest()
     partitions = [
         {
             "partitionId": str(rank),
@@ -93,6 +102,7 @@ def valid_planned_pool_document() -> dict:
             "kvDtype": "float16",
             "blockSize": "16",
             "tensorParallelSize": 2,
+            "layoutSignature": layout_signature,
         },
         "partitions": [
             {
@@ -111,13 +121,16 @@ def valid_planned_pool_document() -> dict:
         "metadata": {"maxChunks": 1},
         "dataPools": [arena],
     }
+    effective_config = copy.deepcopy(config)
+    effective_config["dataPools"][0]["numSlots"] = "8"
+    effective_config["dataPools"][0]["slotBytes"] = "4096"
     return {
         "code": "OK",
         "poolDescriptor": {
             "name": "/model-a",
             "generation": base64.b64encode(GENERATION).decode(),
             "state": "READY",
-            "effectiveConfig": copy.deepcopy(config),
+            "effectiveConfig": effective_config,
         },
         "plan": {
             "normalizedSpec": model_spec,
@@ -187,6 +200,18 @@ def test_environment_path_is_used_when_inline_is_absent(tmp_path):
     plan = load_planned_pool({}, environ={"SPYRE_KV_POOL_PLAN_PATH": str(path)})
 
     assert plan.arena.name == "host-0"
+
+
+def test_explicit_path_wins_over_environment_inline(tmp_path):
+    path = tmp_path / "plan.json"
+    path.write_text(json.dumps(valid_planned_pool_document()))
+
+    plan = load_planned_pool(
+        {"pool_plan_path": str(path)},
+        environ={"SPYRE_KV_POOL_PLAN": "not json"},
+    )
+
+    assert plan.identity.pool_name == "/model-a"
 
 
 def _mutate(path, value):
@@ -318,4 +343,65 @@ def test_descriptor_effective_geometry_must_equal_plan():
     document["poolDescriptor"]["effectiveConfig"]["dataPools"][0]["partitions"][0]["numSlots"] = "8"
 
     with pytest.raises(ValueError, match="effective.*config"):
+        parse_planned_pool(document)
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "match"),
+    [
+        (("plan", "normalizedSpec", "cpuBytesToUse"), str(1 << 64), "uint64"),
+        (("plan", "normalizedSpec", "rankCaches", 0, "layoutVersion"), 2, "layout"),
+        (("plan", "normalizedSpec", "rankCaches", 0, "layoutKind"), "other", "layout"),
+    ],
+)
+def test_parser_rejects_out_of_range_and_unsupported_layout_facts(path, value, match):
+    with pytest.raises(ValueError, match=match):
+        parse_planned_pool(_mutate(path, value))
+
+
+def test_parser_requires_page_aligned_maximal_geometry():
+    unaligned = valid_planned_pool_document()
+    unaligned["plan"]["partitions"][0]["slotBytes"] = "3000"
+    unaligned["plan"]["config"]["dataPools"][0]["partitions"][0]["slotBytes"] = "3000"
+    unaligned["poolDescriptor"]["effectiveConfig"]["dataPools"][0]["partitions"][0]["slotBytes"] = (
+        "3000"
+    )
+    with pytest.raises(ValueError, match="aligned"):
+        parse_planned_pool(unaligned)
+
+    nonmaximal = valid_planned_pool_document()
+    nonmaximal["plan"]["normalizedSpec"]["cpuBytesToUse"] = "49152"
+    nonmaximal["plan"]["unusedBytes"] = "16384"
+    with pytest.raises(ValueError, match="maximal"):
+        parse_planned_pool(nonmaximal)
+
+
+def test_parser_requires_deterministic_partition_names_and_component_order():
+    renamed = valid_planned_pool_document()
+    for location in (
+        renamed["plan"]["partitions"],
+        renamed["plan"]["config"]["dataPools"][0]["partitions"],
+        renamed["poolDescriptor"]["effectiveConfig"]["dataPools"][0]["partitions"],
+    ):
+        location[0]["partitionName" if "partitionName" in location[0] else "name"] = "other"
+    for component in renamed["plan"]["components"][:2]:
+        component["partitionName"] = "other"
+    with pytest.raises(ValueError, match="name"):
+        parse_planned_pool(renamed)
+
+    reordered = valid_planned_pool_document()
+    reordered["plan"]["components"][0]["role"] = "COMPONENT_ROLE_V"
+    reordered["plan"]["components"][1]["role"] = "COMPONENT_ROLE_K"
+    with pytest.raises(ValueError, match="order"):
+        parse_planned_pool(reordered)
+
+
+def test_parser_requires_layout_signature():
+    document = valid_planned_pool_document()
+    del document["plan"]["config"]["dataPools"][0]["compatibility"]["layoutSignature"]
+    del document["poolDescriptor"]["effectiveConfig"]["dataPools"][0]["compatibility"][
+        "layoutSignature"
+    ]
+
+    with pytest.raises(ValueError, match="layout signature"):
         parse_planned_pool(document)

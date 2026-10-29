@@ -17,13 +17,18 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import NamedTuple
 from unittest.mock import MagicMock
 
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+    OffloadingConnector,
+)
 from vllm.v1.kv_offload.base import ReqContext, make_offload_key
 
+from spyre_inference.v1.kv_offload.connector import SpyreOffloadingConnector
 from spyre_inference.v1.kv_offload.shared_identity import SharedPoolIdentity
 from spyre_inference.v1.kv_offload.shared_manager import (
     SpyreSharedOffloadingManager,
@@ -120,3 +125,23 @@ def test_zero_external_tokens_do_not_create_an_h2d_job():
     assert result is None
     assert scheduler._current_batch_load_jobs == {}
     assert scheduler._jobs == {}
+
+
+def test_external_launcher_scheduler_counts_one_completion_per_engine(monkeypatch):
+    class SchedulerConfig(NamedTuple):
+        num_workers: int
+
+    scheduler = SimpleNamespace(config=SchedulerConfig(num_workers=4))
+
+    def fake_init(connector, *_args):
+        connector.connector_scheduler = scheduler
+        connector.connector_worker = None
+
+    monkeypatch.setattr(OffloadingConnector, "__init__", fake_init)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(distributed_executor_backend="external_launcher")
+    )
+
+    SpyreOffloadingConnector(config, object(), object())
+
+    assert scheduler.config.num_workers == 1

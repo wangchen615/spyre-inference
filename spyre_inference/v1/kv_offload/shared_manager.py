@@ -91,6 +91,7 @@ class SpyreSharedOffloadingManager(OffloadingManager):
         identity: SharedPoolIdentity | None = None,
         component_count: int | None = None,
         max_pool_slots: int | None = None,
+        tp_rank: int | None = None,
     ) -> None:
         if plan is None:
             if identity is None or component_count is None or max_pool_slots is None:
@@ -100,6 +101,15 @@ class SpyreSharedOffloadingManager(OffloadingManager):
             if component_count <= 0 or max_pool_slots <= 0:
                 raise ValueError("legacy component geometry must be positive")
         self._plan = plan
+        if (
+            plan is not None
+            and tp_rank is not None
+            and not 0 <= tp_rank < plan.tensor_parallel_size
+        ):
+            raise ValueError(
+                f"tensor-parallel rank {tp_rank} is outside [0, {plan.tensor_parallel_size})"
+            )
+        self._tp_rank = tp_rank
         self._identity = plan.identity if plan is not None else identity
         if plan is not None:
             self._component_count = len(plan.components)
@@ -118,6 +128,7 @@ class SpyreSharedOffloadingManager(OffloadingManager):
         self._directory = None
         self._registered = None
         self._component_routes: tuple[_ComponentRoute, ...] = ()
+        self._store_routes: tuple[_ComponentRoute, ...] = ()
         self._local_manager: CPUOffloadingManager | None = None
         self._local_keys: set[OffloadKey] = set()
         self._owned_entries: dict[OffloadKey, tuple[object, ...]] = {}
@@ -140,6 +151,7 @@ class SpyreSharedOffloadingManager(OffloadingManager):
                     _ComponentRoute(component_id, registered)
                     for component_id in range(self._component_count)
                 )
+                store_routes = routes
                 slot_count = int(registered.slot_count)
                 if (
                     slot_count <= 0
@@ -163,6 +175,15 @@ class SpyreSharedOffloadingManager(OffloadingManager):
                     )
                     for component in self._plan.components
                 )
+                store_routes = (
+                    routes
+                    if self._tp_rank is None
+                    else tuple(
+                        route
+                        for route in routes
+                        if self._plan.components[route.component_id].tp_rank == self._tp_rank
+                    )
+                )
                 registered = routes[0].registered
                 policy_capacity = self._plan.logical_block_capacity
             directory = attachment.metadata
@@ -184,6 +205,7 @@ class SpyreSharedOffloadingManager(OffloadingManager):
             self._directory = directory
             self._registered = registered
             self._component_routes = routes
+            self._store_routes = store_routes
             self._local_manager = local_manager
 
         directory = self._directory
@@ -362,7 +384,8 @@ class SpyreSharedOffloadingManager(OffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
-        directory, routes, runtime, local_manager = self._ensure_directory()
+        directory, _, runtime, local_manager = self._ensure_directory()
+        routes = self._store_routes
         upstream = local_manager.prepare_store(keys, req_context)
         if upstream is None:
             return None
@@ -450,7 +473,8 @@ class SpyreSharedOffloadingManager(OffloadingManager):
         req_context: ReqContext,
         success: bool = True,
     ) -> None:
-        directory, routes, runtime, local_manager = self._ensure_directory()
+        directory, _, runtime, local_manager = self._ensure_directory()
+        routes = self._store_routes
         keys = tuple(keys)
         if not success:
             for key in keys:
@@ -540,5 +564,6 @@ class SpyreSharedOffloadingManager(OffloadingManager):
         self._directory = None
         self._registered = None
         self._component_routes = ()
+        self._store_routes = ()
         self._local_manager = None
         self._runtime = None

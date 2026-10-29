@@ -176,8 +176,10 @@ class SpyreSharedOffloadingSpec(SpyreOffloadingSpec):
         )
 
         if self.shared_pool_plan is not None:
+            tp_rank = self.config.parallel.rank % self.config.parallel.tp_size
             return SpyreSharedOffloadingManager(
                 plan=self.shared_pool_plan,
+                tp_rank=tp_rank,
                 cache_policy=self.eviction_policy,
                 cache_policy_module_path=self.cache_policy_module_path,
                 enable_events=self.kv_events_config.enable_kv_cache_events,

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import mmap
 import sys
 import time
 import urllib.error
@@ -91,6 +92,65 @@ class PreparedDemoPool:
     descriptor: dict[str, Any]
 
 
+def _json_uint(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError
+    result = int(value)
+    if result < 0:
+        raise ValueError
+    return result
+
+
+def _matches_effective_demo_config(requested: dict[str, Any], effective: object) -> bool:
+    if effective == requested:
+        return True
+    try:
+        if not isinstance(effective, dict):
+            return False
+        requested_child = requested["dataPools"][0]
+        effective_children = effective["dataPools"]
+        if len(requested["dataPools"]) != 1 or len(effective_children) != 1:
+            return False
+        effective_child = effective_children[0]
+        partitions = effective_child["partitions"]
+        if len(partitions) != 1:
+            return False
+        partition = partitions[0]
+        requested_slots = _json_uint(requested_child["numSlots"])
+        requested_stride = _json_uint(requested_child["slotBytes"])
+        effective_stride = ((requested_stride + mmap.PAGESIZE - 1) // mmap.PAGESIZE) * mmap.PAGESIZE
+        total_bytes = requested_slots * effective_stride
+        requested_compatibility = requested_child["compatibility"]
+        effective_compatibility = effective_child["compatibility"]
+        compatibility_fields = (
+            "model",
+            "kvDtype",
+            "blockSize",
+            "tensorParallelSize",
+        )
+        return (
+            effective["name"] == requested["name"]
+            and effective["metadata"] == requested["metadata"]
+            and effective_child["name"] == requested_child["name"]
+            and effective_child["backend"] == requested_child["backend"]
+            and all(
+                effective_compatibility.get(field) == requested_compatibility.get(field)
+                for field in compatibility_fields
+            )
+            and effective_compatibility.get("layoutSignature", "") == ""
+            and _json_uint(effective_child["numSlots"]) == total_bytes // mmap.PAGESIZE
+            and _json_uint(effective_child["slotBytes"]) == mmap.PAGESIZE
+            and partition["name"] == requested_child["name"]
+            and _json_uint(partition["tpRank"]) == 0
+            and _json_uint(partition["cacheIndex"]) == 0
+            and _json_uint(partition["numSlots"]) == requested_slots
+            and _json_uint(partition["slotBytes"]) == effective_stride
+            and _json_uint(partition["offsetBytes"]) == 0
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def prepare_demo_pool(
     *,
     ctl: Any,
@@ -149,7 +209,7 @@ def prepare_demo_pool(
         raise RuntimeError(
             f"shared pool descriptor name {descriptor_name!r} disagrees with {pool_name!r}"
         )
-    if descriptor.get("effectiveConfig") != config:
+    if not _matches_effective_demo_config(config, descriptor.get("effectiveConfig")):
         raise RuntimeError(
             "shared pool descriptor effective configuration disagrees with the demo request"
         )

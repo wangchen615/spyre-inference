@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum, auto
 from types import SimpleNamespace
 
@@ -40,6 +41,51 @@ class _Code(Enum):
     STALE_GENERATION = auto()
     CONFIGURATION_MISMATCH = auto()
     RESOURCE_ERROR = auto()
+
+
+class _Backend(Enum):
+    HOST_DRAM = auto()
+
+
+@dataclass(frozen=True)
+class _Compatibility:
+    model: str
+    kv_dtype: str
+    block_size: int
+    tensor_parallel_size: int
+    layout_signature: str
+
+
+@dataclass(frozen=True)
+class _PartitionConfig:
+    name: str
+    tp_rank: int
+    cache_index: int
+    num_slots: int
+    slot_bytes: int
+    offset_bytes: int
+
+
+@dataclass(frozen=True)
+class _ArenaConfig:
+    name: str
+    backend: _Backend
+    num_slots: int
+    slot_bytes: int
+    partitions: list[_PartitionConfig]
+    compatibility: _Compatibility
+
+
+@dataclass(frozen=True)
+class _MetadataConfig:
+    max_chunks: int
+
+
+@dataclass(frozen=True)
+class _PoolConfig:
+    name: str
+    metadata: _MetadataConfig
+    data_pools: list[_ArenaConfig]
 
 
 @pytest.fixture
@@ -75,8 +121,11 @@ def fake_runtime():
 
     class FakeSharedPool:
         @staticmethod
-        def attach_pool(name, generation):
-            calls.append(("attach", name, generation))
+        def attach_pool(name, generation, expected_config=None):
+            call = ("attach", name, generation)
+            if expected_config is not None:
+                call += (expected_config,)
+            calls.append(call)
             return SimpleNamespace(
                 code=state.attach_code,
                 metadata=state.attach_metadata,
@@ -107,6 +156,12 @@ def fake_runtime():
         metadata=metadata,
         registered=registered,
         data_pool=data_pool,
+        PoolBackend=_Backend,
+        PoolCompatibility=_Compatibility,
+        SharedDataPartitionConfig=_PartitionConfig,
+        SharedDataPoolConfig=_ArenaConfig,
+        MetadataConfig=_MetadataConfig,
+        PoolConfig=_PoolConfig,
     )
 
 
@@ -222,6 +277,10 @@ def test_metadata_attachment_registers_every_partition_without_mapping(fake_runt
     attachment = SharedMetadataAttachment.attach(plan, lambda: fake_runtime)
 
     assert set(attachment.registered) == set(registrations)
+    expected_config = fake_runtime.calls[0][3]
+    assert expected_config.name == plan.identity.pool_name
+    assert expected_config.data_pools[0].num_slots == plan.arena.num_slots
+    assert expected_config.data_pools[0].partitions[0].offset_bytes == 0
     assert all(call[0] != "resolve" for call in fake_runtime.calls)
     attachment.close()
 

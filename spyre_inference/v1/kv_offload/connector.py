@@ -364,6 +364,13 @@ class SpyreOffloadingConnector(OffloadingConnector):
         kv_cache_config: KVCacheConfig,
     ):
         super().__init__(vllm_config, role, kv_cache_config)
+        if (
+            self.connector_scheduler is not None
+            and vllm_config.parallel_config.distributed_executor_backend == "external_launcher"
+        ):
+            self.connector_scheduler.config = self.connector_scheduler.config._replace(
+                num_workers=1
+            )
         if self.connector_worker is not None:
             self.connector_worker = SpyreOffloadingConnectorWorker(
                 self.connector_worker.spec,

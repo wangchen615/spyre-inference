@@ -102,6 +102,53 @@ def test_prepare_pool_command_emits_one_identity_for_both_instances(capsys):
     assert json.loads(capsys.readouterr().out) == result
 
 
+def test_prepare_pool_accepts_canonical_effective_partition_geometry(capsys):
+    class Ctl:
+        def create(self, config):
+            child = config["dataPools"][0]
+            return {
+                "result": "OK",
+                "descriptor": {
+                    "name": config["name"],
+                    "generation": "ab" * 16,
+                    "state": "READY",
+                    "effectiveConfig": {
+                        "name": config["name"],
+                        "metadata": config["metadata"],
+                        "dataPools": [
+                            {
+                                **child,
+                                "numSlots": "2",
+                                "slotBytes": "4096",
+                                "partitions": [
+                                    {
+                                        "name": child["name"],
+                                        "tpRank": 0,
+                                        "cacheIndex": 0,
+                                        "numSlots": "2",
+                                        "slotBytes": "4096",
+                                        "offsetBytes": "0",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                },
+            }
+
+    result = demo.prepare_pool_command(
+        ctl=Ctl(),
+        pool_name="/canonical-root",
+        data_pool_name="host-0",
+        model="model",
+        cpu_bytes_to_use=8192,
+        slot_bytes=4096,
+    )
+
+    assert result["poolName"] == "/canonical-root"
+    assert json.loads(capsys.readouterr().out) == result
+
+
 def test_prepare_model_pool_passes_complete_plan_to_both_instances(capsys):
     document = valid_planned_pool_document()
     spec = document["plan"]["normalizedSpec"]

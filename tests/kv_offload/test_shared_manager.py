@@ -223,11 +223,56 @@ class _Code(Enum):
     OK = auto()
 
 
+class FakePoolBackend(Enum):
+    HOST_DRAM = auto()
+
+
+@dataclass(frozen=True)
+class FakePoolCompatibilityConfig:
+    model: str
+    kv_dtype: str
+    block_size: int
+    tensor_parallel_size: int
+    layout_signature: str
+
+
+@dataclass(frozen=True)
+class FakeDataPartitionConfig:
+    name: str
+    tp_rank: int
+    cache_index: int
+    num_slots: int
+    slot_bytes: int
+    offset_bytes: int
+
+
+@dataclass(frozen=True)
+class FakeDataPoolConfig:
+    name: str
+    backend: FakePoolBackend
+    num_slots: int
+    slot_bytes: int
+    partitions: list[FakeDataPartitionConfig]
+    compatibility: FakePoolCompatibilityConfig
+
+
+@dataclass(frozen=True)
+class FakePoolMetadataConfig:
+    max_chunks: int
+
+
+@dataclass(frozen=True)
+class FakePoolConfig:
+    name: str
+    metadata: FakePoolMetadataConfig
+    data_pools: list[FakeDataPoolConfig]
+
+
 def _runtime(directory: FakeDirectory):
     class FakeSharedPool:
         @staticmethod
-        def attach_pool(name, generation):
-            directory.attach_calls.append(("attach", name, generation))
+        def attach_pool(name, generation, expected_config=None):
+            directory.attach_calls.append(("attach", name, generation, expected_config))
             return SimpleNamespace(code=_Code.OK, metadata=directory, detail="")
 
         @staticmethod
@@ -256,6 +301,12 @@ def _runtime(directory: FakeDirectory):
         ExistingClaim=FakeExistingClaim,
         NoSpace=FakeNoSpace,
         Unavailable=FakeUnavailable,
+        PoolBackend=FakePoolBackend,
+        PoolCompatibility=FakePoolCompatibilityConfig,
+        SharedDataPartitionConfig=FakeDataPartitionConfig,
+        SharedDataPoolConfig=FakeDataPoolConfig,
+        MetadataConfig=FakePoolMetadataConfig,
+        PoolConfig=FakePoolConfig,
     )
 
 
@@ -287,9 +338,8 @@ def _manager_directory_runtime(
     return manager, directory, runtime
 
 
-def _tp4_plan() -> PlannedPool:
+def _tp_plan(cache_counts: tuple[int, ...]) -> PlannedPool:
     identity = SharedPoolIdentity("shared-root", GENERATION, "host-0")
-    cache_counts = (1, 2, 1, 3)
     partitions = []
     components = []
     offset = 0
@@ -331,7 +381,7 @@ def _tp4_plan() -> PlannedPool:
         model_revision="rev-a",
         kv_dtype="float16",
         block_size=128,
-        tensor_parallel_size=4,
+        tensor_parallel_size=len(cache_counts),
         cpu_bytes_to_use=offset,
         bytes_per_complete_block=2 * 4096 * len(partitions),
         logical_block_capacity=2,
@@ -343,30 +393,40 @@ def _tp4_plan() -> PlannedPool:
             model="model-a@rev-a",
             kv_dtype="float16",
             block_size=128,
-            tensor_parallel_size=4,
+            tensor_parallel_size=len(cache_counts),
             partitions=partition_tuple,
+            num_slots=offset // 4096,
+            slot_bytes=4096,
+            layout_signature="ab" * 20,
         ),
         partitions=partition_tuple,
         components=tuple(components),
+        metadata_max_chunks=1,
     )
 
 
-def _global_manager_directory_runtime():
-    plan = _tp4_plan()
-    registrations = {
-        partition.partition_name: FakeRegisteredPool(
-            partition.partition_name,
-            FakePoolRef(1, 100 + partition.partition_id, 1),
-            FakeCompatibility(2, 1000 + partition.partition_id),
-            slot_count=partition.num_slots,
-            slot_bytes=partition.slot_bytes,
-        )
-        for partition in plan.partitions
-    }
-    directory = FakeDirectory(registrations)
-    runtime = _runtime(directory)
+def _tp4_plan() -> PlannedPool:
+    return _tp_plan((1, 2, 1, 3))
+
+
+def _global_manager_directory_runtime(*, plan=None, tp_rank=None, directory=None, runtime=None):
+    plan = plan or _tp4_plan()
+    if directory is None:
+        registrations = {
+            partition.partition_name: FakeRegisteredPool(
+                partition.partition_name,
+                FakePoolRef(1, 100 + partition.partition_id, 1),
+                FakeCompatibility(2, 1000 + partition.partition_id),
+                slot_count=partition.num_slots,
+                slot_bytes=partition.slot_bytes,
+            )
+            for partition in plan.partitions
+        }
+        directory = FakeDirectory(registrations)
+    runtime = runtime or _runtime(directory)
     manager = SpyreSharedOffloadingManager(
         plan=plan,
+        tp_rank=tp_rank,
         cache_policy="lru",
         cache_policy_module_path=None,
         enable_events=False,
@@ -425,7 +485,7 @@ def test_directory_attach_lazily_sizes_policy_from_registered_pool(
 
     assert manager.lookup(OFFLOAD_KEY, ReqContext("request-1")) is LookupResult.MISS
 
-    assert directory.attach_calls == [("attach", "shared-root", GENERATION)]
+    assert directory.attach_calls == [("attach", "shared-root", GENERATION, None)]
     assert manager._local_manager is not None
     assert manager._local_manager._num_chunks == 2
 
@@ -894,6 +954,45 @@ def test_tp4_store_claims_every_component_in_its_planned_partition_with_tokens()
         directory.registrations[component.partition_name].pool_ref for component in plan.components
     ]
     assert manager._local_manager._num_chunks == plan.logical_block_capacity
+    expected_config = directory.attach_calls[0][3]
+    assert expected_config.name == plan.identity.pool_name
+    assert expected_config.data_pools[0].num_slots == plan.arena.num_slots
+    assert expected_config.data_pools[0].compatibility.layout_signature == (
+        plan.arena.layout_signature
+    )
+
+
+def test_rank_local_stores_require_all_ranks_before_global_lookup_hits():
+    plan = _tp_plan((1, 1))
+    rank0, directory, runtime, _ = _global_manager_directory_runtime(plan=plan, tp_rank=0)
+    rank1, _, _, _ = _global_manager_directory_runtime(
+        plan=plan,
+        tp_rank=1,
+        directory=directory,
+        runtime=runtime,
+    )
+
+    rank0_context = ReqContext("rank-0-store")
+    rank0_store = rank0.prepare_store([OFFLOAD_KEY], rank0_context)
+    assert rank0_store is not None
+    assert [page.component_id for page in rank0_store.store_spec.transfers[0].pages] == [
+        0,
+        1,
+    ]
+    _publish_store(directory, rank0_store)
+    rank0.complete_store(rank0_store.keys_to_store, rank0_context)
+    assert rank0.lookup(OFFLOAD_KEY, ReqContext("partial-load")) is LookupResult.MISS
+
+    rank1_context = ReqContext("rank-1-store")
+    rank1_store = rank1.prepare_store([OFFLOAD_KEY], rank1_context)
+    assert rank1_store is not None
+    assert [page.component_id for page in rank1_store.store_spec.transfers[0].pages] == [
+        2,
+        3,
+    ]
+    _publish_store(directory, rank1_store)
+    rank1.complete_store(rank1_store.keys_to_store, rank1_context)
+    assert rank0.lookup(OFFLOAD_KEY, ReqContext("complete-load")) is LookupResult.HIT
 
 
 @pytest.mark.parametrize("missing_component", [0, 1, 4, 8, 13])

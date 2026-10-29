@@ -129,6 +129,18 @@ def _start_delegator(root: Path) -> tuple[subprocess.Popen[str], SharedPoolCtl]:
     raise RuntimeError("shared-pool-delegator did not become ready")
 
 
+def _stop_process(process: subprocess.Popen[str] | None) -> None:
+    if process is None:
+        return
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
@@ -177,6 +189,25 @@ def test_torchrun_worker_uses_module_import_root() -> None:
 
     assert command[command.index("--module") + 1] == "tests.kv_offload.test_shared_tp_hw"
     assert command[command.index("--nproc-per-node") + 1] == "4"
+
+
+def test_stop_process_terminates_live_child_and_reaps() -> None:
+    calls = []
+
+    class Process:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            calls.append("terminate")
+
+        def wait(self, timeout):
+            calls.append(("wait", timeout))
+            return 0
+
+    _stop_process(Process())
+
+    assert calls == ["terminate", ("wait", 10)]
 
 
 def _physical_cache(local_rank: int) -> tuple[object, SpyrePhysicalCaches]:
@@ -338,6 +369,7 @@ def test_torchrun_tp_shared_pool_round_trip(tmp_path: Path) -> None:
     pool_name = f"/spyre-tp-hw-{os.getpid()}-{uuid.uuid4().hex}"
     plan_path = tmp_path / "planned-pool.json"
     manager_a = manager_b = None
+    store_process = peer_process = None
     generation = None
     try:
         page_bytes = planned_page_bytes(torch.float16, BLOCK_SIZE, LOCAL_KV_HEADS, HEAD_SIZE)
@@ -445,14 +477,21 @@ def test_torchrun_tp_shared_pool_round_trip(tmp_path: Path) -> None:
         }
         print(f"SPYRE_SHARED_KV_TP_RESULT={json.dumps(evidence, sort_keys=True)}")
     finally:
-        if manager_b is not None:
-            manager_b.shutdown()
-        if manager_a is not None:
-            manager_a.shutdown()
-        if generation is not None:
-            cleanup_pool(pool_name, generation, ctl=ctl)
-        process.terminate()
-        process.wait(timeout=10)
+        _stop_process(peer_process)
+        _stop_process(store_process)
+        try:
+            if manager_b is not None:
+                manager_b.shutdown()
+        finally:
+            try:
+                if manager_a is not None:
+                    manager_a.shutdown()
+            finally:
+                try:
+                    if generation is not None:
+                        cleanup_pool(pool_name, generation, ctl=ctl)
+                finally:
+                    _stop_process(process)
 
 
 @pytest.mark.uses_subprocess
@@ -511,20 +550,21 @@ def test_large_partitioned_arena_preserves_64_bit_offsets_and_edge_slots(
             _C.copy_tensor_raw(destination, pool, slot, True)
             assert torch.equal(source.cpu(), destination.cpu())
     finally:
-        pools.clear()
-        pool = None
-        registered = None
-        if metadata is not None:
-            from torch_spyre import _C
+        try:
+            pools.clear()
+            pool = None
+            registered = None
+            if metadata is not None:
+                from torch_spyre import _C
 
-            _C.SharedPool.detach_pool(metadata)
-        metadata = None
-        attached = None
-        gc.collect()
-        if generation is not None:
-            cleanup_pool(pool_name, generation, ctl=ctl)
-        process.terminate()
-        process.wait(timeout=10)
+                _C.SharedPool.detach_pool(metadata)
+            metadata = None
+            attached = None
+            gc.collect()
+            if generation is not None:
+                cleanup_pool(pool_name, generation, ctl=ctl)
+        finally:
+            _stop_process(process)
 
 
 def _parse_rank_args() -> argparse.Namespace:

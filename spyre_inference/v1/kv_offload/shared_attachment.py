@@ -46,6 +46,40 @@ class ResolvedPartition:
     data_pool: Any
 
 
+def _expected_native_config(runtime: Any, plan: PlannedPool) -> Any:
+    compatibility = runtime.PoolCompatibility(
+        plan.arena.model,
+        plan.arena.kv_dtype,
+        plan.arena.block_size,
+        plan.arena.tensor_parallel_size,
+        plan.arena.layout_signature,
+    )
+    partitions = [
+        runtime.SharedDataPartitionConfig(
+            partition.partition_name,
+            partition.tp_rank,
+            partition.cache_index,
+            partition.num_slots,
+            partition.slot_bytes,
+            partition.offset_bytes,
+        )
+        for partition in plan.partitions
+    ]
+    arena = runtime.SharedDataPoolConfig(
+        plan.arena.name,
+        runtime.PoolBackend.HOST_DRAM,
+        plan.arena.num_slots,
+        plan.arena.slot_bytes,
+        partitions,
+        compatibility,
+    )
+    return runtime.PoolConfig(
+        plan.identity.pool_name,
+        runtime.MetadataConfig(plan.metadata_max_chunks),
+        [arena],
+    )
+
+
 class SharedMetadataAttachment:
     """Own one root lock lease while leaving data arena views unresolved."""
 
@@ -79,7 +113,14 @@ class SharedMetadataAttachment:
         runtime_loader: Callable[[], Any],
     ) -> SharedMetadataAttachment:
         runtime = runtime_loader()
-        result = runtime.SharedPool.attach_pool(identity.pool_name, identity.generation)
+        if plan is None:
+            result = runtime.SharedPool.attach_pool(identity.pool_name, identity.generation)
+        else:
+            result = runtime.SharedPool.attach_pool(
+                identity.pool_name,
+                identity.generation,
+                _expected_native_config(runtime, plan),
+            )
         if result.code is not runtime.PoolResultCode.OK or result.metadata is None:
             message = _attach_error(identity.pool_name, result)
             if result.code is runtime.PoolResultCode.OK and result.metadata is None:
