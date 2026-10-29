@@ -25,6 +25,12 @@ import pytest
 from vllm.v1.kv_offload.base import CacheHitSource, LookupResult, ReqContext, make_offload_key
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
+from spyre_inference.v1.kv_offload.pool_plan import (
+    PlannedArena,
+    PlannedComponent,
+    PlannedPartition,
+    PlannedPool,
+)
 from spyre_inference.v1.kv_offload.shared_identity import SharedPoolIdentity
 from spyre_inference.v1.kv_offload.shared_manager import SpyreSharedOffloadingManager
 from spyre_inference.v1.kv_offload.shared_types import shared_page_hash
@@ -101,6 +107,16 @@ class FakeReservation:
     key: FakeCompatibleBlockKey
     slot: FakeSlotRef
 
+    @property
+    def token(self):
+        return FakeReservationToken(self.key, self.slot)
+
+
+@dataclass(frozen=True)
+class FakeReservationToken:
+    key: FakeCompatibleBlockKey
+    slot: FakeSlotRef
+
 
 @dataclass(frozen=True)
 class FakeExistingClaim:
@@ -131,8 +147,12 @@ class FakeMetadataConfig:
 
 
 class FakeDirectory:
-    def __init__(self, registered: FakeRegisteredPool):
-        self.registered = registered
+    def __init__(self, registered: FakeRegisteredPool | dict[str, FakeRegisteredPool]):
+        registrations = (
+            registered if isinstance(registered, dict) else {registered.name: registered}
+        )
+        self.registrations = registrations
+        self.registered = next(iter(registrations.values()))
         self.attach_calls = []
         self.lookup_calls = []
         self.entries: dict[int, FakeLookupEntry] = {}
@@ -147,10 +167,14 @@ class FakeDirectory:
         self.data_pool = object()
 
     def find_pool(self, name):
-        return self.registered if name == self.registered.name else None
+        return self.registrations.get(name)
 
     def resolve_pool(self, pool_ref):
-        return self.data_pool if pool_ref == self.registered.pool_ref else None
+        return (
+            self.data_pool
+            if any(row.pool_ref == pool_ref for row in self.registrations.values())
+            else None
+        )
 
     def lookup(self, key):
         self.lookup_calls.append(key)
@@ -174,13 +198,17 @@ class FakeDirectory:
         return outcome
 
     def publish(self, reservation, chunks=()):
-        self.live_reservations.remove(reservation)
+        live = next(item for item in self.live_reservations if item.token == reservation)
+        self.live_reservations.remove(live)
         entry = FakeLookupEntry(reservation.key, reservation.slot, tuple(chunks))
         self.entries[reservation.key.block_hash] = entry
         return entry
 
     def abort(self, reservation):
-        self.live_reservations.remove(reservation)
+        live = next((item for item in self.live_reservations if item.token == reservation), None)
+        if live is None:
+            raise RuntimeError("reservation token is no longer live")
+        self.live_reservations.remove(live)
         self.aborted.append(reservation)
 
     def evict(self, entry):
@@ -224,6 +252,7 @@ def _runtime(directory: FakeDirectory):
         PoolResultCode=_Code,
         CompatibleBlockKey=FakeCompatibleBlockKey,
         Reservation=FakeReservation,
+        ReservationToken=FakeReservationToken,
         ExistingClaim=FakeExistingClaim,
         NoSpace=FakeNoSpace,
         Unavailable=FakeUnavailable,
@@ -256,6 +285,96 @@ def _manager_directory_runtime(
         runtime_loader=lambda: runtime,
     )
     return manager, directory, runtime
+
+
+def _tp4_plan() -> PlannedPool:
+    identity = SharedPoolIdentity("shared-root", GENERATION, "host-0")
+    cache_counts = (1, 2, 1, 3)
+    partitions = []
+    components = []
+    offset = 0
+    for tp_rank, cache_count in enumerate(cache_counts):
+        for cache_index in range(cache_count):
+            partition = PlannedPartition(
+                partition_id=len(partitions),
+                arena_name="host-0",
+                partition_name=f"host-r{tp_rank}-c{cache_index}",
+                tp_rank=tp_rank,
+                cache_index=cache_index,
+                offset_bytes=offset,
+                num_slots=4,
+                slot_bytes=4096,
+                physical_page_bytes=3000,
+            )
+            partitions.append(partition)
+            for role in ("k", "v"):
+                components.append(
+                    PlannedComponent(
+                        global_component_id=len(components),
+                        tp_rank=tp_rank,
+                        cache_index=cache_index,
+                        role=role,
+                        arena_name="host-0",
+                        partition_name=partition.partition_name,
+                        partition_id=partition.partition_id,
+                        partition_offset_bytes=offset,
+                        partition_slot_bytes=4096,
+                        physical_page_bytes=3000,
+                    )
+                )
+            offset += 4 * 4096
+    partition_tuple = tuple(partitions)
+    return PlannedPool(
+        identity=identity,
+        planning_version=1,
+        model="model-a",
+        model_revision="rev-a",
+        kv_dtype="float16",
+        block_size=128,
+        tensor_parallel_size=4,
+        cpu_bytes_to_use=offset,
+        bytes_per_complete_block=2 * 4096 * len(partitions),
+        logical_block_capacity=2,
+        allocated_bytes=offset,
+        unused_bytes=0,
+        arena=PlannedArena(
+            name="host-0",
+            backend="HOST_DRAM",
+            model="model-a@rev-a",
+            kv_dtype="float16",
+            block_size=128,
+            tensor_parallel_size=4,
+            partitions=partition_tuple,
+        ),
+        partitions=partition_tuple,
+        components=tuple(components),
+    )
+
+
+def _global_manager_directory_runtime():
+    plan = _tp4_plan()
+    registrations = {
+        partition.partition_name: FakeRegisteredPool(
+            partition.partition_name,
+            FakePoolRef(1, 100 + partition.partition_id, 1),
+            FakeCompatibility(2, 1000 + partition.partition_id),
+            slot_count=partition.num_slots,
+            slot_bytes=partition.slot_bytes,
+        )
+        for partition in plan.partitions
+    }
+    directory = FakeDirectory(registrations)
+    runtime = _runtime(directory)
+    manager = SpyreSharedOffloadingManager(
+        plan=plan,
+        cache_policy="lru",
+        cache_policy_module_path=None,
+        enable_events=False,
+        store_threshold=0,
+        max_tracker_size=64_000,
+        runtime_loader=lambda: runtime,
+    )
+    return manager, directory, runtime, plan
 
 
 @pytest.fixture
@@ -756,6 +875,85 @@ def test_hit_pending_does_not_scan_partial_directory(manager_directory_runtime):
 
     assert manager.lookup(OFFLOAD_KEY, ReqContext("load")) is LookupResult.HIT_PENDING
     assert directory.lookup_calls == []
+
+
+def test_tp4_store_claims_every_component_in_its_planned_partition_with_tokens():
+    manager, directory, _, plan = _global_manager_directory_runtime()
+    for component in plan.components:
+        directory.claim_results[shared_page_hash(OFFLOAD_KEY, component.global_component_id)] = (
+            component.global_component_id % 4
+        )
+
+    output = manager.prepare_store([OFFLOAD_KEY], ReqContext("store"))
+
+    assert output is not None
+    pages = output.store_spec.transfers[0].pages
+    assert len(pages) == len(plan.components)
+    assert all(isinstance(page.reservation, FakeReservationToken) for page in pages)
+    assert [pool_ref for pool_ref, _ in directory.claim_calls] == [
+        directory.registrations[component.partition_name].pool_ref for component in plan.components
+    ]
+    assert manager._local_manager._num_chunks == plan.logical_block_capacity
+
+
+@pytest.mark.parametrize("missing_component", [0, 1, 4, 8, 13])
+def test_tp4_lookup_requires_every_global_component(missing_component):
+    manager, directory, runtime, plan = _global_manager_directory_runtime()
+    for component in plan.components:
+        registered = directory.registrations[component.partition_name]
+        key = runtime.CompatibleBlockKey(
+            registered.compatibility,
+            shared_page_hash(OFFLOAD_KEY, component.global_component_id),
+        )
+        directory.entries[key.block_hash] = FakeLookupEntry(
+            key, FakeSlotRef(registered.pool_ref, component.global_component_id % 4)
+        )
+    missing = plan.components[missing_component]
+    del directory.entries[shared_page_hash(OFFLOAD_KEY, missing.global_component_id)]
+
+    assert manager.lookup(OFFLOAD_KEY, ReqContext("load")) is LookupResult.MISS
+
+
+@pytest.mark.parametrize("outcome", [FakeNoSpace(), FakeUnavailable()])
+def test_tp4_claim_failure_aborts_every_prior_partition_reservation(outcome):
+    manager, directory, _, plan = _global_manager_directory_runtime()
+    failed_component = plan.components[8]
+    for component in plan.components:
+        page_hash = shared_page_hash(OFFLOAD_KEY, component.global_component_id)
+        directory.claim_results[page_hash] = component.global_component_id % 4
+    directory.claim_results[shared_page_hash(OFFLOAD_KEY, failed_component.global_component_id)] = (
+        outcome
+    )
+
+    if isinstance(outcome, FakeUnavailable):
+        with pytest.raises(RuntimeError, match="unavailable"):
+            manager.prepare_store([OFFLOAD_KEY], ReqContext("store"))
+    else:
+        result = manager.prepare_store([OFFLOAD_KEY], ReqContext("store"))
+        assert result is not None and result.keys_to_store == []
+
+    assert len(directory.aborted) == failed_component.global_component_id
+    assert directory.live_reservations == []
+
+
+def test_failed_tp4_completion_cleans_reserved_and_published_components():
+    manager, directory, _, plan = _global_manager_directory_runtime()
+    for component in plan.components:
+        directory.claim_results[shared_page_hash(OFFLOAD_KEY, component.global_component_id)] = (
+            component.global_component_id % 4
+        )
+    ctx = ReqContext("store")
+    output = manager.prepare_store([OFFLOAD_KEY], ctx)
+    assert output is not None
+    pages = output.store_spec.transfers[0].pages
+    for page in pages[:3]:
+        directory.publish(page.reservation)
+
+    manager.complete_store(output.keys_to_store, ctx, success=False)
+
+    assert len(directory.evicted) == 3
+    assert len(directory.aborted) == len(plan.components) - 3
+    assert directory.live_reservations == []
 
 
 def test_reset_releases_pins_then_evicts_owned_pages_and_aborts_pending(

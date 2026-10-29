@@ -41,7 +41,8 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
-from spyre_inference.v1.kv_offload.shared_identity import load_shared_pool_identity
+from spyre_inference.v1.kv_offload.pool_plan import PlannedPool
+from spyre_inference.v1.kv_offload.shared_identity import load_shared_pool_configuration
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -56,6 +57,8 @@ logger = init_logger(__name__)
 
 class SpyreOffloadingSpec(OffloadingSpec):
     """Spyre host-memory offloading: upstream manager, Spyre worker."""
+
+    supports_partitioned_pool_plan = False
 
     @classmethod
     def build_metric_definitions(
@@ -88,7 +91,17 @@ class SpyreOffloadingSpec(OffloadingSpec):
 
     def __init__(self, config: OffloadingConfig) -> None:
         super().__init__(config)
-        self.shared_pool_identity = load_shared_pool_identity(self.extra_config)
+        pool_configuration = load_shared_pool_configuration(self.extra_config)
+        self.shared_pool_plan = (
+            pool_configuration if isinstance(pool_configuration, PlannedPool) else None
+        )
+        if self.shared_pool_plan is not None and not self.supports_partitioned_pool_plan:
+            raise ValueError("SpyreOffloadingSpec does not support a partitioned pool_plan")
+        self.shared_pool_identity = (
+            self.shared_pool_plan.identity
+            if self.shared_pool_plan is not None
+            else pool_configuration
+        )
 
         # One host block must map to exactly one device block. With chunking,
         # upstream's host page is gpu_page_size * blocks_per_chunk and a host
@@ -103,7 +116,11 @@ class SpyreOffloadingSpec(OffloadingSpec):
                 f"'block_size' from kv_connector_extra_config."
             )
 
-        cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
+        cpu_bytes_to_use = (
+            self.shared_pool_plan.cpu_bytes_to_use
+            if self.shared_pool_plan is not None
+            else self.extra_config.get("cpu_bytes_to_use")
+        )
         if not cpu_bytes_to_use:
             raise ValueError("cpu_bytes_to_use must be specified in kv_connector_extra_config")
 
@@ -112,7 +129,9 @@ class SpyreOffloadingSpec(OffloadingSpec):
         # bytes; the pools are sized from the physical page size, which may be
         # larger because of stick padding (see get_worker).
         world_size = config.parallel.world_size
-        if world_size != 1 or config.parallel.tp_size != 1:
+        if (
+            world_size != 1 or config.parallel.tp_size != 1
+        ) and not self.supports_partitioned_pool_plan:
             raise ValueError(
                 "Spyre KV offloading requires world_size == 1 and TP1 until "
                 "persistent child slots are partitioned by rank"
@@ -123,7 +142,11 @@ class SpyreOffloadingSpec(OffloadingSpec):
                 f"cannot size host pool: worker_kv_bytes_per_block="
                 f"{config.worker_kv_bytes_per_block}, world_size={world_size}"
             )
-        self.num_blocks = int(cpu_bytes_to_use) // kv_bytes_per_block
+        self.num_blocks = (
+            self.shared_pool_plan.logical_block_capacity
+            if self.shared_pool_plan is not None
+            else int(cpu_bytes_to_use) // kv_bytes_per_block
+        )
         if self.num_blocks <= 0:
             raise ValueError(
                 f"cpu_bytes_to_use={int(cpu_bytes_to_use)} is too small for even "

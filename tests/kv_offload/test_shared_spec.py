@@ -38,6 +38,7 @@ from spyre_inference.v1.kv_offload.connector import TOKEN_MAJOR, SpyrePhysicalCa
 from spyre_inference.v1.kv_offload.shared_types import PAGE_KEY_ALGORITHM
 from spyre_inference.v1.kv_offload.spec import SpyreOffloadingSpec
 from spyre_inference.v1.worker.spyre_kv_offload import PageSignature
+from tests.kv_offload.test_pool_plan import valid_planned_pool_document
 
 PAGE_BYTES = 262_144
 GENERATION_HEX = "11" * 16
@@ -186,6 +187,58 @@ def test_rejects_non_uni_executor_after_vllm_resolution():
     spec = _shared_spec_module().SpyreSharedOffloadingSpec(_config())
     with pytest.raises(ValueError, match="uni"):
         spec.bind_vllm_config(_vllm_config(backend="mp"))
+
+
+def test_tp_plan_uses_global_capacity_and_requires_external_launcher():
+    plan = valid_planned_pool_document()
+    plan["plan"]["normalizedSpec"]["model"] = "micro-g3.3-8b"
+    plan["plan"]["normalizedSpec"]["blockSize"] = "128"
+    for config in (
+        plan["plan"]["config"],
+        plan["poolDescriptor"]["effectiveConfig"],
+    ):
+        compatibility = config["dataPools"][0]["compatibility"]
+        compatibility["model"] = "micro-g3.3-8b@revision-1"
+        compatibility["blockSize"] = "128"
+    spec = _shared_spec_module().SpyreSharedOffloadingSpec(
+        _config(world_size=2, extra={"pool_plan": plan})
+    )
+
+    assert spec.num_blocks == 2
+    assert spec.component_count == 4
+    spec.bind_vllm_config(
+        _vllm_config(
+            backend="external_launcher",
+            model="micro-g3.3-8b",
+            revision="revision-1",
+        )
+    )
+    with pytest.raises(ValueError, match="external_launcher"):
+        spec.bind_vllm_config(_vllm_config(backend="uni"))
+
+
+def test_tp_plan_rejects_resolved_model_revision_mismatch():
+    plan = valid_planned_pool_document()
+    plan["plan"]["normalizedSpec"]["model"] = "micro-g3.3-8b"
+    plan["plan"]["normalizedSpec"]["blockSize"] = "128"
+    for config in (
+        plan["plan"]["config"],
+        plan["poolDescriptor"]["effectiveConfig"],
+    ):
+        config["dataPools"][0]["compatibility"]["model"] = "micro-g3.3-8b@revision-1"
+        config["dataPools"][0]["compatibility"]["blockSize"] = "128"
+    spec = _shared_spec_module().SpyreSharedOffloadingSpec(
+        _config(world_size=2, extra={"pool_plan": plan})
+    )
+
+    with pytest.raises(ValueError, match="model.*revision"):
+        spec.bind_vllm_config(
+            _vllm_config(
+                backend="external_launcher",
+                model="micro-g3.3-8b",
+                revision="other",
+            )
+        )
 
 
 def test_component_manifest_is_stable_cache_then_k_v(monkeypatch):

@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Upstream cache policy backed by one cross-instance Spyre data pool."""
+"""One global cache policy backed by partitioned cross-instance metadata."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Iterable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -34,7 +35,11 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
-from spyre_inference.v1.kv_offload.shared_attachment import SharedPoolAttachment
+from spyre_inference.v1.kv_offload.pool_plan import PlannedPool
+from spyre_inference.v1.kv_offload.shared_attachment import (
+    SharedMetadataAttachment,
+    SharedPoolAttachment,
+)
 from spyre_inference.v1.kv_offload.shared_identity import SharedPoolIdentity
 from spyre_inference.v1.kv_offload.shared_runtime import load_shared_runtime
 from spyre_inference.v1.kv_offload.shared_types import (
@@ -64,24 +69,43 @@ class _PendingStore:
     pages: tuple[SharedPageTransfer, ...]
 
 
+@dataclass(frozen=True)
+class _ComponentRoute:
+    component_id: int
+    registered: object
+
+
 class SpyreSharedOffloadingManager(OffloadingManager):
     """Apply one logical cache policy to complete shared page bundles."""
 
     def __init__(
         self,
         *,
-        identity: SharedPoolIdentity,
-        component_count: int,
-        max_pool_slots: int,
         cache_policy: str,
         cache_policy_module_path: str | None,
         enable_events: bool,
         store_threshold: int,
         max_tracker_size: int,
         runtime_loader: Callable[[], Any] = load_shared_runtime,
+        plan: PlannedPool | None = None,
+        identity: SharedPoolIdentity | None = None,
+        component_count: int | None = None,
+        max_pool_slots: int | None = None,
     ) -> None:
-        self._identity = identity
-        self._component_count = component_count
+        if plan is None:
+            if identity is None or component_count is None or max_pool_slots is None:
+                raise ValueError(
+                    "a complete plan or legacy identity/component geometry is required"
+                )
+            if component_count <= 0 or max_pool_slots <= 0:
+                raise ValueError("legacy component geometry must be positive")
+        self._plan = plan
+        self._identity = plan.identity if plan is not None else identity
+        if plan is not None:
+            self._component_count = len(plan.components)
+        else:
+            assert component_count is not None
+            self._component_count = component_count
         self._max_pool_slots = max_pool_slots
         self._cache_policy = cache_policy
         self._cache_policy_module_path = cache_policy_module_path
@@ -90,9 +114,10 @@ class SpyreSharedOffloadingManager(OffloadingManager):
         self._max_tracker_size = max_tracker_size
         self._runtime_loader = runtime_loader
         self._runtime = None
-        self._attachment: SharedPoolAttachment | None = None
+        self._attachment: SharedMetadataAttachment | SharedPoolAttachment | None = None
         self._directory = None
         self._registered = None
+        self._component_routes: tuple[_ComponentRoute, ...] = ()
         self._local_manager: CPUOffloadingManager | None = None
         self._local_keys: set[OffloadKey] = set()
         self._owned_entries: dict[OffloadKey, tuple[object, ...]] = {}
@@ -107,23 +132,43 @@ class SpyreSharedOffloadingManager(OffloadingManager):
     def _ensure_directory(self):
         if self._attachment is None:
             runtime = self._runtime_loader()
-            attachment = SharedPoolAttachment.attach(self._identity, lambda: runtime)
-            registered = attachment.registered
-            directory = attachment.metadata
-            try:
+            if self._plan is None:
+                assert self._identity is not None
+                attachment = SharedPoolAttachment.attach(self._identity, lambda: runtime)
+                registered = attachment.registered
+                routes = tuple(
+                    _ComponentRoute(component_id, registered)
+                    for component_id in range(self._component_count)
+                )
                 slot_count = int(registered.slot_count)
                 if (
                     slot_count <= 0
                     or slot_count % self._component_count
+                    or self._max_pool_slots is None
                     or slot_count > self._max_pool_slots
                 ):
+                    attachment.close()
                     raise RuntimeError(
                         f"registered pool slot_count {slot_count} is incompatible with "
                         f"component_count={self._component_count} and "
                         f"max_pool_slots={self._max_pool_slots}"
                     )
+                policy_capacity = slot_count // self._component_count
+            else:
+                attachment = SharedMetadataAttachment.attach(self._plan, lambda: runtime)
+                routes = tuple(
+                    _ComponentRoute(
+                        component.global_component_id,
+                        attachment.registered[component.partition_name],
+                    )
+                    for component in self._plan.components
+                )
+                registered = routes[0].registered
+                policy_capacity = self._plan.logical_block_capacity
+            directory = attachment.metadata
+            try:
                 local_manager = CPUOffloadingManager(
-                    num_chunks=slot_count // self._component_count,
+                    num_chunks=policy_capacity,
                     cache_policy=self._cache_policy,
                     cache_policy_module_path=self._cache_policy_module_path,
                     enable_events=self._enable_events,
@@ -138,6 +183,7 @@ class SpyreSharedOffloadingManager(OffloadingManager):
             self._attachment = attachment
             self._directory = directory
             self._registered = registered
+            self._component_routes = routes
             self._local_manager = local_manager
 
         directory = self._directory
@@ -147,7 +193,7 @@ class SpyreSharedOffloadingManager(OffloadingManager):
             raise RuntimeError("shared pool attachment was not initialized completely")
 
         assert self._local_manager is not None
-        return directory, registered, runtime, self._local_manager
+        return directory, self._component_routes, runtime, self._local_manager
 
     @staticmethod
     def _same_pool(left: object, right: object) -> bool:
@@ -191,7 +237,7 @@ class SpyreSharedOffloadingManager(OffloadingManager):
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        directory, registered, runtime, local_manager = self._ensure_directory()
+        directory, routes, runtime, local_manager = self._ensure_directory()
         local_result = local_manager.lookup(key, req_context)
         if local_result is LookupResult.HIT_PENDING:
             return local_result
@@ -201,7 +247,9 @@ class SpyreSharedOffloadingManager(OffloadingManager):
             return LookupResult.HIT
 
         pinned: list[_PinnedPage] = []
-        for component_id in range(self._component_count):
+        for route in routes:
+            component_id = route.component_id
+            registered = route.registered
             page_key = self._page_key(runtime, registered, key, component_id)
             entry = directory.lookup(page_key)
             if entry is None or not self._valid_slot(entry.slot, registered):
@@ -302,7 +350,9 @@ class SpyreSharedOffloadingManager(OffloadingManager):
             reservation = page.reservation
             entry = directory.lookup(reservation.key)
             if entry is None:
-                directory.abort(reservation)
+                # The worker may already have aborted this exact token.
+                with suppress(RuntimeError):
+                    directory.abort(reservation)
             elif self._same_slot(entry.slot, reservation.slot):
                 directory.evict(entry)
 
@@ -312,7 +362,7 @@ class SpyreSharedOffloadingManager(OffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
-        directory, registered, runtime, local_manager = self._ensure_directory()
+        directory, routes, runtime, local_manager = self._ensure_directory()
         upstream = local_manager.prepare_store(keys, req_context)
         if upstream is None:
             return None
@@ -330,17 +380,20 @@ class SpyreSharedOffloadingManager(OffloadingManager):
             for key in upstream.keys_to_store:
                 current_pages = []
                 complete = True
-                for component_id in range(self._component_count):
+                for route in routes:
+                    component_id = route.component_id
+                    registered = route.registered
                     page_key = self._page_key(runtime, registered, key, component_id)
                     result = directory.claim(registered.pool_ref, page_key)
                     if isinstance(result, runtime.Reservation):
                         if not self._valid_slot(result.slot, registered):
                             raise RuntimeError("reservation returned a foreign pool slot")
+                        token = result.token
                         current_pages.append(
                             SharedPageTransfer(
                                 component_id,
-                                SharedPageLocation(result.slot.pool.pool_id, result.slot.slot_id),
-                                result,
+                                SharedPageLocation(token.slot.pool.pool_id, token.slot.slot_id),
+                                token,
                             )
                         )
                     elif isinstance(result, runtime.ExistingClaim):
@@ -397,11 +450,13 @@ class SpyreSharedOffloadingManager(OffloadingManager):
         req_context: ReqContext,
         success: bool = True,
     ) -> None:
-        directory, registered, runtime, local_manager = self._ensure_directory()
+        directory, routes, runtime, local_manager = self._ensure_directory()
         keys = tuple(keys)
         if not success:
             for key in keys:
-                self._pending_stores.pop(key, None)
+                pending = self._pending_stores.pop(key, None)
+                if pending is not None:
+                    self._release_attempt_pages(directory, pending.pages)
             local_manager.complete_store(keys, req_context, success=False)
             return
 
@@ -411,7 +466,9 @@ class SpyreSharedOffloadingManager(OffloadingManager):
                 pending = self._pending_stores[key]
                 reservations = {page.component_id: page.reservation for page in pending.pages}
                 owned = []
-                for component_id in range(self._component_count):
+                for route in routes:
+                    component_id = route.component_id
+                    registered = route.registered
                     page_key = self._page_key(runtime, registered, key, component_id)
                     entry = directory.lookup(page_key)
                     if entry is None or not self._valid_slot(entry.slot, registered):
@@ -482,5 +539,6 @@ class SpyreSharedOffloadingManager(OffloadingManager):
         self._attachment = None
         self._directory = None
         self._registered = None
+        self._component_routes = ()
         self._local_manager = None
         self._runtime = None
