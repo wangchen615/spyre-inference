@@ -102,6 +102,26 @@ def test_cli_writes_deterministic_delegator_json_to_stdout(capsys):
     ]
 
 
+def test_resolve_model_pool_spec_returns_delegator_input():
+    payload = pool_cli.resolve_model_pool_spec(
+        model="model-a",
+        revision="revision-1",
+        tensor_parallel_size=2,
+        dtype="auto",
+        kv_cache_dtype="auto",
+        block_size=128,
+        trust_remote_code=False,
+        pool_name="/deployment-a",
+        cpu_bytes_to_use=1 << 30,
+        resolve_inputs=_resolved_inputs,
+    )
+
+    assert payload["name"] == "/deployment-a"
+    assert payload["modelRevision"] == "revision-1"
+    assert payload["tensorParallelSize"] == 2
+    assert payload["cpuBytesToUse"] == str(1 << 30)
+
+
 def test_cli_writes_output_file_without_stdout(tmp_path, capsys):
     output = tmp_path / "model-pool.json"
 

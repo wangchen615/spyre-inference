@@ -158,20 +158,56 @@ def _default_resolve_inputs(arguments):
     return config, kv_cache_config
 
 
+def resolve_model_pool_spec(
+    *,
+    model: str,
+    revision: str | None,
+    tensor_parallel_size: int,
+    dtype: str,
+    kv_cache_dtype: str,
+    block_size: int,
+    trust_remote_code: bool,
+    pool_name: str,
+    cpu_bytes_to_use: int,
+    resolve_inputs: Callable | None = None,
+) -> dict:
+    arguments = SimpleNamespace(
+        model=model,
+        revision=revision,
+        tensor_parallel_size=tensor_parallel_size,
+        dtype=dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        block_size=block_size,
+        trust_remote_code=trust_remote_code,
+    )
+    resolver = resolve_inputs or _default_resolve_inputs
+    with redirect_stdout(sys.stderr):
+        vllm_config, kv_cache_config = resolver(arguments)
+    return build_model_pool_spec(
+        vllm_config,
+        kv_cache_config,
+        pool_name,
+        cpu_bytes_to_use,
+    )
+
+
 def main(
     argv: list[str] | None = None,
     *,
     resolve_inputs: Callable | None = None,
 ) -> int:
     arguments = _parser().parse_args(argv)
-    resolver = resolve_inputs or _default_resolve_inputs
-    with redirect_stdout(sys.stderr):
-        vllm_config, kv_cache_config = resolver(arguments)
-    spec = build_model_pool_spec(
-        vllm_config,
-        kv_cache_config,
-        arguments.pool_name,
-        arguments.cpu_bytes_to_use,
+    spec = resolve_model_pool_spec(
+        model=arguments.model,
+        revision=arguments.revision,
+        tensor_parallel_size=arguments.tensor_parallel_size,
+        dtype=arguments.dtype,
+        kv_cache_dtype=arguments.kv_cache_dtype,
+        block_size=arguments.block_size,
+        trust_remote_code=arguments.trust_remote_code,
+        pool_name=arguments.pool_name,
+        cpu_bytes_to_use=arguments.cpu_bytes_to_use,
+        resolve_inputs=resolve_inputs,
     )
     rendered = json.dumps(spec, indent=2, sort_keys=True) + "\n"
     if arguments.output is None:

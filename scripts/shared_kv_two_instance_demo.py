@@ -283,6 +283,35 @@ def prepare_model_pool_command(*, ctl: Any, model_spec: dict[str, Any]) -> dict[
     return result
 
 
+def prepare_resolved_model_pool_command(
+    *,
+    ctl: Any,
+    model: str,
+    revision: str | None,
+    tensor_parallel_size: int,
+    dtype: str,
+    kv_cache_dtype: str,
+    block_size: int,
+    trust_remote_code: bool,
+    pool_name: str,
+    cpu_bytes_to_use: int,
+) -> dict[str, Any]:
+    from spyre_inference.v1.kv_offload import pool_cli
+
+    model_spec = pool_cli.resolve_model_pool_spec(
+        model=model,
+        revision=revision,
+        tensor_parallel_size=tensor_parallel_size,
+        dtype=dtype,
+        kv_cache_dtype=kv_cache_dtype,
+        block_size=block_size,
+        trust_remote_code=trust_remote_code,
+        pool_name=pool_name,
+        cpu_bytes_to_use=cpu_bytes_to_use,
+    )
+    return prepare_model_pool_command(ctl=ctl, model_spec=model_spec)
+
+
 def metric_value(
     metrics_text: str,
     name: str,
@@ -813,10 +842,58 @@ def _parse_prepare_model_pool_args() -> argparse.Namespace:
         prog=f"{sys.argv[0]} prepare-model-pool",
         description="Ask the delegator to plan and create a versioned model pool.",
     )
-    parser.add_argument("--spec", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--spec", type=Path)
+    source.add_argument("--model")
+    parser.add_argument("--revision")
+    parser.add_argument("--tensor-parallel-size", type=int)
+    parser.add_argument("--dtype")
+    parser.add_argument("--kv-cache-dtype")
+    parser.add_argument("--block-size", type=int)
+    parser.add_argument("--trust-remote-code", action="store_true", default=None)
+    parser.add_argument("--pool-name")
+    parser.add_argument("--cpu-bytes-to-use", type=int)
     parser.add_argument("--ctl", default="shared-poolctl")
     parser.add_argument("--socket", default=None)
-    return parser.parse_args(sys.argv[2:])
+    arguments = parser.parse_args(sys.argv[2:])
+    model_options = {
+        "revision": "--revision",
+        "tensor_parallel_size": "--tensor-parallel-size",
+        "dtype": "--dtype",
+        "kv_cache_dtype": "--kv-cache-dtype",
+        "block_size": "--block-size",
+        "trust_remote_code": "--trust-remote-code",
+        "pool_name": "--pool-name",
+        "cpu_bytes_to_use": "--cpu-bytes-to-use",
+    }
+    if arguments.spec is not None:
+        mixed = [
+            flag for name, flag in model_options.items() if getattr(arguments, name) is not None
+        ]
+        if mixed:
+            option_list = ", ".join(mixed)
+            parser.error(f"the following arguments cannot be used with --spec: {option_list}")
+        return arguments
+
+    if arguments.model is not None:
+        missing = []
+        if arguments.pool_name is None:
+            missing.append("--pool-name")
+        if arguments.cpu_bytes_to_use is None:
+            missing.append("--cpu-bytes-to-use")
+        if missing:
+            parser.error(f"the following arguments are required with --model: {', '.join(missing)}")
+        if arguments.tensor_parallel_size is None:
+            arguments.tensor_parallel_size = 1
+        if arguments.dtype is None:
+            arguments.dtype = "auto"
+        if arguments.kv_cache_dtype is None:
+            arguments.kv_cache_dtype = "auto"
+        if arguments.block_size is None:
+            arguments.block_size = 128
+        if arguments.trust_remote_code is None:
+            arguments.trust_remote_code = False
+    return arguments
 
 
 def main() -> None:
@@ -827,13 +904,25 @@ def main() -> None:
             from shared_pool_delegator import SharedPoolCtl
 
         args = _parse_prepare_model_pool_args()
-        model_spec = json.loads(args.spec.read_text(encoding="utf-8"))
-        if not isinstance(model_spec, dict):
-            raise ValueError("model pool specification must be a JSON object")
-        prepare_model_pool_command(
-            ctl=SharedPoolCtl(binary=args.ctl, socket_path=args.socket),
-            model_spec=model_spec,
-        )
+        ctl = SharedPoolCtl(binary=args.ctl, socket_path=args.socket)
+        if args.spec is not None:
+            model_spec = json.loads(args.spec.read_text(encoding="utf-8"))
+            if not isinstance(model_spec, dict):
+                raise ValueError("model pool specification must be a JSON object")
+            prepare_model_pool_command(ctl=ctl, model_spec=model_spec)
+        else:
+            prepare_resolved_model_pool_command(
+                ctl=ctl,
+                model=args.model,
+                revision=args.revision,
+                tensor_parallel_size=args.tensor_parallel_size,
+                dtype=args.dtype,
+                kv_cache_dtype=args.kv_cache_dtype,
+                block_size=args.block_size,
+                trust_remote_code=args.trust_remote_code,
+                pool_name=args.pool_name,
+                cpu_bytes_to_use=args.cpu_bytes_to_use,
+            )
         return
 
     if len(sys.argv) > 1 and sys.argv[1] == "prepare-pool":

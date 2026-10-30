@@ -63,7 +63,6 @@ export MODEL=ibm-ai-platform/micro-g3.3-8b-instruct-1b
 export MODEL_REVISION=main
 export SHARED_POOL_NAME=/micro-g3-m4-planned-demo
 export CPU_BYTES_TO_USE=536870912
-export MODEL_SPEC=/tmp/micro-g3-m4-planned-demo-spec.json
 
 cd "$SPYRE_INFERENCE_M4"
 ```
@@ -116,46 +115,7 @@ loop was waiting.
 The delegator is the lifecycle controller, not the lifetime owner. A READY
 pool remains in shared memory if the delegator later restarts.
 
-## 2. Resolve the real model into a model-pool specification
-
-Generate the specification before creating any pool:
-
-```bash
-uv run --active --no-sync python \
-  -m spyre_inference.v1.kv_offload.pool_cli \
-  --model "$MODEL" \
-  --revision "$MODEL_REVISION" \
-  --tensor-parallel-size 1 \
-  --pool-name "$SHARED_POOL_NAME" \
-  --cpu-bytes-to-use "$CPU_BYTES_TO_USE" \
-  --output "$MODEL_SPEC"
-```
-
-This command does not create model weights or a pool. It resolves the model's
-KV dtype, block size, physical cache allocations, layout, local KV heads, and
-head size into a versioned JSON request for the delegator.
-
-Inspect the relevant facts:
-
-```bash
-jq '{
-  planningVersion,
-  name,
-  model,
-  modelRevision,
-  kvDtype,
-  blockSize,
-  tensorParallelSize,
-  cpuBytesToUse,
-  rankCaches
-}' "$MODEL_SPEC"
-```
-
-For the verified model, the resolver produced four TP1 physical-cache rows.
-Every row used a 262,144-byte head-major page with eight local KV heads and a
-128-element head size.
-
-## 3. Ask the delegator to plan and create the whole pool
+## 2. Resolve the model and create the whole pool
 
 Use `prepare-model-pool`, not the legacy flat `prepare-pool` command:
 
@@ -164,15 +124,22 @@ POOL_JSON=$(uv run --active --no-sync python \
   scripts/shared_kv_two_instance_demo.py prepare-model-pool \
   --ctl "$DELEGATOR_M4/build/shared-poolctl" \
   --socket "$DELEGATOR_SOCKET" \
-  --spec "$MODEL_SPEC")
+  --model "$MODEL" \
+  --revision "$MODEL_REVISION" \
+  --tensor-parallel-size 1 \
+  --pool-name "$SHARED_POOL_NAME" \
+  --cpu-bytes-to-use "$CPU_BYTES_TO_USE")
 
 printf '%s\n' "$POOL_JSON" | jq .
 ```
 
-The helper calls the delegator's `create-model` operation. The delegator plans
-one exact physical arena, checks aggregate `/dev/shm` capacity, calls Flex to
-create the root, metadata, and data objects, and returns the complete immutable
-plan consumed by both replicas.
+The helper first resolves the model's KV dtype, block size, physical cache
+allocations, layout, local KV heads, and head size. It then calls the
+delegator's `create-model` operation with that versioned specification. The
+delegator plans one exact physical arena, checks aggregate `/dev/shm` capacity,
+calls Flex to create the root, metadata, and data objects, and returns the
+complete immutable plan consumed by both replicas. This resolves model
+configuration but does not load model weights.
 
 Export the identity and build vLLM's connector argument directly from the
 returned plan:
@@ -203,6 +170,26 @@ jq '{
 }' <<<"$POOL_JSON"
 ```
 
+Inspect the resolved specification that the delegator planned:
+
+```bash
+jq '.instanceAExtraConfig.pool_plan.plan.normalizedSpec | {
+  planningVersion,
+  name,
+  model,
+  modelRevision,
+  kvDtype,
+  blockSize,
+  tensorParallelSize,
+  cpuBytesToUse,
+  rankCaches
+}' <<<"$POOL_JSON"
+```
+
+For the verified model, the resolver produced four TP1 physical-cache rows.
+Every row used a 262,144-byte head-major page with eight local KV heads and a
+128-element head size.
+
 The verified 512 MiB plan contained:
 
 - one `host-0` physical arena;
@@ -213,7 +200,7 @@ The verified 512 MiB plan contained:
 - 2,097,152 bytes per complete block; and
 - zero unused budget bytes.
 
-## 4. Start two simultaneous TP1 replicas
+## 3. Start two simultaneous TP1 replicas
 
 Both replicas receive the exact same `KV_TRANSFER_CONFIG`, including the full
 pool plan and generation. They differ only in card and HTTP port.
@@ -271,7 +258,7 @@ tail -f /tmp/spyre-shared-kv-m4-instance-b.log
 Each log should report the same pool name, four physical caches, eight
 components, 256 logical blocks, and 536,870,912 actual host bytes.
 
-## 5. Prove live attachments block destroy
+## 4. Prove live attachments block destroy
 
 Destroying the exact generation must return `POOL_BUSY` while A and B are
 attached:
@@ -288,7 +275,7 @@ else
 fi
 ```
 
-## 6. Warm both replicas, then measure a fresh 4K prompt
+## 5. Warm both replicas, then measure a fresh 4K prompt
 
 First give A and B different 4,096-token prompts, then cross them: B reloads
 A's prompt and A reloads B's prompt. This removes each replica's first-request
@@ -390,7 +377,7 @@ measures the raw Flex transfer only; TTFT and E2E include additional serving
 work. Compilation time is excluded because both servers reached `/health`
 before the measured sequence started.
 
-## 7. Stop both replicas and destroy the exact generation
+## 6. Stop both replicas and destroy the exact generation
 
 Stop B and A gracefully so their managers release metadata pins, child views,
 and root-lock ownership:
@@ -403,7 +390,7 @@ kill -TERM "$INSTANCE_A_PID"
 wait "$INSTANCE_A_PID"
 ```
 
-Destroy exactly the generation created in step 3:
+Destroy exactly the generation created in step 2:
 
 ```bash
 uv run --active --no-sync python scripts/cleanup_shared_kv_demo.py \

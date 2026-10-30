@@ -22,6 +22,8 @@ from argparse import Namespace
 import pytest
 
 from scripts import shared_kv_two_instance_demo as demo
+from scripts import shared_pool_delegator
+from spyre_inference.v1.kv_offload import pool_cli
 from tests.kv_offload.test_pool_plan import valid_planned_pool_document
 
 
@@ -169,6 +171,207 @@ def test_prepare_model_pool_passes_complete_plan_to_both_instances(capsys):
         "pool_plan": document,
     }
     assert json.loads(capsys.readouterr().out) == result
+
+
+def test_prepare_resolved_model_pool_resolves_before_delegating(monkeypatch, capsys):
+    document = valid_planned_pool_document()
+    spec = document["plan"]["normalizedSpec"]
+    resolved = []
+
+    def resolve_model_pool_spec(**kwargs):
+        resolved.append(kwargs)
+        return spec
+
+    monkeypatch.setattr(pool_cli, "resolve_model_pool_spec", resolve_model_pool_spec)
+
+    class Ctl:
+        def create_model(self, actual):
+            assert actual == spec
+            return document
+
+    result = demo.prepare_resolved_model_pool_command(
+        ctl=Ctl(),
+        model="model-a",
+        revision="revision-1",
+        tensor_parallel_size=2,
+        dtype="auto",
+        kv_cache_dtype="auto",
+        block_size=128,
+        trust_remote_code=False,
+        pool_name="/model-a",
+        cpu_bytes_to_use=1 << 30,
+    )
+
+    assert resolved == [
+        {
+            "model": "model-a",
+            "revision": "revision-1",
+            "tensor_parallel_size": 2,
+            "dtype": "auto",
+            "kv_cache_dtype": "auto",
+            "block_size": 128,
+            "trust_remote_code": False,
+            "pool_name": "/model-a",
+            "cpu_bytes_to_use": 1 << 30,
+        }
+    ]
+    assert result["poolGeneration"] == "11" * 16
+    assert json.loads(capsys.readouterr().out) == result
+
+
+def test_prepare_model_pool_parser_accepts_model_inputs_without_spec(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "shared_kv_two_instance_demo.py",
+            "prepare-model-pool",
+            "--model",
+            "model-a",
+            "--revision",
+            "revision-1",
+            "--tensor-parallel-size",
+            "2",
+            "--pool-name",
+            "/model-a",
+            "--cpu-bytes-to-use",
+            str(1 << 30),
+        ],
+    )
+
+    arguments = demo._parse_prepare_model_pool_args()
+
+    assert arguments.spec is None
+    assert arguments.model == "model-a"
+    assert arguments.revision == "revision-1"
+    assert arguments.tensor_parallel_size == 2
+    assert arguments.pool_name == "/model-a"
+    assert arguments.cpu_bytes_to_use == 1 << 30
+
+
+def test_prepare_model_pool_parser_preserves_spec_input(monkeypatch, tmp_path):
+    spec = tmp_path / "model-pool.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "shared_kv_two_instance_demo.py",
+            "prepare-model-pool",
+            "--spec",
+            str(spec),
+        ],
+    )
+
+    arguments = demo._parse_prepare_model_pool_args()
+
+    assert arguments.spec == spec
+    assert arguments.model is None
+
+
+@pytest.mark.parametrize(
+    "model_arguments",
+    (
+        ("--revision", "revision-1"),
+        ("--tensor-parallel-size", "2"),
+        ("--dtype", "float16"),
+        ("--kv-cache-dtype", "float16"),
+        ("--block-size", "64"),
+        ("--trust-remote-code",),
+        ("--pool-name", "/model-a"),
+        ("--cpu-bytes-to-use", str(1 << 30)),
+    ),
+)
+def test_prepare_model_pool_parser_rejects_model_options_with_spec(
+    monkeypatch, capsys, tmp_path, model_arguments
+):
+    spec = tmp_path / "model-pool.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "shared_kv_two_instance_demo.py",
+            "prepare-model-pool",
+            "--spec",
+            str(spec),
+            *model_arguments,
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        demo._parse_prepare_model_pool_args()
+
+    assert model_arguments[0] in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("missing", ("pool-name", "cpu-bytes-to-use"))
+def test_prepare_model_pool_parser_requires_planning_inputs_with_model(
+    monkeypatch, capsys, missing
+):
+    arguments = [
+        "shared_kv_two_instance_demo.py",
+        "prepare-model-pool",
+        "--model",
+        "model-a",
+    ]
+    if missing != "pool-name":
+        arguments.extend(("--pool-name", "/model-a"))
+    if missing != "cpu-bytes-to-use":
+        arguments.extend(("--cpu-bytes-to-use", str(1 << 30)))
+    monkeypatch.setattr(sys, "argv", arguments)
+
+    with pytest.raises(SystemExit, match="2"):
+        demo._parse_prepare_model_pool_args()
+
+    assert f"--{missing}" in capsys.readouterr().err
+
+
+def test_prepare_model_pool_main_resolves_model_inputs(monkeypatch):
+    calls = []
+
+    class Ctl:
+        def __init__(self, *, binary, socket_path):
+            calls.append(("ctl", binary, socket_path))
+
+    arguments = Namespace(
+        spec=None,
+        model="model-a",
+        revision="revision-1",
+        tensor_parallel_size=2,
+        dtype="auto",
+        kv_cache_dtype="auto",
+        block_size=128,
+        trust_remote_code=False,
+        pool_name="/model-a",
+        cpu_bytes_to_use=1 << 30,
+        ctl="ctl-bin",
+        socket="socket-path",
+    )
+    monkeypatch.setattr(sys, "argv", ["shared_kv_two_instance_demo.py", "prepare-model-pool"])
+    monkeypatch.setattr(demo, "_parse_prepare_model_pool_args", lambda: arguments)
+    monkeypatch.setattr(shared_pool_delegator, "SharedPoolCtl", Ctl)
+    monkeypatch.setattr(
+        demo,
+        "prepare_resolved_model_pool_command",
+        lambda **kwargs: calls.append(("prepare", kwargs)),
+    )
+
+    demo.main()
+
+    assert calls[0] == ("ctl", "ctl-bin", "socket-path")
+    assert calls[1][0] == "prepare"
+    prepared = calls[1][1]
+    assert isinstance(prepared.pop("ctl"), Ctl)
+    assert prepared == {
+        "model": "model-a",
+        "revision": "revision-1",
+        "tensor_parallel_size": 2,
+        "dtype": "auto",
+        "kv_cache_dtype": "auto",
+        "block_size": 128,
+        "trust_remote_code": False,
+        "pool_name": "/model-a",
+        "cpu_bytes_to_use": 1 << 30,
+    }
 
 
 def test_complete_assembles_stream_and_measures_first_token(monkeypatch):
