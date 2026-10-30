@@ -84,7 +84,7 @@ def run_warmup(
     print(f"Warmup identifier: {warmup_id}")
     print(f"Instance A: http://{instance_a_host}:{instance_a_port}")
     print(f"Instance B: http://{instance_b_host}:{instance_b_port}")
-    print("Each instance cold-computes and stores one visibly different junk prompt.")
+    print("Each instance cold-computes one junk prompt, then reloads the other instance's prompt.")
 
     common: dict[str, Any] = {
         "model": model,
@@ -116,10 +116,50 @@ def run_warmup(
             expected_source=demo.LOCAL_COMPUTE,
             **common,
         ),
+        demo.execute_request(
+            label="B reloads A junk prompt",
+            instance_name="B",
+            host=instance_b_host,
+            port=instance_b_port,
+            identifier=identifier_a,
+            prompt_source=prompt_a,
+            response_instruction=WARMUP_RESPONSE_INSTRUCTION_A,
+            expected_source=demo.EXTERNAL_TRANSFER,
+            **common,
+        ),
+        demo.execute_request(
+            label="A reloads B junk prompt",
+            instance_name="A",
+            host=instance_a_host,
+            port=instance_a_port,
+            identifier=identifier_b,
+            prompt_source=prompt_b,
+            response_instruction=WARMUP_RESPONSE_INSTRUCTION_B,
+            expected_source=demo.EXTERNAL_TRANSFER,
+            **common,
+        ),
     ]
-    result = {"warmup_id": warmup_id, "requests": requests}
+    output_comparisons = []
+    for cold, reload in ((requests[0], requests[2]), (requests[1], requests[3])):
+        comparison = {
+            "cold_label": cold["label"],
+            "reload_label": reload["label"],
+            "token_ids_match": reload["token_ids"] == cold["token_ids"],
+            "text_matches": reload["text"].encode() == cold["text"].encode(),
+        }
+        output_comparisons.append(comparison)
+        if not comparison["token_ids_match"] or not comparison["text_matches"]:
+            print(
+                "WARNING: reload output differs from cold output: "
+                f"{reload['label']} versus {cold['label']}"
+            )
+    result = {
+        "warmup_id": warmup_id,
+        "requests": requests,
+        "output_comparisons": output_comparisons,
+    }
     demo.print_request_summary("Warmup summary", requests)
-    print("Warmup complete: 2/2 requests cold-computed and stored shared KV.")
+    print("Warmup complete: 4/4 requests completed with crossed shared-KV reloads.")
     if show_json:
         print("\n=== Machine-readable warmup result ===")
         print(json.dumps(result, indent=2, sort_keys=True))
