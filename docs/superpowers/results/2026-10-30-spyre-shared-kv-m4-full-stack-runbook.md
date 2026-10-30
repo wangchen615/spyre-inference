@@ -413,6 +413,123 @@ kill -TERM "$DELEGATOR_PID"
 wait "$DELEGATOR_PID"
 ```
 
+## Recover and destroy a pool when its identity is unknown
+
+Destroy intentionally requires both the pool name and its exact generation.
+The current management API has no `ListPools` operation, so a caller that has
+lost both values cannot discover pools through `shared-poolctl` alone. Do not
+guess a generation or manually unlink `/dev/shm` objects.
+
+If the original delegator is no longer running, start a temporary controller.
+The controller does not own the pool, and its per-name management guard safely
+serializes this recovery with other management operations:
+
+```bash
+export RECOVERY_SOCKET="/tmp/shared-pool-delegator-${UID}-recovery-$$.sock"
+
+"$DELEGATOR_M4/build/shared-pool-delegator" \
+  --socket-path "$RECOVERY_SOCKET" \
+  --socket-mode 0600 \
+  >"/tmp/shared-pool-delegator-${UID}-recovery.log" 2>&1 &
+export RECOVERY_DELEGATOR_PID=$!
+
+trap 'kill -TERM "$RECOVERY_DELEGATOR_PID" 2>/dev/null || true' EXIT
+
+until "$DELEGATOR_M4/build/shared-poolctl" \
+  --socket "$RECOVERY_SOCKET" health >/dev/null 2>&1; do
+  kill -0 "$RECOVERY_DELEGATOR_PID"
+  sleep 0.1
+done
+```
+
+When even the pool name is unknown, use the metadata-child filenames only to
+produce candidate root names. This is an emergency node-local discovery step,
+not a replacement for `OpenPool`. It must run under the same host UID and IPC
+namespace as the process that created the pool:
+
+```bash
+mapfile -t POOL_CANDIDATES < <(
+  find /dev/shm -maxdepth 1 -type f -uid "$(id -u)" -printf '%f\n' |
+    sed -n 's/\.metadata\.[[:xdigit:]]\{32\}$//p' |
+    sort -u |
+    while read -r root; do
+      test -f "/dev/shm/$root" && printf '/%s\n' "$root"
+    done
+)
+
+printf 'candidate: %s\n' "${POOL_CANDIDATES[@]}"
+```
+
+Treat every filename as untrusted. Ask Flex to validate the root header and
+print only real pool descriptors:
+
+```bash
+for candidate in "${POOL_CANDIDATES[@]}"; do
+  if OPEN_JSON=$("$DELEGATOR_M4/build/shared-poolctl" \
+    --socket "$RECOVERY_SOCKET" open --name "$candidate" 2>/dev/null); then
+    jq -c 'select(.result == "OK") | {
+      name: .descriptor.name,
+      generation: .descriptor.generation,
+      state: .descriptor.state,
+      effectiveConfig: .descriptor.effectiveConfig
+    }' <<<"$OPEN_JSON"
+  fi
+done
+```
+
+Select the intended pool from those validated descriptors. Re-open that name
+and extract the generation from the descriptor, never from a child filename:
+
+```bash
+export RECOVERED_POOL_NAME=/the-validated-pool-name
+
+OPEN_JSON=$("$DELEGATOR_M4/build/shared-poolctl" \
+  --socket "$RECOVERY_SOCKET" open --name "$RECOVERED_POOL_NAME")
+
+jq -e '.result == "OK" and .descriptor.state == "READY"' \
+  <<<"$OPEN_JSON" >/dev/null
+
+export RECOVERED_POOL_GENERATION=$(jq -er \
+  '.descriptor.generation | select(test("^[0-9a-fA-F]{32}$"))' \
+  <<<"$OPEN_JSON")
+
+printf 'destroy target: %s generation %s\n' \
+  "$RECOVERED_POOL_NAME" "$RECOVERED_POOL_GENERATION"
+```
+
+Confirm that the target deployment's workers have exited. If ownership of a
+remaining worker is uncertain, do not destroy the pool. The root flock remains
+the authoritative check and destroy returns `POOL_BUSY` while any attachment
+is alive:
+
+```bash
+pgrep -af 'vllm|EngineCore' || true
+
+uv run --active --no-sync python scripts/cleanup_shared_kv_demo.py \
+  --ctl "$DELEGATOR_M4/build/shared-poolctl" \
+  --socket "$RECOVERY_SOCKET" \
+  --pool-name "$RECOVERED_POOL_NAME" \
+  --pool-generation "$RECOVERED_POOL_GENERATION"
+```
+
+Verify exact-generation cleanup, then stop the temporary controller:
+
+```bash
+VERIFY_JSON=$("$DELEGATOR_M4/build/shared-poolctl" \
+  --socket "$RECOVERY_SOCKET" open \
+  --name "$RECOVERED_POOL_NAME" 2>/dev/null || true)
+
+jq -e '.result == "NOT_FOUND"' <<<"$VERIFY_JSON" >/dev/null
+
+kill -TERM "$RECOVERY_DELEGATOR_PID"
+wait "$RECOVERY_DELEGATOR_PID"
+trap - EXIT
+```
+
+If several valid descriptors are reported, compare their effective model,
+tensor-parallel size, layout, and capacity before selecting one. Never destroy
+all candidates as a cleanup shortcut.
+
 ## Troubleshooting
 
 ### Reload mixes local and external prompt tokens
