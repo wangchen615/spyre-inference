@@ -101,14 +101,13 @@ class SpyreSharedOffloadingManager(OffloadingManager):
             if component_count <= 0 or max_pool_slots <= 0:
                 raise ValueError("legacy component geometry must be positive")
         self._plan = plan
-        if (
-            plan is not None
-            and tp_rank is not None
-            and not 0 <= tp_rank < plan.tensor_parallel_size
-        ):
-            raise ValueError(
-                f"tensor-parallel rank {tp_rank} is outside [0, {plan.tensor_parallel_size})"
-            )
+        if plan is not None:
+            if tp_rank is None:
+                raise ValueError("planned shared manager requires a tensor-parallel rank")
+            if not 0 <= tp_rank < plan.tensor_parallel_size:
+                raise ValueError(
+                    f"tensor-parallel rank {tp_rank} is outside [0, {plan.tensor_parallel_size})"
+                )
         self._tp_rank = tp_rank
         self._identity = plan.identity if plan is not None else identity
         if plan is not None:
@@ -167,7 +166,12 @@ class SpyreSharedOffloadingManager(OffloadingManager):
                     )
                 policy_capacity = slot_count // self._component_count
             else:
-                attachment = SharedMetadataAttachment.attach(self._plan, lambda: runtime)
+                assert self._tp_rank is not None
+                attachment = SharedMetadataAttachment.attach(
+                    self._plan,
+                    self._tp_rank,
+                    lambda: runtime,
+                )
                 routes = tuple(
                     _ComponentRoute(
                         component.global_component_id,
@@ -175,14 +179,10 @@ class SpyreSharedOffloadingManager(OffloadingManager):
                     )
                     for component in self._plan.components
                 )
-                store_routes = (
-                    routes
-                    if self._tp_rank is None
-                    else tuple(
-                        route
-                        for route in routes
-                        if self._plan.components[route.component_id].tp_rank == self._tp_rank
-                    )
+                store_routes = tuple(
+                    route
+                    for route in routes
+                    if self._plan.components[route.component_id].tp_rank == self._tp_rank
                 )
                 registered = routes[0].registered
                 policy_capacity = self._plan.logical_block_capacity

@@ -47,62 +47,72 @@ class ResolvedPartition:
 
 
 def _expected_native_config(runtime: Any, plan: PlannedPool) -> Any:
-    compatibility = runtime.PoolCompatibility(
-        plan.arena.model,
-        plan.arena.kv_dtype,
-        plan.arena.block_size,
-        plan.arena.tensor_parallel_size,
-        plan.arena.layout_signature,
-    )
-    partitions = [
-        runtime.SharedDataPartitionConfig(
-            partition.partition_name,
-            partition.tp_rank,
-            partition.cache_index,
-            partition.num_slots,
-            partition.slot_bytes,
-            partition.offset_bytes,
+    arenas = []
+    for arena in plan.arenas:
+        compatibility = runtime.PoolCompatibility(
+            arena.model,
+            arena.kv_dtype,
+            arena.block_size,
+            arena.tensor_parallel_size,
+            arena.layout_signature,
         )
-        for partition in plan.partitions
-    ]
-    arena = runtime.SharedDataPoolConfig(
-        plan.arena.name,
-        runtime.PoolBackend.HOST_DRAM,
-        plan.arena.num_slots,
-        plan.arena.slot_bytes,
-        partitions,
-        compatibility,
-    )
+        partitions = [
+            runtime.SharedDataPartitionConfig(
+                partition.partition_name,
+                partition.tp_rank,
+                partition.cache_index,
+                partition.num_slots,
+                partition.slot_bytes,
+                partition.offset_bytes,
+            )
+            for partition in arena.partitions
+        ]
+        arenas.append(
+            runtime.SharedDataPoolConfig(
+                arena.name,
+                runtime.PoolBackend.HOST_DRAM,
+                arena.num_slots,
+                arena.slot_bytes,
+                partitions,
+                compatibility,
+            )
+        )
     return runtime.PoolConfig(
         plan.identity.pool_name,
         runtime.MetadataConfig(plan.metadata_max_chunks),
-        [arena],
+        arenas,
     )
 
 
 class SharedMetadataAttachment:
-    """Own one root lock lease while leaving data arena views unresolved."""
+    """Own one eager rank-scoped pool attachment and its global directory."""
 
     def __init__(
         self,
         runtime: Any,
-        metadata: Any,
+        native_attachment: Any,
         plan: PlannedPool | None,
         registered: dict,
+        attached_data: dict,
+        local_partitions: tuple[ResolvedPartition, ...],
     ) -> None:
         self._runtime = runtime
-        self.metadata = metadata
+        self._native_attachment = native_attachment
+        self.metadata = native_attachment.metadata
         self.plan = plan
         self.registered = MappingProxyType(dict(registered))
+        self._attached_data = MappingProxyType(dict(attached_data))
+        self.local_partitions = local_partitions
 
     @classmethod
     def attach(
         cls,
         plan: PlannedPool,
+        tp_rank: int,
         runtime_loader: Callable[[], Any] = load_shared_runtime,
     ) -> SharedMetadataAttachment:
         expected = {partition.partition_name: partition for partition in plan.partitions}
-        return cls._attach_identity(plan.identity, expected, plan, runtime_loader)
+        return cls._attach_identity(plan.identity, expected, plan, tp_rank, runtime_loader)
 
     @classmethod
     def _attach_identity(
@@ -110,28 +120,88 @@ class SharedMetadataAttachment:
         identity: SharedPoolIdentity,
         expected: dict[str, PlannedPartition | None],
         plan: PlannedPool | None,
+        tp_rank: int,
         runtime_loader: Callable[[], Any],
     ) -> SharedMetadataAttachment:
         runtime = runtime_loader()
         if plan is None:
-            result = runtime.SharedPool.attach_pool(identity.pool_name, identity.generation)
+            result = runtime.SharedPool.attach_pool(
+                identity.pool_name,
+                identity.generation,
+                tp_rank,
+            )
         else:
             result = runtime.SharedPool.attach_pool(
                 identity.pool_name,
                 identity.generation,
                 _expected_native_config(runtime, plan),
+                tp_rank,
             )
-        if result.code is not runtime.PoolResultCode.OK or result.metadata is None:
+        native_attachment = result.attachment
+        if result.code is not runtime.PoolResultCode.OK or native_attachment is None:
             message = _attach_error(identity.pool_name, result)
-            if result.code is runtime.PoolResultCode.OK and result.metadata is None:
-                message += ": no metadata returned"
+            if result.code is runtime.PoolResultCode.OK and native_attachment is None:
+                message += ": no attachment returned"
             raise RuntimeError(message)
 
-        metadata = result.metadata
         try:
+            attached_rank = int(native_attachment.tp_rank)
+            if attached_rank != tp_rank:
+                raise RuntimeError(
+                    f"shared pool {identity.pool_name!r} returned tensor-parallel "
+                    f"rank {attached_rank}, expected {tp_rank}"
+                )
+            metadata = native_attachment.metadata
+            if metadata is None:
+                raise RuntimeError(f"shared pool {identity.pool_name!r} attachment has no metadata")
+            attached_data = {}
+            for item in native_attachment.data_pools:
+                name = str(item.registration.name)
+                if name in attached_data:
+                    raise RuntimeError(
+                        f"shared pool {identity.pool_name!r} returned duplicate eager "
+                        f"partition {name!r}"
+                    )
+                attached_data[name] = item
+
+            if plan is None:
+                local_partitions = ()
+                expected_local_names = set(expected)
+            else:
+                local_plan = plan.partitions_for_rank(tp_rank)
+                expected_local_names = {partition.partition_name for partition in local_plan}
+                local_partitions = tuple(
+                    ResolvedPartition(
+                        partition,
+                        attached_data[partition.partition_name].registration,
+                        attached_data[partition.partition_name].data_pool,
+                    )
+                    for partition in local_plan
+                    if partition.partition_name in attached_data
+                )
+
+            attached_names = set(attached_data)
+            missing = expected_local_names - attached_names
+            unexpected = attached_names - expected_local_names
+            if missing:
+                if plan is None:
+                    name = next(iter(missing))
+                    raise RuntimeError(
+                        f"data pool {name!r} was not eagerly attached in shared "
+                        f"pool {identity.pool_name!r}"
+                    )
+                raise RuntimeError(
+                    "missing eager rank-local partitions: " + ", ".join(sorted(missing))
+                )
+            if unexpected and plan is not None:
+                raise RuntimeError(
+                    "unexpected eager rank-local partitions: " + ", ".join(sorted(unexpected))
+                )
+
             registered = {}
             for partition_name, partition in expected.items():
-                row = metadata.find_pool(partition_name)
+                item = attached_data.get(partition_name)
+                row = item.registration if item is not None else metadata.find_pool(partition_name)
                 if row is None:
                     if partition is None:
                         raise RuntimeError(
@@ -151,34 +221,30 @@ class SharedMetadataAttachment:
                         "does not match the immutable pool plan"
                     )
                 registered[partition_name] = row
-            return cls(runtime, metadata, plan, registered)
+            return cls(
+                runtime,
+                native_attachment,
+                plan,
+                registered,
+                attached_data,
+                local_partitions,
+            )
         except BaseException:
-            runtime.SharedPool.detach_pool(metadata)
+            runtime.SharedPool.detach_pool(native_attachment)
             raise
 
-    def resolve_rank(self, tp_rank: int) -> tuple[ResolvedPartition, ...]:
-        if self.plan is None:
-            raise RuntimeError("rank resolution requires a complete planned pool")
-        resolved = []
-        for partition in self.plan.partitions_for_rank(tp_rank):
-            registered = self.registered[partition.partition_name]
-            data_pool = self.metadata.resolve_pool(registered.pool_ref)
-            if data_pool is None:
-                raise RuntimeError(
-                    f"planned partition {partition.partition_name!r} cannot be resolved"
-                )
-            resolved.append(ResolvedPartition(partition, registered, data_pool))
-        return tuple(resolved)
-
     def close(self) -> None:
-        metadata = getattr(self, "metadata", None)
-        if metadata is None:
+        native_attachment = getattr(self, "_native_attachment", None)
+        if native_attachment is None:
             return
         runtime = self._runtime
+        self.local_partitions = ()
+        self._attached_data = MappingProxyType({})
         self.registered = MappingProxyType({})
         self.metadata = None
         self._runtime = None
-        runtime.SharedPool.detach_pool(metadata)
+        self._native_attachment = None
+        runtime.SharedPool.detach_pool(native_attachment)
 
     def __del__(self) -> None:
         try:  # noqa: SIM105 - globals may be cleared during interpreter teardown
@@ -211,17 +277,13 @@ class SharedPoolAttachment:
             identity,
             {identity.data_pool_name: None},
             None,
+            0,
             runtime_loader,
         )
-        metadata = metadata_attachment.metadata
         try:
-            registered = metadata_attachment.registered[identity.data_pool_name]
-            data_pool = metadata.resolve_pool(registered.pool_ref)
-            if data_pool is None:
-                raise RuntimeError(
-                    f"data pool {identity.data_pool_name!r} cannot be resolved "
-                    f"in shared pool {identity.pool_name!r}"
-                )
+            attached = metadata_attachment._attached_data[identity.data_pool_name]
+            registered = attached.registration
+            data_pool = attached.data_pool
             return cls(metadata_attachment, registered, data_pool)
         except BaseException:
             metadata_attachment.close()

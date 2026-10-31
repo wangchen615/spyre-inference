@@ -164,7 +164,7 @@ def test_prepare_model_pool_passes_complete_plan_to_both_instances(capsys):
 
     assert result["poolName"] == "/model-a"
     assert result["poolGeneration"] == "11" * 16
-    assert result["dataPoolName"] == "host-0"
+    assert result["dataPoolName"] == "host-r0"
     assert result["instanceAExtraConfig"] == result["instanceBExtraConfig"]
     assert result["instanceAExtraConfig"] == {
         "spec_name": "SpyreSharedOffloadingSpec",

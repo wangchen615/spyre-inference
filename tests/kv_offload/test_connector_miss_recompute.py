@@ -45,9 +45,6 @@ class EmptyDirectory:
     def find_pool(self, name):
         return self.registered if name == self.registered.name else None
 
-    def resolve_pool(self, pool_ref):
-        return self.data_pool if pool_ref is self.registered.pool_ref else None
-
     def lookup(self, key):
         return None
 
@@ -67,13 +64,18 @@ def _manager_with_empty_directory():
     directory = EmptyDirectory()
     directory.registered = registered
     directory.data_pool = object()
+    native_attachment = SimpleNamespace(
+        tp_rank=0,
+        metadata=directory,
+        data_pools=[SimpleNamespace(registration=registered, data_pool=directory.data_pool)],
+    )
     ok = object()
     runtime = SimpleNamespace(
         SharedPool=SimpleNamespace(
-            attach_pool=lambda _name, _generation: SimpleNamespace(
-                code=ok, metadata=directory, detail=""
+            attach_pool=lambda _name, _generation, _tp_rank: SimpleNamespace(
+                code=ok, attachment=native_attachment, detail=""
             ),
-            detach_pool=lambda _metadata: None,
+            detach_pool=lambda _attachment: None,
         ),
         PoolResultCode=SimpleNamespace(OK=ok),
         CompatibleBlockKey=lambda compatibility, block_hash: SimpleNamespace(

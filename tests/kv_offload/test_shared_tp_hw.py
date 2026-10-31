@@ -44,6 +44,10 @@ from spyre_inference.v1.kv_offload.pool_plan import parse_planned_pool
 from spyre_inference.v1.kv_offload.pool_spec import planned_page_bytes
 from spyre_inference.v1.kv_offload.shared_manager import SpyreSharedOffloadingManager
 from spyre_inference.v1.kv_offload.shared_spec import component_manifest
+from spyre_inference.v1.kv_offload.shared_types import (
+    SharedBlockTransfer,
+    SharedLoadStoreSpec,
+)
 from spyre_inference.v1.kv_offload.shared_worker import SpyreSharedOffloadingWorker
 from tests.kv_offload.hw_helpers import _assert_bit_exact, _fill_all
 
@@ -90,9 +94,44 @@ def _model_spec(pool_name: str, tp_size: int, cpu_bytes: int) -> dict[str, objec
     }
 
 
-def _manager(plan):
+def _large_offset_model_spec(pool_name: str, cpu_bytes: int) -> dict[str, object]:
+    spec = _model_spec(pool_name, 2, cpu_bytes)
+    spec["rankCaches"] = [
+        {
+            "tpRank": 0,
+            "cacheIndex": 0,
+            "physicalPageBytes": str(4 << 20),
+            "layoutKind": "token-major",
+            "layoutVersion": 1,
+            "localKvHeads": LOCAL_KV_HEADS,
+            "headSize": HEAD_SIZE,
+        },
+        {
+            "tpRank": 0,
+            "cacheIndex": 1,
+            "physicalPageBytes": "4096",
+            "layoutKind": "token-major",
+            "layoutVersion": 1,
+            "localKvHeads": LOCAL_KV_HEADS,
+            "headSize": HEAD_SIZE,
+        },
+        {
+            "tpRank": 1,
+            "cacheIndex": 0,
+            "physicalPageBytes": "4096",
+            "layoutKind": "token-major",
+            "layoutVersion": 1,
+            "localKvHeads": LOCAL_KV_HEADS,
+            "headSize": HEAD_SIZE,
+        },
+    ]
+    return spec
+
+
+def _manager(plan, tp_rank):
     return SpyreSharedOffloadingManager(
         plan=plan,
+        tp_rank=tp_rank,
         cache_policy="lru",
         cache_policy_module_path=None,
         enable_events=False,
@@ -368,7 +407,8 @@ def test_torchrun_tp_shared_pool_round_trip(tmp_path: Path) -> None:
     process, ctl = _start_delegator(tmp_path)
     pool_name = f"/spyre-tp-hw-{os.getpid()}-{uuid.uuid4().hex}"
     plan_path = tmp_path / "planned-pool.json"
-    manager_a = manager_b = None
+    managers_a = []
+    manager_b = None
     store_process = peer_process = None
     generation = None
     try:
@@ -380,17 +420,21 @@ def test_torchrun_tp_shared_pool_round_trip(tmp_path: Path) -> None:
         assert plan.tensor_parallel_size == tp_size
         assert len(plan.partitions) == tp_size
 
-        # This test's controller is intentionally separate from the torchrun
-        # ranks. Keep its metadata-only attachment on the mock runtime so it
-        # does not open a card that a rank worker must own.
+        # The controller attaches each rank on the mock runtime so it never
+        # opens a card owned by a torchrun worker.
         original_flex_device = os.environ.get("FLEX_DEVICE")
         original_flex_compute = os.environ.get("FLEX_COMPUTE")
         os.environ["FLEX_DEVICE"] = "MOCK1p0"
         os.environ["FLEX_COMPUTE"] = "NULL"
-        manager_a = _manager(plan)
-        store_context = ReqContext("cold-store")
+        store_pages = []
         try:
-            store = manager_a.prepare_store([OFFLOAD_KEY], store_context)
+            for rank in range(tp_size):
+                manager = _manager(plan, rank)
+                context = ReqContext(f"cold-store-{rank}")
+                store = manager.prepare_store([OFFLOAD_KEY], context)
+                assert store is not None and store.keys_to_store == [OFFLOAD_KEY]
+                store_pages.extend(store.store_spec.transfers[0].pages)
+                managers_a.append((manager, context))
         finally:
             if original_flex_device is None:
                 os.environ.pop("FLEX_DEVICE", None)
@@ -400,11 +444,11 @@ def test_torchrun_tp_shared_pool_round_trip(tmp_path: Path) -> None:
                 os.environ.pop("FLEX_COMPUTE", None)
             else:
                 os.environ["FLEX_COMPUTE"] = original_flex_compute
-        assert store is not None and store.keys_to_store == [OFFLOAD_KEY]
-        assert len(store.store_spec.transfers[0].pages) == 2 * tp_size
+        assert len(store_pages) == 2 * tp_size
+        store_spec = SharedLoadStoreSpec([SharedBlockTransfer(OFFLOAD_KEY, tuple(store_pages))])
         store_path = tmp_path / "store.pkl"
         same_load_path = tmp_path / "same-load.pkl"
-        _write_pickle(store_path, store.store_spec)
+        _write_pickle(store_path, store_spec)
 
         store_log = tmp_path / "store-torchrun.log"
         with store_log.open("w", encoding="utf-8") as output:
@@ -422,7 +466,9 @@ def test_torchrun_tp_shared_pool_round_trip(tmp_path: Path) -> None:
                 text=True,
             )
         _wait_for(tmp_path / "store.done", store_process, store_log, 300)
-        manager_a.complete_store(store.keys_to_store, store_context, success=True)
+        for manager, context in managers_a:
+            manager.complete_store([OFFLOAD_KEY], context, success=True)
+        manager_a = managers_a[0][0]
         same_context = ReqContext("same-replica-load")
         assert manager_a.lookup(OFFLOAD_KEY, same_context) is LookupResult.HIT
         same_load = manager_a.prepare_load([OFFLOAD_KEY], same_context)
@@ -432,7 +478,7 @@ def test_torchrun_tp_shared_pool_round_trip(tmp_path: Path) -> None:
         )
         manager_a.complete_load([OFFLOAD_KEY], same_context)
 
-        manager_b = _manager(plan)
+        manager_b = _manager(plan, 0)
         peer_context = ReqContext("peer-replica-load")
         assert manager_b.lookup(OFFLOAD_KEY, peer_context) is LookupResult.HIT
         peer_load_path = tmp_path / "peer-load.pkl"
@@ -484,8 +530,8 @@ def test_torchrun_tp_shared_pool_round_trip(tmp_path: Path) -> None:
                 manager_b.shutdown()
         finally:
             try:
-                if manager_a is not None:
-                    manager_a.shutdown()
+                for manager, _ in managers_a:
+                    manager.shutdown()
             finally:
                 try:
                     if generation is not None:
@@ -508,41 +554,51 @@ def test_large_partitioned_arena_preserves_64_bit_offsets_and_edge_slots(
     process, ctl = _start_delegator(tmp_path)
     pool_name = f"/spyre-large-hw-{os.getpid()}-{uuid.uuid4().hex}"
     generation = None
-    metadata = None
-    attached = None
-    registered = None
+    attachments = []
+    by_name = {}
     pool = None
     pools = []
     try:
-        budget = (4 << 30) + (1 << 20)
-        document = ctl.create_model(_model_spec(pool_name, 2, budget))
+        budget = (4 << 30) + (8 << 20)
+        document = ctl.create_model(_large_offset_model_spec(pool_name, budget))
         plan = parse_planned_pool(document)
         generation = plan.identity.generation.hex()
         assert plan.allocated_bytes > 4 << 30
         assert plan.allocated_bytes <= budget
-        assert plan.partitions[-1].offset_bytes > 2 << 30
+        rank_zero = plan.partitions_for_rank(0)
+        assert len(rank_zero) == 2
+        assert rank_zero[-1].offset_bytes >= 4 << 30
 
         from torch_spyre import _C
 
         opened = _C.SharedPool.open_pool(pool_name)
         assert opened.code is _C.PoolResultCode.OK
-        native = opened.descriptor.effective_config.data_pools[0].partitions
-        assert [item.offset_bytes for item in native] == [
-            item.offset_bytes for item in plan.partitions
-        ]
-        assert [item.num_slots for item in native] == [item.num_slots for item in plan.partitions]
-        attached = _C.SharedPool.attach_pool(pool_name, plan.identity.generation)
+        native_arenas = opened.descriptor.effective_config.data_pools
+        assert len(native_arenas) == len(plan.arenas)
+        for native, arena in zip(native_arenas, plan.arenas, strict=True):
+            assert native.name == arena.name
+            assert [item.offset_bytes for item in native.partitions] == [
+                item.offset_bytes for item in arena.partitions
+            ]
+            assert [item.num_slots for item in native.partitions] == [
+                item.num_slots for item in arena.partitions
+            ]
+
+        attached = _C.SharedPool.attach_pool(
+            pool_name,
+            plan.identity.generation,
+            0,
+        )
         assert attached.code is _C.PoolResultCode.OK
-        metadata = attached.metadata
-        for partition in (plan.partitions[0], plan.partitions[-1]):
-            registered = metadata.find_pool(partition.partition_name)
-            pools.append(metadata.resolve_pool(registered.pool_ref))
+        attachment = attached.attachment
+        assert attachment is not None
+        by_name = {item.registration.name: item for item in attachment.data_pools}
+        pools.extend(by_name[partition.partition_name].data_pool for partition in rank_zero)
+        attachments.append(attachment)
 
         torch.spyre.set_device(0)
         torch.spyre._impl._lazy_init()
-        for index, (partition, pool) in enumerate(
-            zip((plan.partitions[0], plan.partitions[-1]), pools, strict=True)
-        ):
+        for index, (partition, pool) in enumerate(zip(rank_zero, pools, strict=True)):
             slot = 0 if index == 0 else partition.num_slots - 1
             source = torch.arange(64, dtype=torch.float16, device="spyre") + 1000 * index
             destination = torch.empty_like(source)
@@ -553,13 +609,12 @@ def test_large_partitioned_arena_preserves_64_bit_offsets_and_edge_slots(
         try:
             pools.clear()
             pool = None
-            registered = None
-            if metadata is not None:
-                from torch_spyre import _C
+            by_name.clear()
+            from torch_spyre import _C
 
-                _C.SharedPool.detach_pool(metadata)
-            metadata = None
-            attached = None
+            for attachment in reversed(attachments):
+                _C.SharedPool.detach_pool(attachment)
+            attachments.clear()
             gc.collect()
             if generation is not None:
                 cleanup_pool(pool_name, generation, ctl=ctl)

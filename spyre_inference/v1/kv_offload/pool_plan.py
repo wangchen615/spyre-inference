@@ -71,6 +71,7 @@ class PlannedRankCache:
 @dataclass(frozen=True)
 class PlannedArena:
     name: str
+    tp_rank: int
     backend: str
     model: str
     kv_dtype: str
@@ -96,7 +97,7 @@ class PlannedPool:
     logical_block_capacity: int
     allocated_bytes: int
     unused_bytes: int
-    arena: PlannedArena
+    arenas: tuple[PlannedArena, ...]
     partitions: tuple[PlannedPartition, ...]
     components: tuple[PlannedComponent, ...]
     rank_caches: tuple[PlannedRankCache, ...] = ()
@@ -108,6 +109,10 @@ class PlannedPool:
                 f"tensor-parallel rank {tp_rank} is outside [0, {self.tensor_parallel_size})"
             )
         return tuple(item for item in self.partitions if item.tp_rank == tp_rank)
+
+    def arena_for_rank(self, tp_rank: int) -> PlannedArena:
+        self.partitions_for_rank(tp_rank)
+        return self.arenas[tp_rank]
 
     def components_for_rank(self, tp_rank: int) -> tuple[PlannedComponent, ...]:
         self.partitions_for_rank(tp_rank)
@@ -307,58 +312,10 @@ def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
         positive=True,
     )
 
-    arenas = _sequence(plan_config.get("dataPools"), "plan.config.dataPools")
-    effective_arenas = _sequence(effective.get("dataPools"), "effectiveConfig.dataPools")
-    if len(arenas) != 1 or len(effective_arenas) != 1:
-        raise ValueError("a planned shared pool must contain exactly one data arena")
-    arena_row = _mapping(arenas[0], "plan.config.dataPools[0]")
-    effective_arena_row = _mapping(effective_arenas[0], "effectiveConfig.dataPools[0]")
-    arena_name = _text(arena_row.get("name"), "planned arena name")
-    if _text(effective_arena_row.get("name"), "effective arena name") != arena_name:
-        raise ValueError("descriptor effective arena differs from the planned config")
-    backend = _text(arena_row.get("backend"), "planned arena backend")
-    if (
-        backend != "HOST_DRAM"
-        or _text(effective_arena_row.get("backend"), "effective arena backend") != backend
-    ):
-        raise ValueError(f"unsupported planned arena backend {backend!r}")
-    compatibility = _mapping(arena_row.get("compatibility"), "arena compatibility")
-    effective_compatibility = _mapping(
-        effective_arena_row.get("compatibility"), "effective arena compatibility"
-    )
-    expected_model = model if not revision else f"{model}@{revision}"
-    if _text(compatibility.get("model"), "compatibility.model") != expected_model:
-        raise ValueError("arena model compatibility does not match the normalized spec")
-    if _text(compatibility.get("kvDtype"), "compatibility.kvDtype") != kv_dtype:
-        raise ValueError("arena KV dtype compatibility does not match the normalized spec")
-    if _uint(compatibility.get("blockSize"), "compatibility.blockSize") != block_size:
-        raise ValueError("arena block size compatibility does not match the normalized spec")
-    if (
-        _uint(
-            compatibility.get("tensorParallelSize"),
-            "compatibility.tensorParallelSize",
-        )
-        != tp_size
-    ):
-        raise ValueError("arena tensor parallel compatibility does not match the plan")
-    layout_signature = _text(compatibility.get("layoutSignature"), "arena layout signature")
-    if len(layout_signature) != 40 or any(
-        character not in "0123456789abcdef" for character in layout_signature
-    ):
-        raise ValueError("arena layout signature must be 40 lowercase hexadecimal digits")
-    compatibility_fields = (
-        "model",
-        "kvDtype",
-        "blockSize",
-        "tensorParallelSize",
-        "layoutSignature",
-    )
-    if any(
-        effective_compatibility.get(field) != compatibility.get(field)
-        for field in compatibility_fields
-    ):
-        raise ValueError("descriptor effective compatibility differs from the planned config")
-
+    raw_arenas = _sequence(plan_config.get("dataPools"), "plan.config.dataPools")
+    raw_effective_arenas = _sequence(effective.get("dataPools"), "effectiveConfig.dataPools")
+    if len(raw_arenas) != tp_size or len(raw_effective_arenas) != tp_size:
+        raise ValueError("a planned shared pool requires exactly one data arena per rank")
     partitions = tuple(
         _parse_partition(value, f"plan.partitions[{index}]")
         for index, value in enumerate(_sequence(plan.get("partitions"), "plan.partitions"))
@@ -383,15 +340,16 @@ def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
         if cache_indices != list(range(len(cache_indices))):
             raise ValueError(f"planned cache indices for rank {rank} are not contiguous")
 
-    expected_offset = 0
+    arena_extents = [0] * tp_size
     for item in partitions:
         expected_name = f"host-r{item.tp_rank}-c{item.cache_index}"
+        expected_arena = f"host-r{item.tp_rank}"
         if item.partition_name != expected_name:
             raise ValueError(
                 f"planned partition name {item.partition_name!r} does not equal "
                 f"the deterministic name {expected_name!r}"
             )
-        if item.arena_name != arena_name:
+        if item.arena_name != expected_arena:
             raise ValueError(f"partition {item.partition_name!r} refers to a foreign arena")
         if item.offset_bytes % mmap.PAGESIZE or item.slot_bytes % mmap.PAGESIZE:
             raise ValueError("planned partition offsets and slot strides must be page aligned")
@@ -401,42 +359,152 @@ def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
             raise ValueError(
                 f"partition {item.partition_name!r} slot stride does not match its physical page"
             )
+        expected_offset = arena_extents[item.tp_rank]
         if item.offset_bytes != expected_offset:
             raise ValueError(
                 f"partition {item.partition_name!r} offset {item.offset_bytes} "
                 f"does not equal exact prefix {expected_offset}"
             )
-        expected_offset = _checked_add(
+        arena_extents[item.tp_rank] = _checked_add(
             expected_offset,
             _checked_multiply(item.num_slots, item.slot_bytes, "partition byte extent"),
             "arena byte extent",
         )
 
-    config_partitions = tuple(
-        _configuration_partition(value, f"arena.partitions[{index}]")
-        for index, value in enumerate(_sequence(arena_row.get("partitions"), "arena.partitions"))
+    expected_model = model if not revision else f"{model}@{revision}"
+    compatibility_fields = (
+        "model",
+        "kvDtype",
+        "blockSize",
+        "tensorParallelSize",
+        "layoutSignature",
     )
-    plan_partition_geometry = tuple(
-        (
-            item.partition_name,
-            item.tp_rank,
-            item.cache_index,
-            item.offset_bytes,
-            item.num_slots,
-            item.slot_bytes,
+    layout_signature = None
+    planned_arenas = []
+    for rank, (raw_arena, raw_effective_arena) in enumerate(
+        zip(raw_arenas, raw_effective_arenas, strict=True)
+    ):
+        field = f"plan.config.dataPools[{rank}]"
+        effective_field = f"effectiveConfig.dataPools[{rank}]"
+        arena_row = _mapping(raw_arena, field)
+        effective_arena_row = _mapping(raw_effective_arena, effective_field)
+        arena_name = _text(arena_row.get("name"), f"{field}.name")
+        expected_arena_name = f"host-r{rank}"
+        if arena_name != expected_arena_name:
+            raise ValueError(f"planned arena for rank {rank} must be named {expected_arena_name!r}")
+        if _text(effective_arena_row.get("name"), f"{effective_field}.name") != arena_name:
+            raise ValueError("descriptor effective arena differs from the planned config")
+        backend = _text(arena_row.get("backend"), f"{field}.backend")
+        if (
+            backend != "HOST_DRAM"
+            or _text(effective_arena_row.get("backend"), f"{effective_field}.backend") != backend
+        ):
+            raise ValueError(f"unsupported planned arena backend {backend!r}")
+
+        compatibility = _mapping(arena_row.get("compatibility"), f"{field}.compatibility")
+        effective_compatibility = _mapping(
+            effective_arena_row.get("compatibility"),
+            f"{effective_field}.compatibility",
         )
-        for item in partitions
-    )
-    if config_partitions != plan_partition_geometry:
-        raise ValueError("arena partition geometry differs from the partition plan")
-    effective_config_partitions = tuple(
-        _configuration_partition(value, f"effectiveArena.partitions[{index}]")
-        for index, value in enumerate(
-            _sequence(effective_arena_row.get("partitions"), "effectiveArena.partitions")
+        if _text(compatibility.get("model"), "compatibility.model") != expected_model:
+            raise ValueError("arena model compatibility does not match the normalized spec")
+        if _text(compatibility.get("kvDtype"), "compatibility.kvDtype") != kv_dtype:
+            raise ValueError("arena KV dtype compatibility does not match the normalized spec")
+        if _uint(compatibility.get("blockSize"), "compatibility.blockSize") != block_size:
+            raise ValueError("arena block size compatibility does not match the normalized spec")
+        if (
+            _uint(
+                compatibility.get("tensorParallelSize"),
+                "compatibility.tensorParallelSize",
+            )
+            != tp_size
+        ):
+            raise ValueError("arena tensor parallel compatibility does not match the plan")
+        signature = _text(compatibility.get("layoutSignature"), "arena layout signature")
+        if len(signature) != 40 or any(
+            character not in "0123456789abcdef" for character in signature
+        ):
+            raise ValueError("arena layout signature must be 40 lowercase hexadecimal digits")
+        if layout_signature is None:
+            layout_signature = signature
+        elif signature != layout_signature:
+            raise ValueError("rank arenas must share one layout signature")
+        if any(
+            effective_compatibility.get(name) != compatibility.get(name)
+            for name in compatibility_fields
+        ):
+            raise ValueError("descriptor effective compatibility differs from the planned config")
+
+        rank_partitions = tuple(item for item in partitions if item.tp_rank == rank)
+        planned_geometry = tuple(
+            (
+                item.partition_name,
+                item.tp_rank,
+                item.cache_index,
+                item.offset_bytes,
+                item.num_slots,
+                item.slot_bytes,
+            )
+            for item in rank_partitions
         )
-    )
-    if effective_config_partitions != plan_partition_geometry:
-        raise ValueError("descriptor effective config partition geometry differs from the plan")
+        config_geometry = tuple(
+            _configuration_partition(value, f"{field}.partitions[{index}]")
+            for index, value in enumerate(
+                _sequence(arena_row.get("partitions"), f"{field}.partitions")
+            )
+        )
+        if config_geometry != planned_geometry:
+            raise ValueError("arena partition geometry differs from the partition plan")
+        effective_geometry = tuple(
+            _configuration_partition(value, f"{effective_field}.partitions[{index}]")
+            for index, value in enumerate(
+                _sequence(
+                    effective_arena_row.get("partitions"),
+                    f"{effective_field}.partitions",
+                )
+            )
+        )
+        if effective_geometry != planned_geometry:
+            raise ValueError("descriptor effective config partition geometry differs from the plan")
+
+        effective_slots = _uint(
+            effective_arena_row.get("numSlots"),
+            f"{effective_field}.numSlots",
+            positive=True,
+        )
+        effective_stride = _uint(
+            effective_arena_row.get("slotBytes"),
+            f"{effective_field}.slotBytes",
+            positive=True,
+        )
+        if (
+            effective_stride != mmap.PAGESIZE
+            or effective_slots != arena_extents[rank] // mmap.PAGESIZE
+        ):
+            raise ValueError("descriptor effective arena summary is not canonical")
+        planned_slots = _uint(arena_row.get("numSlots", 0), f"{field}.numSlots")
+        planned_stride = _uint(arena_row.get("slotBytes", 0), f"{field}.slotBytes")
+        if (planned_slots, planned_stride) not in {
+            (0, 0),
+            (effective_slots, effective_stride),
+        }:
+            raise ValueError("planned arena summary is inconsistent with effective geometry")
+        planned_arenas.append(
+            PlannedArena(
+                name=arena_name,
+                tp_rank=rank,
+                backend=backend,
+                model=expected_model,
+                kv_dtype=kv_dtype,
+                block_size=block_size,
+                tensor_parallel_size=tp_size,
+                partitions=rank_partitions,
+                num_slots=effective_slots,
+                slot_bytes=effective_stride,
+                layout_signature=signature,
+            )
+        )
+    assert layout_signature is not None
 
     raw_rank_caches = _sequence(spec.get("rankCaches"), "plan.normalizedSpec.rankCaches")
     rank_caches = []
@@ -507,7 +575,7 @@ def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
     allocated = _checked_multiply(bytes_per_block, capacity, "allocated bytes")
     if _uint(plan.get("allocatedBytes"), "allocatedBytes") != allocated:
         raise ValueError("allocatedBytes does not match capacity arithmetic")
-    if expected_offset != allocated:
+    if sum(arena_extents) != allocated:
         raise ValueError("partition extents do not match allocatedBytes")
     if budget < allocated:
         raise ValueError("planned allocation exceeds cpuBytesToUse")
@@ -516,29 +584,6 @@ def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
         raise ValueError("unusedBytes does not match budget arithmetic")
     if unused >= bytes_per_block:
         raise ValueError("logicalBlockCapacity is not maximal for cpuBytesToUse")
-    effective_arena_slots = _uint(
-        effective_arena_row.get("numSlots"),
-        "effective arena numSlots",
-        positive=True,
-    )
-    effective_arena_stride = _uint(
-        effective_arena_row.get("slotBytes"),
-        "effective arena slotBytes",
-        positive=True,
-    )
-    if (
-        effective_arena_stride != mmap.PAGESIZE
-        or effective_arena_slots != allocated // mmap.PAGESIZE
-    ):
-        raise ValueError("descriptor effective arena summary is not canonical")
-    planned_arena_slots = _uint(arena_row.get("numSlots", 0), "planned arena numSlots")
-    planned_arena_stride = _uint(arena_row.get("slotBytes", 0), "planned arena slotBytes")
-    if (planned_arena_slots, planned_arena_stride) not in {
-        (0, 0),
-        (effective_arena_slots, effective_arena_stride),
-    }:
-        raise ValueError("planned arena summary is inconsistent with effective geometry")
-
     components = tuple(
         _parse_component(value, f"plan.components[{index}]")
         for index, value in enumerate(_sequence(plan.get("components"), "plan.components"))
@@ -580,21 +625,11 @@ def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
     if actual_component_order != expected_component_order:
         raise ValueError("planned components must use canonical rank/cache/K-then-V order")
 
-    arena = PlannedArena(
-        name=arena_name,
-        backend=backend,
-        model=expected_model,
-        kv_dtype=kv_dtype,
-        block_size=block_size,
-        tensor_parallel_size=tp_size,
-        partitions=partitions,
-        num_slots=effective_arena_slots,
-        slot_bytes=effective_arena_stride,
-        layout_signature=layout_signature,
-    )
     return PlannedPool(
         identity=SharedPoolIdentity(
-            pool_name, _generation(descriptor.get("generation")), arena_name
+            pool_name,
+            _generation(descriptor.get("generation")),
+            planned_arenas[0].name,
         ),
         planning_version=version,
         model=model,
@@ -607,7 +642,7 @@ def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
         logical_block_capacity=capacity,
         allocated_bytes=allocated,
         unused_bytes=unused,
-        arena=arena,
+        arenas=tuple(planned_arenas),
         partitions=partitions,
         components=components,
         rank_caches=tuple(rank_caches),

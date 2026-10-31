@@ -198,9 +198,10 @@ def test_tp_plan_uses_global_capacity_and_requires_external_launcher():
         plan["plan"]["config"],
         plan["poolDescriptor"]["effectiveConfig"],
     ):
-        compatibility = config["dataPools"][0]["compatibility"]
-        compatibility["model"] = "micro-g3.3-8b@revision-1"
-        compatibility["blockSize"] = "128"
+        for arena in config["dataPools"]:
+            compatibility = arena["compatibility"]
+            compatibility["model"] = "micro-g3.3-8b@revision-1"
+            compatibility["blockSize"] = "128"
     spec = _shared_spec_module().SpyreSharedOffloadingSpec(
         _config(world_size=2, extra={"pool_plan": plan})
     )
@@ -226,8 +227,9 @@ def test_tp_plan_rejects_resolved_model_revision_mismatch():
         plan["plan"]["config"],
         plan["poolDescriptor"]["effectiveConfig"],
     ):
-        config["dataPools"][0]["compatibility"]["model"] = "micro-g3.3-8b@revision-1"
-        config["dataPools"][0]["compatibility"]["blockSize"] = "128"
+        for arena in config["dataPools"]:
+            arena["compatibility"]["model"] = "micro-g3.3-8b@revision-1"
+            arena["compatibility"]["blockSize"] = "128"
     spec = _shared_spec_module().SpyreSharedOffloadingSpec(
         _config(world_size=2, extra={"pool_plan": plan})
     )
@@ -458,9 +460,10 @@ def test_planned_worker_factory_receives_complete_plan_and_tp_rank(monkeypatch):
     plan["plan"]["normalizedSpec"]["model"] = "micro-g3.3-8b"
     plan["plan"]["normalizedSpec"]["blockSize"] = "128"
     for config in (plan["plan"]["config"], plan["poolDescriptor"]["effectiveConfig"]):
-        compatibility = config["dataPools"][0]["compatibility"]
-        compatibility["model"] = "micro-g3.3-8b@revision-1"
-        compatibility["blockSize"] = "128"
+        for arena in config["dataPools"]:
+            compatibility = arena["compatibility"]
+            compatibility["model"] = "micro-g3.3-8b@revision-1"
+            compatibility["blockSize"] = "128"
 
     worker_kwargs: dict[str, Any] = {}
 

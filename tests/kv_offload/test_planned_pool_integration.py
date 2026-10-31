@@ -103,9 +103,10 @@ def _model_spec(pool_name: str) -> dict[str, object]:
     }
 
 
-def _manager(plan):
+def _manager(plan, tp_rank):
     return SpyreSharedOffloadingManager(
         plan=plan,
+        tp_rank=tp_rank,
         cache_policy="lru",
         cache_policy_module_path=None,
         enable_events=False,
@@ -130,9 +131,9 @@ with open(document_path, encoding="utf-8") as source:
 with open(token_path, "rb") as source:
     tokens = pickle.load(source)
 rank = int(rank_text)
-attachment = SharedMetadataAttachment.attach(plan)
+attachment = SharedMetadataAttachment.attach(plan, rank)
 try:
-    resolved = attachment.resolve_rank(rank)
+    resolved = attachment.local_partitions
     assert [item.partition.partition_name for item in resolved] == [
         item.partition_name for item in plan.partitions_for_rank(rank)
     ]
@@ -175,7 +176,7 @@ def test_delegator_created_tp4_arena_supports_global_publish_and_rank_local_atta
     document_path = tmp_path / "planned-pool.json"
     daemon = _start_daemon(socket)
     workers: list[subprocess.Popen[str]] = []
-    first_manager = None
+    first_managers = []
     second_manager = None
     current_generation = None
     try:
@@ -186,19 +187,28 @@ def test_delegator_created_tp4_arena_supports_global_publish_and_rank_local_atta
         plan = parse_planned_pool(document)
         current_generation = plan.identity.generation.hex()
 
-        assert len(document["plan"]["config"]["dataPools"]) == 1
-        assert plan.arena.name == "host-0"
+        assert len(document["plan"]["config"]["dataPools"]) == 4
+        assert [arena.name for arena in plan.arenas] == [
+            "host-r0",
+            "host-r1",
+            "host-r2",
+            "host-r3",
+        ]
         assert len(plan.partitions) == 6
         assert {item.slot_bytes for item in plan.partitions} == {4096, 8192}
-        assert [item.offset_bytes for item in plan.partitions] == sorted(
-            item.offset_bytes for item in plan.partitions
-        )
+        for rank in range(plan.tensor_parallel_size):
+            offsets = [item.offset_bytes for item in plan.partitions_for_rank(rank)]
+            assert offsets[0] == 0
+            assert offsets == sorted(offsets)
 
-        first_manager = _manager(plan)
-        store_context = ReqContext("store")
-        prepared = first_manager.prepare_store([OFFLOAD_KEY], store_context)
-        assert prepared is not None
-        pages = prepared.store_spec.transfers[0].pages
+        pages = []
+        for rank in range(plan.tensor_parallel_size):
+            manager = _manager(plan, rank)
+            store_context = ReqContext(f"store-{rank}")
+            prepared = manager.prepare_store([OFFLOAD_KEY], store_context)
+            assert prepared is not None
+            pages.extend(prepared.store_spec.transfers[0].pages)
+            first_managers.append((manager, store_context))
         assert len(pages) == len(plan.components)
 
         worker_env = _worker_environment()
@@ -236,8 +246,9 @@ def test_delegator_created_tp4_arena_supports_global_publish_and_rank_local_atta
             assert worker.stdout is not None and worker.stderr is not None
             assert worker.stdout.readline().strip() == "READY", worker.stderr.read()
 
-        first_manager.complete_store([OFFLOAD_KEY], store_context, success=True)
-        second_manager = _manager(plan)
+        for manager, store_context in first_managers:
+            manager.complete_store([OFFLOAD_KEY], store_context, success=True)
+        second_manager = _manager(plan, 0)
         load_context = ReqContext("load")
         assert second_manager.lookup(OFFLOAD_KEY, load_context) is LookupResult.HIT
         second_manager.on_request_finished(load_context)
@@ -260,8 +271,9 @@ def test_delegator_created_tp4_arena_supports_global_publish_and_rank_local_atta
         workers.clear()
         second_manager.shutdown()
         second_manager = None
-        first_manager.shutdown()
-        first_manager = None
+        for manager, _ in first_managers:
+            manager.shutdown()
+        first_managers.clear()
 
         destroyed = _run_ctl(
             socket,
@@ -280,9 +292,9 @@ def test_delegator_created_tp4_arena_supports_global_publish_and_rank_local_atta
 
         from torch_spyre import _C
 
-        stale = _C.SharedPool.attach_pool(pool_name, plan.identity.generation)
+        stale = _C.SharedPool.attach_pool(pool_name, plan.identity.generation, 0)
         assert stale.code is _C.PoolResultCode.STALE_GENERATION
-        assert stale.metadata is None
+        assert stale.attachment is None
     finally:
         for worker in workers:
             if worker.poll() is None:
@@ -290,8 +302,8 @@ def test_delegator_created_tp4_arena_supports_global_publish_and_rank_local_atta
                 worker.wait(timeout=10)
         if second_manager is not None:
             second_manager.shutdown()
-        if first_manager is not None:
-            first_manager.shutdown()
+        for manager, _ in first_managers:
+            manager.shutdown()
         if current_generation is not None:
             _run_ctl(
                 socket,

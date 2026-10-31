@@ -169,13 +169,6 @@ class FakeDirectory:
     def find_pool(self, name):
         return self.registrations.get(name)
 
-    def resolve_pool(self, pool_ref):
-        return (
-            self.data_pool
-            if any(row.pool_ref == pool_ref for row in self.registrations.values())
-            else None
-        )
-
     def lookup(self, key):
         self.lookup_calls.append(key)
         return self.entries.get(key.block_hash)
@@ -271,13 +264,40 @@ class FakePoolConfig:
 def _runtime(directory: FakeDirectory):
     class FakeSharedPool:
         @staticmethod
-        def attach_pool(name, generation, expected_config=None):
-            directory.attach_calls.append(("attach", name, generation, expected_config))
-            return SimpleNamespace(code=_Code.OK, metadata=directory, detail="")
+        def attach_pool(name, generation, expected_config_or_rank, tp_rank=None):
+            expected_config = None if tp_rank is None else expected_config_or_rank
+            rank = expected_config_or_rank if tp_rank is None else tp_rank
+            directory.attach_calls.append(("attach", name, generation, expected_config, rank))
+            if expected_config is None:
+                local_names = [directory.registered.name]
+            else:
+                local_names = [
+                    partition.name
+                    for arena in expected_config.data_pools
+                    for partition in arena.partitions
+                    if partition.tp_rank == rank
+                ]
+            native_attachment = SimpleNamespace(
+                tp_rank=rank,
+                metadata=directory,
+                data_pools=[
+                    SimpleNamespace(
+                        registration=directory.registrations[local_name],
+                        data_pool=directory.data_pool,
+                    )
+                    for local_name in local_names
+                ],
+            )
+            directory.native_attachment = native_attachment
+            return SimpleNamespace(
+                code=_Code.OK,
+                attachment=native_attachment,
+                detail="",
+            )
 
         @staticmethod
-        def detach_pool(metadata):
-            assert metadata is directory
+        def detach_pool(attachment):
+            assert attachment is directory.native_attachment
             directory.lifecycle_calls.append(("detach",))
 
         @staticmethod
@@ -339,15 +359,16 @@ def _manager_directory_runtime(
 
 
 def _tp_plan(cache_counts: tuple[int, ...]) -> PlannedPool:
-    identity = SharedPoolIdentity("shared-root", GENERATION, "host-0")
+    identity = SharedPoolIdentity("shared-root", GENERATION, "host-r0")
     partitions = []
     components = []
-    offset = 0
+    allocated_bytes = 0
     for tp_rank, cache_count in enumerate(cache_counts):
+        offset = 0
         for cache_index in range(cache_count):
             partition = PlannedPartition(
                 partition_id=len(partitions),
-                arena_name="host-0",
+                arena_name=f"host-r{tp_rank}",
                 partition_name=f"host-r{tp_rank}-c{cache_index}",
                 tp_rank=tp_rank,
                 cache_index=cache_index,
@@ -364,7 +385,7 @@ def _tp_plan(cache_counts: tuple[int, ...]) -> PlannedPool:
                         tp_rank=tp_rank,
                         cache_index=cache_index,
                         role=role,
-                        arena_name="host-0",
+                        arena_name=f"host-r{tp_rank}",
                         partition_name=partition.partition_name,
                         partition_id=partition.partition_id,
                         partition_offset_bytes=offset,
@@ -373,6 +394,7 @@ def _tp_plan(cache_counts: tuple[int, ...]) -> PlannedPool:
                     )
                 )
             offset += 4 * 4096
+            allocated_bytes += 4 * 4096
     partition_tuple = tuple(partitions)
     return PlannedPool(
         identity=identity,
@@ -382,22 +404,28 @@ def _tp_plan(cache_counts: tuple[int, ...]) -> PlannedPool:
         kv_dtype="float16",
         block_size=128,
         tensor_parallel_size=len(cache_counts),
-        cpu_bytes_to_use=offset,
+        cpu_bytes_to_use=allocated_bytes,
         bytes_per_complete_block=2 * 4096 * len(partitions),
         logical_block_capacity=2,
-        allocated_bytes=offset,
+        allocated_bytes=allocated_bytes,
         unused_bytes=0,
-        arena=PlannedArena(
-            name="host-0",
-            backend="HOST_DRAM",
-            model="model-a@rev-a",
-            kv_dtype="float16",
-            block_size=128,
-            tensor_parallel_size=len(cache_counts),
-            partitions=partition_tuple,
-            num_slots=offset // 4096,
-            slot_bytes=4096,
-            layout_signature="ab" * 20,
+        arenas=tuple(
+            PlannedArena(
+                name=f"host-r{tp_rank}",
+                tp_rank=tp_rank,
+                backend="HOST_DRAM",
+                model="model-a@rev-a",
+                kv_dtype="float16",
+                block_size=128,
+                tensor_parallel_size=len(cache_counts),
+                partitions=tuple(item for item in partition_tuple if item.tp_rank == tp_rank),
+                num_slots=sum(
+                    item.num_slots for item in partition_tuple if item.tp_rank == tp_rank
+                ),
+                slot_bytes=4096,
+                layout_signature="ab" * 20,
+            )
+            for tp_rank in range(len(cache_counts))
         ),
         partitions=partition_tuple,
         components=tuple(components),
@@ -409,7 +437,7 @@ def _tp4_plan() -> PlannedPool:
     return _tp_plan((1, 2, 1, 3))
 
 
-def _global_manager_directory_runtime(*, plan=None, tp_rank=None, directory=None, runtime=None):
+def _global_manager_directory_runtime(*, plan=None, tp_rank=0, directory=None, runtime=None):
     plan = plan or _tp4_plan()
     if directory is None:
         registrations = {
@@ -440,6 +468,11 @@ def _global_manager_directory_runtime(*, plan=None, tp_rank=None, directory=None
 @pytest.fixture
 def manager_directory_runtime():
     return _manager_directory_runtime()
+
+
+def test_planned_manager_requires_tensor_parallel_rank():
+    with pytest.raises(ValueError, match="requires a tensor-parallel rank"):
+        _global_manager_directory_runtime(tp_rank=None)
 
 
 def _compatible_key(directory, runtime, key, component_id):
@@ -485,7 +518,7 @@ def test_directory_attach_lazily_sizes_policy_from_registered_pool(
 
     assert manager.lookup(OFFLOAD_KEY, ReqContext("request-1")) is LookupResult.MISS
 
-    assert directory.attach_calls == [("attach", "shared-root", GENERATION, None)]
+    assert directory.attach_calls == [("attach", "shared-root", GENERATION, None, 0)]
     assert manager._local_manager is not None
     assert manager._local_manager._num_chunks == 2
 
@@ -938,7 +971,8 @@ def test_hit_pending_does_not_scan_partial_directory(manager_directory_runtime):
 
 
 def test_tp4_store_claims_every_component_in_its_planned_partition_with_tokens():
-    manager, directory, _, plan = _global_manager_directory_runtime()
+    manager, directory, _, plan = _global_manager_directory_runtime(tp_rank=3)
+    local_components = plan.components_for_rank(3)
     for component in plan.components:
         directory.claim_results[shared_page_hash(OFFLOAD_KEY, component.global_component_id)] = (
             component.global_component_id % 4
@@ -948,18 +982,19 @@ def test_tp4_store_claims_every_component_in_its_planned_partition_with_tokens()
 
     assert output is not None
     pages = output.store_spec.transfers[0].pages
-    assert len(pages) == len(plan.components)
+    assert len(pages) == len(local_components)
     assert all(isinstance(page.reservation, FakeReservationToken) for page in pages)
     assert [pool_ref for pool_ref, _ in directory.claim_calls] == [
-        directory.registrations[component.partition_name].pool_ref for component in plan.components
+        directory.registrations[component.partition_name].pool_ref for component in local_components
     ]
     assert manager._local_manager._num_chunks == plan.logical_block_capacity
     expected_config = directory.attach_calls[0][3]
     assert expected_config.name == plan.identity.pool_name
-    assert expected_config.data_pools[0].num_slots == plan.arena.num_slots
+    assert expected_config.data_pools[0].num_slots == plan.arena_for_rank(0).num_slots
     assert expected_config.data_pools[0].compatibility.layout_signature == (
-        plan.arena.layout_signature
+        plan.arena_for_rank(0).layout_signature
     )
+    assert directory.attach_calls[0][4] == 3
 
 
 def test_rank_local_stores_require_all_ranks_before_global_lookup_hits():
@@ -1015,8 +1050,9 @@ def test_tp4_lookup_requires_every_global_component(missing_component):
 
 @pytest.mark.parametrize("outcome", [FakeNoSpace(), FakeUnavailable()])
 def test_tp4_claim_failure_aborts_every_prior_partition_reservation(outcome):
-    manager, directory, _, plan = _global_manager_directory_runtime()
-    failed_component = plan.components[8]
+    manager, directory, _, plan = _global_manager_directory_runtime(tp_rank=3)
+    local_components = plan.components_for_rank(3)
+    failed_component = local_components[2]
     for component in plan.components:
         page_hash = shared_page_hash(OFFLOAD_KEY, component.global_component_id)
         directory.claim_results[page_hash] = component.global_component_id % 4
@@ -1031,12 +1067,13 @@ def test_tp4_claim_failure_aborts_every_prior_partition_reservation(outcome):
         result = manager.prepare_store([OFFLOAD_KEY], ReqContext("store"))
         assert result is not None and result.keys_to_store == []
 
-    assert len(directory.aborted) == failed_component.global_component_id
+    assert len(directory.aborted) == 2
     assert directory.live_reservations == []
 
 
 def test_failed_tp4_completion_cleans_reserved_and_published_components():
-    manager, directory, _, plan = _global_manager_directory_runtime()
+    manager, directory, _, plan = _global_manager_directory_runtime(tp_rank=3)
+    local_components = plan.components_for_rank(3)
     for component in plan.components:
         directory.claim_results[shared_page_hash(OFFLOAD_KEY, component.global_component_id)] = (
             component.global_component_id % 4
@@ -1051,7 +1088,7 @@ def test_failed_tp4_completion_cleans_reserved_and_published_components():
     manager.complete_store(output.keys_to_store, ctx, success=False)
 
     assert len(directory.evicted) == 3
-    assert len(directory.aborted) == len(plan.components) - 3
+    assert len(directory.aborted) == len(local_components) - 3
     assert directory.live_reservations == []
 
 

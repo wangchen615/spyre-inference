@@ -55,11 +55,11 @@ def valid_planned_pool_document() -> dict:
     partitions = [
         {
             "partitionId": str(rank),
-            "arenaName": "host-0",
+            "arenaName": f"host-r{rank}",
             "partitionName": f"host-r{rank}-c0",
             "tpRank": rank,
             "cacheIndex": 0,
-            "offsetBytes": str(rank * 16_384),
+            "offsetBytes": "0",
             "numSlots": "4",
             "slotBytes": "4096",
             "physicalPageBytes": "3000",
@@ -75,7 +75,7 @@ def valid_planned_pool_document() -> dict:
                     "tpRank": partition["tpRank"],
                     "cacheIndex": 0,
                     "role": role,
-                    "arenaName": "host-0",
+                    "arenaName": partition["arenaName"],
                     "partitionName": partition["partitionName"],
                     "partitionId": partition["partitionId"],
                     "partitionOffsetBytes": partition["offsetBytes"],
@@ -94,36 +94,39 @@ def valid_planned_pool_document() -> dict:
         "cpuBytesToUse": "40000",
         "rankCaches": rank_caches,
     }
-    arena = {
-        "name": "host-0",
-        "backend": "HOST_DRAM",
-        "compatibility": {
-            "model": "model-a@revision-1",
-            "kvDtype": "float16",
-            "blockSize": "16",
-            "tensorParallelSize": 2,
-            "layoutSignature": layout_signature,
-        },
-        "partitions": [
-            {
-                "name": partition["partitionName"],
-                "tpRank": partition["tpRank"],
-                "cacheIndex": 0,
-                "numSlots": "4",
-                "slotBytes": "4096",
-                "offsetBytes": partition["offsetBytes"],
-            }
-            for partition in partitions
-        ],
-    }
+    arenas = [
+        {
+            "name": f"host-r{rank}",
+            "backend": "HOST_DRAM",
+            "compatibility": {
+                "model": "model-a@revision-1",
+                "kvDtype": "float16",
+                "blockSize": "16",
+                "tensorParallelSize": 2,
+                "layoutSignature": layout_signature,
+            },
+            "partitions": [
+                {
+                    "name": partitions[rank]["partitionName"],
+                    "tpRank": rank,
+                    "cacheIndex": 0,
+                    "numSlots": "4",
+                    "slotBytes": "4096",
+                    "offsetBytes": "0",
+                }
+            ],
+        }
+        for rank in range(2)
+    ]
     config = {
         "name": "/model-a",
         "metadata": {"maxChunks": 1},
-        "dataPools": [arena],
+        "dataPools": arenas,
     }
     effective_config = copy.deepcopy(config)
-    effective_config["dataPools"][0]["numSlots"] = "8"
-    effective_config["dataPools"][0]["slotBytes"] = "4096"
+    for arena in effective_config["dataPools"]:
+        arena["numSlots"] = "4"
+        arena["slotBytes"] = "4096"
     return {
         "code": "OK",
         "poolDescriptor": {
@@ -153,7 +156,8 @@ def test_parser_returns_immutable_complete_plan():
     assert plan.identity.generation == GENERATION
     assert plan.tensor_parallel_size == 2
     assert plan.logical_block_capacity == 2
-    assert plan.arena.name == "host-0"
+    assert [arena.name for arena in plan.arenas] == ["host-r0", "host-r1"]
+    assert plan.arena_for_rank(1).name == "host-r1"
     assert [(p.tp_rank, p.cache_index) for p in plan.partitions] == [(0, 0), (1, 0)]
     assert [component.role for component in plan.components] == ["k", "v", "k", "v"]
     with pytest.raises(FrozenInstanceError):
@@ -199,7 +203,7 @@ def test_environment_path_is_used_when_inline_is_absent(tmp_path):
 
     plan = load_planned_pool({}, environ={"SPYRE_KV_POOL_PLAN_PATH": str(path)})
 
-    assert plan.arena.name == "host-0"
+    assert plan.arena_for_rank(0).name == "host-r0"
 
 
 def test_explicit_path_wins_over_environment_inline(tmp_path):
@@ -281,13 +285,24 @@ def test_parser_recalculates_scalar_and_geometry_invariants(document, match):
         parse_planned_pool(document)
 
 
-def test_parser_requires_exactly_one_arena():
-    for arenas in ([], [valid_planned_pool_document()["plan"]["config"]["dataPools"][0]] * 2):
+def test_parser_requires_exactly_one_arena_per_tensor_parallel_rank():
+    valid = valid_planned_pool_document()["plan"]["config"]["dataPools"]
+    for arenas in ([], valid[:1]):
         document = valid_planned_pool_document()
         document["plan"]["config"]["dataPools"] = arenas
         document["poolDescriptor"]["effectiveConfig"] = copy.deepcopy(document["plan"]["config"])
-        with pytest.raises(ValueError, match="one.*arena"):
+        with pytest.raises(ValueError, match="arena.*rank|rank.*arena"):
             parse_planned_pool(document)
+
+    duplicate = valid_planned_pool_document()
+    duplicate["plan"]["config"]["dataPools"][1] = copy.deepcopy(
+        duplicate["plan"]["config"]["dataPools"][0]
+    )
+    duplicate["poolDescriptor"]["effectiveConfig"]["dataPools"][1] = copy.deepcopy(
+        duplicate["poolDescriptor"]["effectiveConfig"]["dataPools"][0]
+    )
+    with pytest.raises(ValueError, match="arena.*rank|rank.*arena"):
+        parse_planned_pool(duplicate)
 
 
 @pytest.mark.parametrize("collection", ["partitions", "components"])
@@ -307,11 +322,11 @@ def test_parser_rejects_foreign_component_partition():
         parse_planned_pool(document)
 
 
-@pytest.mark.parametrize("offset", ["1", "16385"])
+@pytest.mark.parametrize("offset", ["1", "4096"])
 def test_parser_rejects_gapped_or_overlapping_partition_offsets(offset):
     document = valid_planned_pool_document()
-    document["plan"]["partitions"][1]["offsetBytes"] = offset
-    document["plan"]["config"]["dataPools"][0]["partitions"][1]["offsetBytes"] = offset
+    document["plan"]["partitions"][0]["offsetBytes"] = offset
+    document["plan"]["config"]["dataPools"][0]["partitions"][0]["offsetBytes"] = offset
     document["poolDescriptor"]["effectiveConfig"] = copy.deepcopy(document["plan"]["config"])
 
     with pytest.raises(ValueError, match="offset"):
@@ -331,7 +346,7 @@ def test_parser_requires_every_tensor_parallel_rank():
     document["plan"]["normalizedSpec"]["rankCaches"].pop()
     document["plan"]["partitions"].pop()
     document["plan"]["components"] = document["plan"]["components"][:2]
-    document["plan"]["config"]["dataPools"][0]["partitions"].pop()
+    document["plan"]["config"]["dataPools"].pop()
     document["poolDescriptor"]["effectiveConfig"] = copy.deepcopy(document["plan"]["config"])
 
     with pytest.raises(ValueError, match="rank"):

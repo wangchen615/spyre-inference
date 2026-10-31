@@ -1,5 +1,10 @@
 # Spyre Shared KV M4 Two-Instance Manual Demo
 
+> **Historical flat-pool procedure:** This document records the original M4
+> TP1 demonstration. For the current model-resolved, partitioned M3-on-M4
+> procedure and freshly verified results, use
+> [2026-10-30-spyre-shared-kv-m4-full-stack-runbook.md](2026-10-30-spyre-shared-kv-m4-full-stack-runbook.md).
+
 This runbook starts two independent vLLM instances on separate Spyre cards and
 demonstrates that instance A can compute and publish KV pages that are later
 loaded by both A and B from one persistent, node-local Flex M4 pool.

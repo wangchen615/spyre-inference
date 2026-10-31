@@ -92,16 +92,24 @@ class _PoolConfig:
 def fake_runtime():
     calls = []
     metadata = SimpleNamespace()
-    registered = SimpleNamespace(pool_ref=POOL_REF, slot_count=8, slot_bytes=4096)
+    registered = SimpleNamespace(
+        name="host-0",
+        pool_ref=POOL_REF,
+        slot_count=8,
+        slot_bytes=4096,
+    )
     data_pool = object()
+    native_attachment = SimpleNamespace(
+        tp_rank=0,
+        metadata=metadata,
+        data_pools=[SimpleNamespace(registration=registered, data_pool=data_pool)],
+    )
     state = SimpleNamespace(
         attach_code=_Code.OK,
-        attach_metadata=metadata,
+        attach_attachment=native_attachment,
         detail="",
         find_result=registered,
-        resolve_result=data_pool,
         find_error=None,
-        resolve_error=None,
     )
 
     def find_pool(name):
@@ -110,25 +118,20 @@ def fake_runtime():
             raise state.find_error
         return state.find_result
 
-    def resolve_pool(pool_ref):
-        calls.append(("resolve", pool_ref))
-        if state.resolve_error is not None:
-            raise state.resolve_error
-        return state.resolve_result
-
     metadata.find_pool = find_pool
-    metadata.resolve_pool = resolve_pool
 
     class FakeSharedPool:
         @staticmethod
-        def attach_pool(name, generation, expected_config=None):
+        def attach_pool(name, generation, expected_config_or_rank, tp_rank=None):
             call = ("attach", name, generation)
-            if expected_config is not None:
-                call += (expected_config,)
+            if tp_rank is None:
+                call += (expected_config_or_rank,)
+            else:
+                call += (expected_config_or_rank, tp_rank)
             calls.append(call)
             return SimpleNamespace(
                 code=state.attach_code,
-                metadata=state.attach_metadata,
+                attachment=state.attach_attachment,
                 detail=state.detail,
             )
 
@@ -154,6 +157,7 @@ def fake_runtime():
         calls=calls,
         state=state,
         metadata=metadata,
+        native_attachment=native_attachment,
         registered=registered,
         data_pool=data_pool,
         PoolBackend=_Backend,
@@ -165,14 +169,12 @@ def fake_runtime():
     )
 
 
-def test_attach_resolves_precreated_child_and_close_detaches_once(fake_runtime):
+def test_legacy_attach_eagerly_returns_rank_zero_child_and_close_detaches_once(
+    fake_runtime,
+):
     attachment = SharedPoolAttachment.attach(IDENTITY, lambda: fake_runtime)
 
-    assert fake_runtime.calls == [
-        ("attach", "root", GENERATION),
-        ("find", "host-0"),
-        ("resolve", POOL_REF),
-    ]
+    assert fake_runtime.calls == [("attach", "root", GENERATION, 0)]
     assert attachment.metadata is fake_runtime.metadata
     assert attachment.registered is fake_runtime.registered
     assert attachment.data_pool is fake_runtime.data_pool
@@ -180,10 +182,27 @@ def test_attach_resolves_precreated_child_and_close_detaches_once(fake_runtime):
     attachment.close()
     attachment.close()
 
-    assert fake_runtime.calls.count(("detach", fake_runtime.metadata)) == 1
+    assert fake_runtime.calls.count(("detach", fake_runtime.native_attachment)) == 1
     assert attachment.metadata is None
     assert attachment.registered is None
     assert attachment.data_pool is None
+
+
+def test_legacy_attach_selects_named_child_from_all_eager_rank_zero_children(
+    fake_runtime,
+):
+    extra = SimpleNamespace(
+        registration=SimpleNamespace(name="host-extra"),
+        data_pool=object(),
+    )
+    fake_runtime.native_attachment.data_pools.append(extra)
+
+    attachment = SharedPoolAttachment.attach(IDENTITY, lambda: fake_runtime)
+
+    assert attachment.registered is fake_runtime.registered
+    assert attachment.data_pool is fake_runtime.data_pool
+    attachment.close()
+    assert fake_runtime.calls.count(("detach", fake_runtime.native_attachment)) == 1
 
 
 @pytest.mark.parametrize(
@@ -199,46 +218,29 @@ def test_attach_resolves_precreated_child_and_close_detaches_once(fake_runtime):
 )
 def test_structured_attach_failure_names_result(code, fake_runtime):
     fake_runtime.state.attach_code = getattr(_Code, code)
-    fake_runtime.state.attach_metadata = None
+    fake_runtime.state.attach_attachment = None
     fake_runtime.state.detail = "runtime detail"
 
     with pytest.raises(RuntimeError, match=rf"{code}.*runtime detail"):
         SharedPoolAttachment.attach(IDENTITY, lambda: fake_runtime)
 
-    assert fake_runtime.calls == [("attach", "root", GENERATION)]
+    assert fake_runtime.calls == [("attach", "root", GENERATION, 0)]
 
 
-def test_ok_without_metadata_is_rejected(fake_runtime):
-    fake_runtime.state.attach_metadata = None
+def test_ok_without_attachment_is_rejected(fake_runtime):
+    fake_runtime.state.attach_attachment = None
 
-    with pytest.raises(RuntimeError, match="OK.*no metadata"):
+    with pytest.raises(RuntimeError, match="OK.*no attachment"):
         SharedPoolAttachment.attach(IDENTITY, lambda: fake_runtime)
 
 
-@pytest.mark.parametrize(
-    ("failure_stage", "message"),
-    [("find_missing", "is not configured"), ("resolve_missing", "cannot be resolved")],
-)
-def test_resolution_failure_after_attach_detaches_once(fake_runtime, failure_stage, message):
-    if failure_stage == "find_missing":
-        fake_runtime.state.find_result = None
-    else:
-        fake_runtime.state.resolve_result = None
+def test_missing_eager_child_after_attach_detaches_once(fake_runtime):
+    fake_runtime.native_attachment.data_pools = []
 
-    with pytest.raises(RuntimeError, match=message):
+    with pytest.raises(RuntimeError, match="was not eagerly attached"):
         SharedPoolAttachment.attach(IDENTITY, lambda: fake_runtime)
 
-    assert fake_runtime.calls.count(("detach", fake_runtime.metadata)) == 1
-
-
-@pytest.mark.parametrize("failure_stage", ["find", "resolve"])
-def test_resolution_exception_after_attach_detaches_once(fake_runtime, failure_stage):
-    setattr(fake_runtime.state, f"{failure_stage}_error", RuntimeError("resolution failed"))
-
-    with pytest.raises(RuntimeError, match="resolution failed"):
-        SharedPoolAttachment.attach(IDENTITY, lambda: fake_runtime)
-
-    assert fake_runtime.calls.count(("detach", fake_runtime.metadata)) == 1
+    assert fake_runtime.calls.count(("detach", fake_runtime.native_attachment)) == 1
 
 
 def test_attachment_path_never_invokes_management_calls(fake_runtime):
@@ -257,13 +259,13 @@ def test_finalizer_stays_no_throw_during_module_teardown(fake_runtime, monkeypat
 
     attachment.__del__()
 
-    assert fake_runtime.calls.count(("detach", fake_runtime.metadata)) == 0
+    assert fake_runtime.calls.count(("detach", fake_runtime.native_attachment)) == 0
 
 
-def test_metadata_attachment_registers_every_partition_without_mapping(fake_runtime):
-    plan = parse_planned_pool(valid_planned_pool_document())
+def _configure_planned_rank(fake_runtime, plan, tp_rank):
     registrations = {
         partition.partition_name: SimpleNamespace(
+            name=partition.partition_name,
             pool_ref=object(),
             slot_count=partition.num_slots,
             slot_bytes=partition.slot_bytes,
@@ -273,38 +275,68 @@ def test_metadata_attachment_registers_every_partition_without_mapping(fake_runt
     fake_runtime.metadata.find_pool = lambda name: (
         fake_runtime.calls.append(("find", name)) or registrations.get(name)
     )
+    local_entries = [
+        SimpleNamespace(
+            registration=registrations[partition.partition_name],
+            data_pool=f"view:{partition.partition_name}",
+        )
+        for partition in plan.partitions_for_rank(tp_rank)
+    ]
+    native_attachment = SimpleNamespace(
+        tp_rank=tp_rank,
+        metadata=fake_runtime.metadata,
+        data_pools=local_entries,
+    )
+    fake_runtime.state.attach_attachment = native_attachment
+    return registrations, native_attachment
 
-    attachment = SharedMetadataAttachment.attach(plan, lambda: fake_runtime)
+
+def test_planned_attach_registers_global_directory_and_returns_eager_rank_entries(
+    fake_runtime,
+):
+    plan = parse_planned_pool(valid_planned_pool_document())
+    registrations, native_attachment = _configure_planned_rank(fake_runtime, plan, 1)
+
+    attachment = SharedMetadataAttachment.attach(plan, 1, lambda: fake_runtime)
 
     assert set(attachment.registered) == set(registrations)
     expected_config = fake_runtime.calls[0][3]
-    assert expected_config.name == plan.identity.pool_name
-    assert expected_config.data_pools[0].num_slots == plan.arena.num_slots
-    assert expected_config.data_pools[0].partitions[0].offset_bytes == 0
-    assert all(call[0] != "resolve" for call in fake_runtime.calls)
-    attachment.close()
-
-
-def test_rank_resolver_maps_only_local_partitions(fake_runtime):
-    plan = parse_planned_pool(valid_planned_pool_document())
-    registrations = {
-        partition.partition_name: SimpleNamespace(
-            pool_ref=partition.partition_name,
-            slot_count=partition.num_slots,
-            slot_bytes=partition.slot_bytes,
-        )
-        for partition in plan.partitions
-    }
-    fake_runtime.metadata.find_pool = registrations.get
-    fake_runtime.metadata.resolve_pool = lambda pool_ref: (
-        fake_runtime.calls.append(("resolve", pool_ref)) or f"view:{pool_ref}"
+    assert fake_runtime.calls[0] == (
+        "attach",
+        plan.identity.pool_name,
+        plan.identity.generation,
+        expected_config,
+        1,
     )
-    attachment = SharedMetadataAttachment.attach(plan, lambda: fake_runtime)
-
-    resolved = attachment.resolve_rank(1)
-
-    assert [item.partition.tp_rank for item in resolved] == [1]
-    assert [call for call in fake_runtime.calls if call[0] == "resolve"] == [
-        ("resolve", "host-r1-c0")
+    assert expected_config.name == plan.identity.pool_name
+    assert len(expected_config.data_pools) == plan.tensor_parallel_size
+    assert expected_config.data_pools[0].num_slots == plan.arena_for_rank(0).num_slots
+    assert expected_config.data_pools[0].partitions[0].offset_bytes == 0
+    assert [item.partition.tp_rank for item in attachment.local_partitions] == [1]
+    assert [item.registered for item in attachment.local_partitions] == [
+        registrations["host-r1-c0"]
     ]
+    assert [item.data_pool for item in attachment.local_partitions] == ["view:host-r1-c0"]
     attachment.close()
+    assert fake_runtime.calls.count(("detach", native_attachment)) == 1
+
+
+def test_planned_attach_rejects_native_attachment_for_another_rank(fake_runtime):
+    plan = parse_planned_pool(valid_planned_pool_document())
+    _, native_attachment = _configure_planned_rank(fake_runtime, plan, 0)
+
+    with pytest.raises(RuntimeError, match="returned tensor-parallel rank 0, expected 1"):
+        SharedMetadataAttachment.attach(plan, 1, lambda: fake_runtime)
+
+    assert fake_runtime.calls.count(("detach", native_attachment)) == 1
+
+
+def test_planned_attach_rejects_missing_eager_local_partition(fake_runtime):
+    plan = parse_planned_pool(valid_planned_pool_document())
+    _, native_attachment = _configure_planned_rank(fake_runtime, plan, 1)
+    native_attachment.data_pools = []
+
+    with pytest.raises(RuntimeError, match="missing eager rank-local partitions"):
+        SharedMetadataAttachment.attach(plan, 1, lambda: fake_runtime)
+
+    assert fake_runtime.calls.count(("detach", native_attachment)) == 1

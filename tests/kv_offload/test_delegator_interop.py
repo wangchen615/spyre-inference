@@ -209,16 +209,19 @@ def test_external_delegator_reports_busy_until_torch_spyre_detaches(tmp_path):
 import sys
 from torch_spyre import _C
 name, generation_hex, child = sys.argv[1:]
-attached = _C.SharedPool.attach_pool(name, bytes.fromhex(generation_hex))
+attached = _C.SharedPool.attach_pool(name, bytes.fromhex(generation_hex), 0)
 assert attached.code is _C.PoolResultCode.OK, (attached.code, attached.detail)
-metadata = attached.metadata
-registered = metadata.find_pool(child)
-assert registered is not None
-assert metadata.resolve_pool(registered.pool_ref) is not None
+attachment = attached.attachment
+assert attachment is not None
+by_name = {item.registration.name: item for item in attachment.data_pools}
+assert child in by_name
+assert by_name[child].data_pool is not None
 print("attached", flush=True)
 assert sys.stdin.readline().strip() == "detach"
-_C.SharedPool.detach_pool(metadata)
+by_name.clear()
+_C.SharedPool.detach_pool(attachment)
 print("detached", flush=True)
+assert sys.stdin.readline().strip() == "exit"
 """
         attached_process = subprocess.Popen(
             [
@@ -253,12 +256,15 @@ print("detached", flush=True)
         assert attached_process.stdin is not None
         attached_process.stdin.write("detach\n")
         attached_process.stdin.flush()
-        assert attached_process.wait(timeout=20) == 0, attached_process.stderr.read()
-        assert attached_process.stdout.read().strip().splitlines()[-1] == "detached"
-        attached_process = None
+        assert attached_process.stdout.readline().strip() == "detached"
+        assert attached_process.poll() is None
 
         assert cleanup_pool(prepared.pool_name, prepared.generation, ctl=ctl)["result"] == "OK"
         prepared = None
+        attached_process.stdin.write("exit\n")
+        attached_process.stdin.flush()
+        assert attached_process.wait(timeout=20) == 0, attached_process.stderr.read()
+        attached_process = None
     finally:
         if attached_process is not None and attached_process.poll() is None:
             attached_process.terminate()

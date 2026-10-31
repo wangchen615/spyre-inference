@@ -170,9 +170,13 @@ class SpyreSharedOffloadingWorker(SpyreOffloadingWorker):
             )
         else:
             assert tp_rank is not None
-            attachment = SharedMetadataAttachment.attach(plan, lambda: self._runtime)
+            attachment = SharedMetadataAttachment.attach(
+                plan,
+                tp_rank,
+                lambda: self._runtime,
+            )
             try:
-                resolved = attachment.resolve_rank(tp_rank)
+                resolved = attachment.local_partitions
                 resolved_by_cache = {item.partition.cache_index: item for item in resolved}
                 planned_components = {
                     (item.cache_index, item.role): item
@@ -204,7 +208,7 @@ class SpyreSharedOffloadingWorker(SpyreOffloadingWorker):
                 raise
             components = local_components
             self._known_component_ids = {item.global_component_id for item in plan.components}
-            log_name = f"{plan.arena.name}/rank-{tp_rank}"
+            log_name = plan.arena_for_rank(tp_rank).name
             log_pool_name = plan.identity.pool_name
             log_capacity = plan.logical_block_capacity
             log_slots = sum(item.partition.num_slots for item in resolved)

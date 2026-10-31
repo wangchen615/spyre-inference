@@ -65,8 +65,9 @@ def _tp4_document() -> dict:
     rank_caches = []
     partitions = []
     components = []
-    offset = 0
+    allocated_bytes = 0
     for rank, cache_count in enumerate(cache_counts):
+        offset = 0
         for cache in range(cache_count):
             page = page_bytes[rank, cache]
             stride = 4096 if page <= 4096 else 8192
@@ -86,7 +87,7 @@ def _tp4_document() -> dict:
             partitions.append(
                 {
                     "partitionId": str(partition_id),
-                    "arenaName": "host-0",
+                    "arenaName": f"host-r{rank}",
                     "partitionName": name,
                     "tpRank": rank,
                     "cacheIndex": cache,
@@ -103,7 +104,7 @@ def _tp4_document() -> dict:
                         "tpRank": rank,
                         "cacheIndex": cache,
                         "role": role,
-                        "arenaName": "host-0",
+                        "arenaName": f"host-r{rank}",
                         "partitionName": name,
                         "partitionId": str(partition_id),
                         "partitionOffsetBytes": str(offset),
@@ -112,6 +113,7 @@ def _tp4_document() -> dict:
                     }
                 )
             offset += 4 * stride
+            allocated_bytes += 4 * stride
     canonical_layout = "".join(
         f"{row['tpRank']}:{row['cacheIndex']}:{row['physicalPageBytes']}:"
         f"{row['layoutKind']}:{row['layoutVersion']}:{row['localKvHeads']}:"
@@ -119,37 +121,44 @@ def _tp4_document() -> dict:
         for row in rank_caches
     )
     layout_signature = hashlib.sha1(canonical_layout.encode()).hexdigest()
-    arena = {
-        "name": "host-0",
-        "backend": "HOST_DRAM",
-        "compatibility": {
-            "model": "model-a@revision-1",
-            "kvDtype": "float16",
-            "blockSize": "128",
-            "tensorParallelSize": 4,
-            "layoutSignature": layout_signature,
-        },
-        "partitions": [
-            {
-                "name": row["partitionName"],
-                "tpRank": row["tpRank"],
-                "cacheIndex": row["cacheIndex"],
-                "offsetBytes": row["offsetBytes"],
-                "numSlots": row["numSlots"],
-                "slotBytes": row["slotBytes"],
-            }
-            for row in partitions
-        ],
-    }
+    arenas = [
+        {
+            "name": f"host-r{rank}",
+            "backend": "HOST_DRAM",
+            "compatibility": {
+                "model": "model-a@revision-1",
+                "kvDtype": "float16",
+                "blockSize": "128",
+                "tensorParallelSize": 4,
+                "layoutSignature": layout_signature,
+            },
+            "partitions": [
+                {
+                    "name": row["partitionName"],
+                    "tpRank": row["tpRank"],
+                    "cacheIndex": row["cacheIndex"],
+                    "offsetBytes": row["offsetBytes"],
+                    "numSlots": row["numSlots"],
+                    "slotBytes": row["slotBytes"],
+                }
+                for row in partitions
+                if row["tpRank"] == rank
+            ],
+        }
+        for rank in range(4)
+    ]
     bytes_per_block = 2 * sum(int(row["slotBytes"]) for row in partitions)
     config = {
         "name": "/model-a-tp4",
         "metadata": {"maxChunks": 1},
-        "dataPools": [arena],
+        "dataPools": arenas,
     }
     effective_config = copy.deepcopy(config)
-    effective_config["dataPools"][0]["numSlots"] = str(offset // 4096)
-    effective_config["dataPools"][0]["slotBytes"] = "4096"
+    for arena in effective_config["dataPools"]:
+        arena["numSlots"] = str(
+            sum(int(row["numSlots"]) * int(row["slotBytes"]) for row in arena["partitions"]) // 4096
+        )
+        arena["slotBytes"] = "4096"
     return {
         "code": "OK",
         "poolDescriptor": {
@@ -167,12 +176,12 @@ def _tp4_document() -> dict:
                 "kvDtype": "float16",
                 "blockSize": "128",
                 "tensorParallelSize": 4,
-                "cpuBytesToUse": str(offset + 123),
+                "cpuBytesToUse": str(allocated_bytes + 123),
                 "rankCaches": rank_caches,
             },
             "bytesPerCompleteBlock": str(bytes_per_block),
             "logicalBlockCapacity": "2",
-            "allocatedBytes": str(offset),
+            "allocatedBytes": str(allocated_bytes),
             "unusedBytes": "123",
             "config": config,
             "partitions": partitions,
@@ -236,7 +245,23 @@ def _make_worker(monkeypatch, *, manifest=None, directory=None):
         )
     directory.registered = registrations
     directory.resolved = resolved
-    directory.configure_geometry = lambda: None
+
+    def configure_geometry():
+        name = "host-r2-c0"
+        registered = directory.registered[name]
+        directory.registered[name] = replace(
+            registered,
+            slot_count=directory.registered_slot_count or registered.slot_count,
+            slot_bytes=directory.registered_slot_bytes or registered.slot_bytes,
+        )
+        pool = directory.resolved[registered.pool_ref]
+        directory.resolved[registered.pool_ref] = replace(
+            pool,
+            count=directory.resolved_slot_count or pool.count,
+            size=directory.resolved_slot_bytes or pool.size,
+        )
+
+    directory.configure_geometry = configure_geometry
     runtime = _runtime(directory, addresses, events)
     from spyre_inference.v1.kv_offload import shared_worker as worker_mod
 
@@ -306,15 +331,16 @@ def test_parsed_plan_retains_rank_cache_layout_contract():
     ) == (1, 0, 3000, "token-major", 1, 4, 128)
 
 
-def test_tp4_rank_two_resolves_and_copies_only_its_local_partitions(monkeypatch):
-    """Resolving a foreign partition would pin another rank's arena range."""
+def test_tp4_rank_two_attaches_and_copies_only_its_local_partitions(monkeypatch):
+    """Attaching a foreign partition would map another rank's arena range."""
 
     worker, plan, directory, events = _make_worker(monkeypatch)
     local = plan.components_for_rank(2)
 
-    assert directory.resolve_calls == [
-        directory.registered["host-r2-c0"].pool_ref,
-        directory.registered["host-r2-c1"].pool_ref,
+    assert directory.attach_calls[0][-1] == 2
+    assert [item.registration.name for item in directory.native_attachment.data_pools] == [
+        "host-r2-c0",
+        "host-r2-c1",
     ]
 
     events.clear()
@@ -382,32 +408,20 @@ def test_physical_mismatch_fails_before_attachment(monkeypatch, manifest, messag
     assert directory.attach_calls == []
 
 
-@pytest.mark.parametrize("failure", ["registered", "resolved", "resolved_geometry"])
+@pytest.mark.parametrize("failure", ["registered", "missing_eager", "eager_geometry"])
 def test_post_attach_constructor_failure_detaches_once(monkeypatch, failure):
     directory = FakeDirectory([])
-    original_find = directory.find_pool
-    original_resolve = directory.resolve_pool
     if failure == "registered":
-        directory.find_pool = lambda name: (
-            replace(original_find(name), slot_bytes=1234)
-            if name == "host-r2-c0"
-            else original_find(name)
-        )
-    elif failure == "resolved":
-        directory.resolve_pool = lambda pool_ref: (
-            None if getattr(pool_ref, "pool_id", -1) == 103 else original_resolve(pool_ref)
-        )
+        directory.registered_slot_bytes = 1234
+    elif failure == "missing_eager":
+        directory.omit_attached_data = True
     else:
-        directory.resolve_pool = lambda pool_ref: (
-            replace(original_resolve(pool_ref), size=1234)
-            if getattr(pool_ref, "pool_id", -1) == 103
-            else original_resolve(pool_ref)
-        )
+        directory.resolved_slot_bytes = 1234
 
     with pytest.raises(RuntimeError):
         _make_worker(monkeypatch, directory=directory)
 
-    assert directory.detach_calls == [directory]
+    assert directory.detach_calls == [directory.native_attachment]
 
 
 @pytest.mark.parametrize("invalid", ["foreign_pool", "malformed_token"])

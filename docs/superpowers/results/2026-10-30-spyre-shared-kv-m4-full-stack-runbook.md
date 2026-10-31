@@ -22,7 +22,9 @@ Do not directly unlink any object under `/dev/shm`.
 1. Spyre-inference resolves the real model and physical KV-cache geometry.
 2. The delegator plans and creates the metadata object plus one exact-sized,
    partitioned host arena before either worker starts.
-3. Both vLLM replicas attach to the same immutable pool plan and generation.
+3. Both vLLM replicas attach to the same immutable pool plan and generation;
+   each TP1 worker's single attach call returns metadata plus all rank-0 data
+   handles with their IOMMU mappings ready.
 4. A cold-computes and publishes one complete prompt.
 5. A reloads every prompt token from shared host KV.
 6. B reloads the same prompt from the same pool while A is still attached.
@@ -192,7 +194,7 @@ Every row used a 262,144-byte head-major page with eight local KV heads and a
 
 The verified 512 MiB plan contained:
 
-- one `host-0` physical arena;
+- one `host-r0` physical arena;
 - four logical partitions, `host-r0-c0` through `host-r0-c3`;
 - 512 slots of 262,144 bytes in each partition;
 - eight global components: one K and one V component per partition;
@@ -203,7 +205,9 @@ The verified 512 MiB plan contained:
 ## 3. Start two simultaneous TP1 replicas
 
 Both replicas receive the exact same `KV_TRANSFER_CONFIG`, including the full
-pool plan and generation. They differ only in card and HTTP port.
+pool plan and generation. They differ only in card and HTTP port. Each process
+has TP rank 0 because these are two independent TP1 replicas, not one TP2
+replica.
 
 ```bash
 export PYTHONHASHSEED=0
@@ -258,10 +262,22 @@ tail -f /tmp/spyre-shared-kv-m4-instance-b.log
 Each log should report the same pool name, four physical caches, eight
 components, 256 logical blocks, and 536,870,912 actual host bytes.
 
+Worker startup now performs one eager, rank-scoped attachment. For this TP1
+run, spyre-inference calls `attach_pool(name, generation, expected_config, 0)`.
+A successful result contains one aggregate `PoolAttachment`: its metadata
+handle sees the global directory, while its `data_pools` contain all four
+`host-r0-c*` partitions ready for DMA. There is no later `resolve_pool` call.
+
+For a TP-N deployment, every worker supplies its local TP rank to the same
+operation and receives only that rank's data partitions under the common root.
+An absent child, invalid rank, data mapping failure, or IOMMU mapping failure is
+an attachment failure and must prevent the server from reaching `/health`.
+
 ## 4. Prove live attachments block destroy
 
-Destroying the exact generation must return `POOL_BUSY` while A and B are
-attached:
+Destroying the exact generation must return `POOL_BUSY` while A and B retain
+their aggregate attachments or any independently retained metadata, data-pool,
+or read-pin handle:
 
 ```bash
 if "$DELEGATOR_M4/build/shared-poolctl" \
@@ -343,7 +359,32 @@ grep '^Token IDs' \
   /tmp/spyre-shared-kv-m4-b-reload.log
 ```
 
-## Verified result from 2026-10-30
+## Eager attachment API verification from 2026-10-31
+
+The revised rank-scoped API and planner geometry were verified independently
+of the historical serving measurements below. The following current-worktree
+checks passed with the prerequisite `LD_LIBRARY_PATH` from this runbook:
+
+| Repository | Verification | Result |
+| --- | --- | ---: |
+| torch-spyre | `pytest -q tests/test_shared_pool_lifecycle.py tests/test_shared_host_pool.py tests/test_shared_metadata.py` | 39 passed, 1 skipped |
+| shared-pool-delegator | `cmake --build build -j8` followed by `ctest --test-dir build --output-on-failure` | build passed; 11 passed, 2 disabled |
+| shared-pool-delegator | `DELEGATOR_BUILD_DIR=$PWD/build pytest -q tests` | 9 passed |
+| spyre-inference | `pytest -q tests/kv_offload` | 337 passed, 49 skipped |
+
+These checks cover eager aggregate attachment, independent child lifetimes,
+rank-homogeneous planner output, real Flex lifecycle publication, the
+independent torch-spyre worker, plan parsing and rank routing, and the full
+KV-offload unit/integration suite. They do not replace the two-replica serving
+rerun required to refresh the performance evidence.
+
+## Historical verified result from 2026-10-30
+
+The performance evidence below predates the 2026-10-31 eager rank-scoped
+attachment API revision. The serving and transfer flow is unchanged, but these
+numbers do not by themselves verify the revised startup contract. Re-run steps
+1 through 6 with the current Flex, torch-spyre, delegator, and spyre-inference
+worktrees before recording new acceptance evidence.
 
 The commands above were run against the final M4 worktrees:
 
@@ -379,8 +420,9 @@ before the measured sequence started.
 
 ## 6. Stop both replicas and destroy the exact generation
 
-Stop B and A gracefully so their managers release metadata pins, child views,
-and root-lock ownership:
+Stop B and A gracefully so their managers release read pins and local data
+handles before closing each aggregate attachment. Destroy remains busy until
+all independently retained child handles have also drained:
 
 ```bash
 kill -TERM "$INSTANCE_B_PID"

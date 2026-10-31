@@ -149,9 +149,8 @@ class FakeDirectory:
         self.attach_calls = []
         self.detach_calls = []
         self.find_calls = []
-        self.resolve_calls = []
         self.management_calls = []
-        self.fail_resolve = False
+        self.omit_attached_data = False
         self.registered_slot_count = None
         self.registered_slot_bytes = None
         self.resolved_slot_count = None
@@ -193,12 +192,6 @@ class FakeDirectory:
     def find_pool(self, name):
         self.find_calls.append(name)
         return self.registered.get(name)
-
-    def resolve_pool(self, pool_ref):
-        self.resolve_calls.append(pool_ref)
-        if self.fail_resolve:
-            return None
-        return self.resolved.get(pool_ref)
 
     def publish(self, reservation, chunks):
         self.events.append(("publish", reservation.key.block_hash))
@@ -270,21 +263,48 @@ class FakePoolConfig:
 def _runtime(directory, addresses, events):
     class FakeSharedPool:
         @staticmethod
-        def attach_pool(name, generation, expected_config=None):
+        def attach_pool(name, generation, expected_config_or_rank, tp_rank=None):
+            expected_config = None if tp_rank is None else expected_config_or_rank
+            rank = expected_config_or_rank if tp_rank is None else tp_rank
             call = (name, generation)
             if expected_config is not None:
                 call += (expected_config,)
+            call += (rank,)
             directory.attach_calls.append(call)
             directory.configure_geometry()
+            if expected_config is None:
+                local_names = ["host-0"]
+            else:
+                local_names = [
+                    partition.name
+                    for arena in expected_config.data_pools
+                    for partition in arena.partitions
+                    if partition.tp_rank == rank
+                ]
+            attached_data = []
+            if not directory.omit_attached_data:
+                attached_data.extend(
+                    SimpleNamespace(
+                        registration=directory.registered[local_name],
+                        data_pool=directory.resolved[directory.registered[local_name].pool_ref],
+                    )
+                    for local_name in local_names
+                )
+            native_attachment = SimpleNamespace(
+                tp_rank=rank,
+                metadata=directory,
+                data_pools=attached_data,
+            )
+            directory.native_attachment = native_attachment
             return SimpleNamespace(
                 code=FakePoolResultCode.OK,
-                metadata=directory,
+                attachment=native_attachment,
                 detail="",
             )
 
         @staticmethod
-        def detach_pool(metadata):
-            directory.detach_calls.append(metadata)
+        def detach_pool(attachment):
+            directory.detach_calls.append(attachment)
 
         @staticmethod
         def create_pool(*args):
@@ -431,9 +451,8 @@ def _block(directory, slots=(7, 2, 6, 1), *, reservation=True):
 
 def test_attaches_to_exact_generation_and_uses_existing_child(worker_directory_events):
     worker, directory, _, _ = worker_directory_events
-    assert directory.attach_calls == [("deployment-root", GENERATION)]
-    assert directory.find_calls == ["host-0"]
-    assert directory.resolve_calls == [directory.registered["host-0"].pool_ref]
+    assert directory.attach_calls == [("deployment-root", GENERATION, 0)]
+    assert directory.find_calls == []
     assert directory.management_calls == []
     assert worker._bytes_per_block == sum(PAGE_BYTES)
 
@@ -492,10 +511,10 @@ def test_rejects_resolved_pool_geometry_mismatch(monkeypatch, attribute, value):
         _make_worker(monkeypatch, directory=directory)
 
 
-def test_rejects_registered_pool_that_cannot_be_resolved(monkeypatch):
+def test_rejects_registered_pool_that_is_not_eagerly_attached(monkeypatch):
     directory = FakeDirectory([])
-    directory.fail_resolve = True
-    with pytest.raises(RuntimeError, match="cannot be resolved"):
+    directory.omit_attached_data = True
+    with pytest.raises(RuntimeError, match="was not eagerly attached"):
         _make_worker(monkeypatch, directory=directory)
 
 
@@ -505,7 +524,7 @@ def test_shutdown_detaches_once_after_releasing_child_handles(monkeypatch):
     worker.shutdown()
     worker.shutdown()
 
-    assert directory.detach_calls == [directory]
+    assert directory.detach_calls == [directory.native_attachment]
     assert worker._pool is None
     assert worker._registered is None
 

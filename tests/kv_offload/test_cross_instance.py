@@ -321,17 +321,19 @@ import sys
 from torch_spyre._C import PoolResultCode, SharedPool
 
 pool_name, generation_hex, data_pool_name = sys.argv[1:4]
-attached = SharedPool.attach_pool(pool_name, bytes.fromhex(generation_hex))
+attached = SharedPool.attach_pool(pool_name, bytes.fromhex(generation_hex), 0)
 if attached.code is not PoolResultCode.OK:
     raise RuntimeError(f"attach failed: {attached.code}: {attached.detail}")
-directory = attached.metadata
+attachment = attached.attachment
+if attachment is None:
+    raise RuntimeError("attach returned no attachment")
+directory = attachment.metadata
 try:
-    registered = directory.find_pool(data_pool_name)
-    if registered is None:
-        raise RuntimeError(f"pool {data_pool_name!r} is not registered")
-    pool = directory.resolve_pool(registered.pool_ref)
-    if pool is None:
-        raise RuntimeError(f"pool {data_pool_name!r} cannot be resolved")
+    by_name = {item.registration.name: item for item in attachment.data_pools}
+    if data_pool_name not in by_name:
+        raise RuntimeError(f"pool {data_pool_name!r} was not eagerly attached")
+    registered = by_name[data_pool_name].registration
+    pool = by_name[data_pool_name].data_pool
     print(json.dumps({
         "pool_count": directory.pool_count(),
         "slot_count": registered.slot_count,
@@ -341,7 +343,7 @@ try:
         "total_bytes": pool.total_bytes(),
     }))
 finally:
-    SharedPool.detach_pool(directory)
+    SharedPool.detach_pool(attachment)
 """
     result = subprocess.run(
         [

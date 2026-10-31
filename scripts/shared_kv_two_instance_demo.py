@@ -275,7 +275,7 @@ def prepare_model_pool_command(*, ctl: Any, model_spec: dict[str, Any]) -> dict[
     result = {
         "poolName": plan.identity.pool_name,
         "poolGeneration": plan.identity.generation.hex(),
-        "dataPoolName": plan.arena.name,
+        "dataPoolName": plan.arena_for_rank(0).name,
         "instanceAExtraConfig": dict(extra_config),
         "instanceBExtraConfig": dict(extra_config),
     }
