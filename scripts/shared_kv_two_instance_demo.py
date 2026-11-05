@@ -133,6 +133,8 @@ def _matches_effective_demo_config(requested: dict[str, Any], effective: object)
             and effective["metadata"] == requested["metadata"]
             and effective_child["name"] == requested_child["name"]
             and effective_child["backend"] == requested_child["backend"]
+            and (effective_child.get("marvell") or {}).get("pciBdf")
+            == (requested_child.get("marvell") or {}).get("pciBdf")
             and all(
                 effective_compatibility.get(field) == requested_compatibility.get(field)
                 for field in compatibility_fields
@@ -162,6 +164,7 @@ def prepare_demo_pool(
     kv_dtype: str = "float16",
     block_size: int = 128,
     tensor_parallel_size: int = 1,
+    marvell_bdf: str | None = None,
 ) -> PreparedDemoPool:
     """Create the whole demo pool and retain its exact generation capability."""
 
@@ -176,7 +179,8 @@ def prepare_demo_pool(
         "dataPools": [
             {
                 "name": data_pool_name,
-                "backend": "HOST_DRAM",
+                "backend": "HOST_DRAM" if marvell_bdf is None else "MARVELL",
+                **({} if marvell_bdf is None else {"marvell": {"pciBdf": marvell_bdf}}),
                 "numSlots": str(num_slots),
                 "slotBytes": str(slot_bytes),
                 "compatibility": {
@@ -240,6 +244,7 @@ def prepare_pool_command(
     model: str,
     cpu_bytes_to_use: int,
     slot_bytes: int = 262_144,
+    marvell_bdf: str | None = None,
 ) -> dict[str, Any]:
     """Create once and print the identical configuration consumed by A and B."""
 
@@ -250,6 +255,7 @@ def prepare_pool_command(
         model=model,
         cpu_bytes_to_use=cpu_bytes_to_use,
         slot_bytes=slot_bytes,
+        marvell_bdf=marvell_bdf,
     )
     result = {
         "poolName": prepared.pool_name,
@@ -830,13 +836,22 @@ def _parse_prepare_pool_args() -> argparse.Namespace:
         description="Create the persistent demo pool through shared-poolctl.",
     )
     parser.add_argument("--pool-name", required=True)
-    parser.add_argument("--data-pool-name", default="host-0")
+    parser.add_argument("--data-pool-name", help="default host-0, or marvell-0 with --marvell-bdf")
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--cpu-bytes-to-use", type=int, default=512 * 1024 * 1024)
+    parser.add_argument(
+        "--cpu-bytes-to-use",
+        type=int,
+        default=512 * 1024 * 1024,
+        help="pool bytes; on the Marvell card with --marvell-bdf",
+    )
     parser.add_argument("--slot-bytes", type=int, default=262_144)
+    parser.add_argument("--marvell-bdf", help="Marvell card PCI BDF; the arena lives on its BAR2")
     parser.add_argument("--ctl", default="shared-poolctl")
     parser.add_argument("--socket", default=None)
-    return parser.parse_args(sys.argv[2:])
+    args = parser.parse_args(sys.argv[2:])
+    if args.data_pool_name is None:
+        args.data_pool_name = "host-0" if args.marvell_bdf is None else "marvell-0"
+    return args
 
 
 def _parse_prepare_model_pool_args() -> argparse.Namespace:
@@ -954,6 +969,7 @@ def main() -> None:
             model=args.model,
             cpu_bytes_to_use=args.cpu_bytes_to_use,
             slot_bytes=args.slot_bytes,
+            marvell_bdf=args.marvell_bdf,
         )
         return
 

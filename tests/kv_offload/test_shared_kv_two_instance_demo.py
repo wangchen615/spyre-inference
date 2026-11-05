@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import mmap
 import os
 import shlex
 import subprocess
@@ -149,6 +150,92 @@ def test_prepare_pool_accepts_canonical_effective_partition_geometry(capsys):
 
     assert result["poolName"] == "/canonical-root"
     assert json.loads(capsys.readouterr().out) == result
+
+
+class _PlacingCtl:
+    """Echoes the request back with flex's Marvell placement filled in."""
+
+    def __init__(self, placed_bdf=None):
+        self.requests = []
+        self.placed_bdf = placed_bdf
+
+    def create(self, config):
+        self.requests.append(config)
+        effective = json.loads(json.dumps(config))
+        child = effective["dataPools"][0]
+        # The delegator returns the canonical one-partition geometry for a flat pool.
+        child["partitions"] = [
+            {
+                "name": child["name"],
+                "tpRank": 0,
+                "cacheIndex": 0,
+                "numSlots": child["numSlots"],
+                "slotBytes": child["slotBytes"],
+                "offsetBytes": "0",
+            }
+        ]
+        child["numSlots"] = str(int(child["numSlots"]) * int(child["slotBytes"]) // mmap.PAGESIZE)
+        child["slotBytes"] = str(mmap.PAGESIZE)
+        if "marvell" in child:
+            child["marvell"] = {
+                "pciBdf": self.placed_bdf or child["marvell"]["pciBdf"],
+                "barOffset": "1048576",
+            }
+        return {
+            "result": "OK",
+            "descriptor": {
+                "name": config["name"],
+                "generation": "cd" * 16,
+                "state": "READY",
+                "effectiveConfig": effective,
+            },
+        }
+
+
+def test_prepare_pool_requests_an_unplaced_marvell_arena(capsys):
+    ctl = _PlacingCtl()
+    result = demo.prepare_pool_command(
+        ctl=ctl,
+        pool_name="/private-marvell",
+        data_pool_name="marvell-0",
+        model="model",
+        cpu_bytes_to_use=8 * 262_144,
+        marvell_bdf="0000:ed:00.0",
+    )
+
+    child = ctl.requests[0]["dataPools"][0]
+    assert child["backend"] == "MARVELL"
+    assert child["marvell"] == {"pciBdf": "0000:ed:00.0"}  # flex places the window.
+    assert result["dataPoolName"] == "marvell-0"
+    assert result["instanceAExtraConfig"]["cpu_bytes_to_use"] == 8 * 262_144
+    assert json.loads(capsys.readouterr().out) == result
+
+
+def test_prepare_pool_rejects_a_marvell_arena_placed_on_another_card():
+    with pytest.raises(RuntimeError, match="effective configuration disagrees"):
+        demo.prepare_pool_command(
+            ctl=_PlacingCtl(placed_bdf="0000:83:00.0"),
+            pool_name="/private-marvell",
+            data_pool_name="marvell-0",
+            model="model",
+            cpu_bytes_to_use=8 * 262_144,
+            marvell_bdf="0000:ed:00.0",
+        )
+
+
+def test_prepare_pool_host_request_has_no_marvell_placement():
+    ctl = _PlacingCtl()
+    demo.prepare_pool_command(
+        ctl=ctl,
+        pool_name="/private-host",
+        data_pool_name="host-0",
+        model="model",
+        cpu_bytes_to_use=8 * 262_144,
+    )
+
+    child = ctl.requests[0]["dataPools"][0]
+    assert child["backend"] == "HOST_DRAM"
+    assert "marvell" not in child  # host requests are unchanged.
 
 
 def test_prepare_model_pool_passes_complete_plan_to_both_instances(capsys):
