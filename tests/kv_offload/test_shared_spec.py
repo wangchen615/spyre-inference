@@ -183,14 +183,13 @@ def test_rejects_unsupported_shared_execution_shapes(config, match):
         _shared_spec_module().SpyreSharedOffloadingSpec(config)
 
 
-@pytest.mark.parametrize("backend", ["mp", "uni"])
-def test_tp1_accepts_the_default_and_uni_executors(backend):
+def test_tp1_accepts_the_uni_executor():
     spec = _shared_spec_module().SpyreSharedOffloadingSpec(_config())
-    spec.bind_vllm_config(_vllm_config(backend=backend))
+    spec.bind_vllm_config(_vllm_config(backend="uni"))
     assert spec._vllm_config is not None
 
 
-@pytest.mark.parametrize("backend", ["ray", "external_launcher"])
+@pytest.mark.parametrize("backend", ["mp", "ray", "external_launcher"])
 def test_tp1_rejects_other_executors(backend):
     spec = _shared_spec_module().SpyreSharedOffloadingSpec(_config())
     with pytest.raises(ValueError, match="TP1 requires distributed_executor_backend"):
@@ -484,7 +483,7 @@ def test_tp1_mp_builds_scheduler_and_worker_sides_from_separate_specs(monkeypatc
     scheduler_spec = module.SpyreSharedOffloadingSpec(_config())  # scheduler process.
     worker_spec = module.SpyreSharedOffloadingSpec(_config())  # worker process.
     for spec in (scheduler_spec, worker_spec):
-        spec.bind_vllm_config(_vllm_config(backend="mp"))
+        spec.bind_vllm_config(_vllm_config(backend="uni"))
     scheduler_spec.get_manager()
     physical = _physical()
     worker_spec.bind_physical_caches(physical)

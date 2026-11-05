@@ -131,9 +131,9 @@ class SpyreSharedOffloadingSpec(SpyreOffloadingSpec):
     def bind_vllm_config(self, vllm_config: VllmConfig) -> None:
         backend = vllm_config.parallel_config.distributed_executor_backend
         tp_size = self.config.parallel.tp_size
-        # TP1: vLLM's default ("mp" after CpuPlatform) or "uni"; manager and
-        # worker attach the pool independently, so either process layout works.
-        allowed_backends = ("mp", "uni") if tp_size == 1 else ("external_launcher",)
+        # TP1 needs "uni": the scheduler-side attach starts a device runtime, and a
+        # Spyre card opens in one process only, so "mp" fails with DeviceOpenFail.
+        allowed_backends = ("uni",) if tp_size == 1 else ("external_launcher",)
         if backend not in allowed_backends:
             raise ValueError(
                 "Spyre shared KV offloading with "
