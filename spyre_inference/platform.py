@@ -109,6 +109,25 @@ def _raise_dynamo_recompile_limits() -> None:
 
 _raise_dynamo_recompile_limits()
 
+_SHARED_SPEC_NAME = "SpyreSharedOffloadingSpec"
+
+
+def _keep_uni_for_shared_spec(vllm_config: VllmConfig) -> None:
+    # CpuPlatform rewrites "uni" to "mp". The shared spec's scheduler attach opens the card,
+    # so at world_size 1 it must share the worker's process; every other run keeps "mp".
+    parallel_config = vllm_config.parallel_config
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if (
+        parallel_config.world_size != 1
+        or parallel_config.distributed_executor_backend != "mp"
+        or kv_transfer_config is None
+        or (kv_transfer_config.kv_connector_extra_config or {}).get("spec_name")
+        != _SHARED_SPEC_NAME
+    ):
+        return
+    logger.info("Using the uni executor at world_size 1 for %s.", _SHARED_SPEC_NAME)
+    parallel_config.distributed_executor_backend = "uni"
+
 
 class TorchSpyrePlatform(CpuPlatform):
     _enum = PlatformEnum.OOT
@@ -711,6 +730,7 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # call CpuPlatform.check_and_update_config()
         super().check_and_update_config(vllm_config)
+        _keep_uni_for_shared_spec(vllm_config)
 
         # Must run after super(), which sets a block_size default of its own, and before
         # the num_gpu_blocks_override math below, which reads block_size.
