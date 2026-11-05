@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OffloadingWorker that moves Spyre KV pages to and from a shared slot pool.
-
-The pool is host memory or a Marvell BAR2 window, chosen by the spec's
-`pool_backend` and handed in as one pool factory per cache; this worker and
-the offloaders below it are otherwise identical for both tiers.
+"""OffloadingWorker that moves Spyre KV pages to and from shared host memory.
 
 The job/result skeleton (`submit_store`/`submit_load`/`_run`/`get_finished`/
 `wait`, synchronous completion, per-job exception capture) follows the draft in
@@ -41,13 +37,13 @@ hardware, with a rank-4 cache and a 4-slot pool:
 | input | `copy_tensor_raw` | `copy_kv_page_raw` |
 | --- | --- | --- |
 | block id past the end | **accepted silently** | `block_id 99 out of range [0, 8)` |
-| flattened `(N,-1)` view | **accepted silently** | `expected a rank-4 KV cache [N,X,Y,D], got rank 2` |
+| flattened `(N,-1)` view | **accepted silently** | `expected rank-4 KV cache, got rank 2` |
 | slot past the end | rejected | rejected |
 
 Both silent acceptances matter here. The connector hands vLLM *flattened*
 canonical tensors (`connector.py`), so a wiring mistake that reaches the DMA path
 with a canonical tensor instead of the physical one is exactly the rank-2 case --
-caught by `copy_kv_page_raw`, silently mis-transferred by `copy_tensor_raw`. And
+caught by `copy_kv_page_raw`, silently mistransferred by `copy_tensor_raw`. And
 device block ids arrive from the scheduler's block table, so an off-by-one there
 should fail loudly rather than move an arbitrary page.
 
@@ -57,20 +53,11 @@ correct if a future layout makes logical page order differ from physical.
 
 ## Slot indexing
 
-One `SpyreKvPageOffloader` -- hence one pool (`SharedHostPool` or, for the
-Marvell tier, `SharedMarvellPool` over that cache's own BAR2 window) -- per
-physical cache:
-
-    (cache c, host block h) -> offloaders[c].offload(block_id=dev_blk, slot=h)
-                                -> pool "{prefix}_c{c}", slot 2h   (K)
-                                -> pool "{prefix}_c{c}", slot 2h+1 (V)
-
-This is the identity mapping because upstream's host block ids are
-per-canonical-tensor, not global: `CPUOffloadingWorker` allocates one
-`(num_cpu_blocks, page_size)` buffer per canonical tensor, so host block `h`
-means "slot `h` of every tensor". Per-cache pools also keep one `PageSignature`
-per pool, which a single shared pool would collapse -- wrong the moment two
-layers differ in `head_size`.
+The delegator creates one fixed child for every physical K/V component. If a
+model has `C` components, logical host block `h` owns the consecutive run
+`[h*C, (h+1)*C)`. Cache `c` uses component ids `2*c` for K and `2*c+1` for V.
+This preserves upstream's meaning of one host block across every canonical
+tensor while ensuring that layers and K/V allocations never share a slot.
 
 ## Why `_transfer` fences first
 
@@ -103,7 +90,7 @@ rather than silently offloading a hybrid model's layers against the wrong blocks
 """
 
 import time
-from collections.abc import Sequence
+import traceback
 
 import torch
 from vllm.logger import init_logger
@@ -115,9 +102,11 @@ from vllm.v1.kv_offload.base import (
 )
 
 from spyre_inference.v1.kv_offload.connector import SpyrePhysicalCaches
+from spyre_inference.v1.kv_offload.shared_attachment import SharedPoolAttachment
+from spyre_inference.v1.kv_offload.shared_identity import SharedPoolIdentity
 from spyre_inference.v1.worker.spyre_kv_offload import (
-    PoolFactory,
     SpyreKvPageOffloader,
+    page_signature,
 )
 
 logger = init_logger(__name__)
@@ -134,56 +123,75 @@ class SpyreOffloadingWorker(OffloadingWorker):
         self,
         physical: SpyrePhysicalCaches,
         num_host_blocks: int,
-        pool_prefix: str,
-        pool_factories: Sequence[PoolFactory | None] | None = None,
+        identity: SharedPoolIdentity,
     ) -> None:
         if num_host_blocks <= 0:
             raise ValueError(f"num_host_blocks must be positive, got {num_host_blocks}")
-        num_caches = len(physical.caches)
-        if pool_factories is None:
-            # None per cache -> SpyreKvPageOffloader's default, the host pool.
-            pool_factories = [None] * num_caches
-        if len(pool_factories) != num_caches:
-            raise ValueError(f"{len(pool_factories)} pool factories for {num_caches} cache(s)")
+        if not physical.caches:
+            raise ValueError("at least one physical KV cache is required")
 
         self._finished_jobs: list[TransferResult] = []
         self._physical = physical
         self._num_host_blocks = num_host_blocks
 
-        # One offloader per physical cache. Constructed eagerly so a geometry or
-        # shared-memory problem surfaces at registration, not mid-serve. If one
-        # fails, the pools already created are released so a failed start does
-        # not leave segments behind.
-        self._offloaders: list[SpyreKvPageOffloader] = []
+        cache_layouts = tuple(zip(physical.caches, physical.layout_kinds, strict=True))
+        signatures = tuple(page_signature(cache, layout) for cache, layout in cache_layouts)
+        component_count = 2 * len(cache_layouts)
+        expected_slots = num_host_blocks * component_count
+        largest_page = max(signature.page_bytes for signature in signatures)
+
+        attachment = SharedPoolAttachment.attach(identity)
+        self._attachment = attachment
         try:
-            for cache_idx, (cache, layout_kind, factory) in enumerate(
-                zip(physical.caches, physical.layout_kinds, pool_factories, strict=True)
-            ):
-                self._offloaders.append(
-                    SpyreKvPageOffloader(
-                        cache=cache,
-                        pool_name=f"{pool_prefix}_c{cache_idx}",
-                        num_slots=num_host_blocks,
-                        layout_kind=layout_kind,
-                        pool_factory=factory,
-                    )
+            if attachment.registered.slot_count != expected_slots:
+                raise ValueError(
+                    f"data pool {identity.data_pool_name!r} has slot_count="
+                    f"{attachment.registered.slot_count}, expected {expected_slots} "
+                    f"({num_host_blocks} blocks x {component_count} components)"
                 )
+            if attachment.registered.slot_bytes < largest_page:
+                raise ValueError(
+                    f"data pool {identity.data_pool_name!r} has slot_bytes="
+                    f"{attachment.registered.slot_bytes}, smaller than the largest "
+                    f"physical KV page ({largest_page})"
+                )
+
+            self._offloaders = [
+                SpyreKvPageOffloader(
+                    cache=cache,
+                    pool=attachment.data_pool,
+                    num_slots=num_host_blocks,
+                    layout_kind=layout_kind,
+                    component_count=component_count,
+                    component_offset=2 * cache_idx,
+                    signature=signatures[cache_idx],
+                )
+                for cache_idx, (cache, layout_kind) in enumerate(cache_layouts)
+            ]
         except BaseException:
-            self.shutdown()
+            attachment.close()
             raise
-        # K + V per logical page.
-        self._bytes_per_block = 2 * sum(offloader.page_size_bytes for offloader in self._offloaders)
+
+        self._component_count = component_count
+        self._bytes_per_block = 2 * sum(signature.page_bytes for signature in signatures)
         logger.info(
-            "Spyre offloading worker: %d cache(s), %d offload block(s), "
-            "%d bytes per block, %s pools %s_c0..%s_c%d",
+            "Spyre offloading worker: %d cache(s), %d host block(s), %d components, "
+            "%d bytes per block, shared child %s/%s",
             len(self._offloaders),
             num_host_blocks,
+            component_count,
             self._bytes_per_block,
-            getattr(self._offloaders[0], "backend", "?") if self._offloaders else "?",
-            pool_prefix,
-            pool_prefix,
-            len(self._offloaders) - 1,
+            identity.pool_name,
+            identity.data_pool_name,
         )
+
+    def _validate_gpu_spec(self, gpu_spec: GPULoadStoreSpec) -> None:
+        group_sizes = getattr(gpu_spec, "group_sizes", None)
+        if group_sizes is not None and len(group_sizes) != 1:
+            raise NotImplementedError(
+                f"Spyre KV offloading supports a single KV cache group; got "
+                f"{len(group_sizes)} (hybrid/HMA models are out of scope for M1)"
+            )
 
     def _transfer(
         self, host_spec: LoadStoreSpec, gpu_spec: GPULoadStoreSpec, to_device: bool
@@ -198,12 +206,7 @@ class SpyreOffloadingWorker(OffloadingWorker):
         # this model's layers share, which is what the loop below assumes. With
         # several groups each group's slice applies to only its own layers, and
         # pairing them flat would offload the wrong pages -- silently.
-        group_sizes = getattr(gpu_spec, "group_sizes", None)
-        if group_sizes is not None and len(group_sizes) != 1:
-            raise NotImplementedError(
-                f"Spyre KV offloading supports a single KV cache group; got "
-                f"{len(group_sizes)} (hybrid/HMA models are out of scope for M1)"
-            )
+        self._validate_gpu_spec(gpu_spec)
 
         # Fence before reading device pages. Stores are deferred a step:
         # get_finished() -> prepare_store_kv() queues them, and they are issued
@@ -230,14 +233,8 @@ class SpyreOffloadingWorker(OffloadingWorker):
                     f"host block {host_block} out of range [0, {self._num_host_blocks})"
                 )
 
-        # Enqueue every page copy without waiting, then wait once for the job.
-        # Nothing reads a reloaded page before this job reports finished: vLLM
-        # schedules the request's forward only after get_finished() returns the
-        # job, and a stored page is read only by a later load. So the per-copy
-        # stream.synchronize() of a blocking copy_kv_page_raw bought no safety
-        # here, only a host round trip per K and per V page. Copies on one stream
-        # still execute in order, and the single synchronize below makes the
-        # whole job complete before submit_* returns, as before.
+        # Enqueue all pages, then wait once for the complete job. The worker's
+        # synchronous contract is preserved without one host wait per page.
         for offloader in self._offloaders:
             for device_block, host_block in zip(device_blocks, host_blocks, strict=True):
                 if to_device:
@@ -262,9 +259,10 @@ class SpyreOffloadingWorker(OffloadingWorker):
         except Exception:
             # Upstream asserts `transfer_result.success` in its get_finished(),
             # so a failure here surfaces as an assertion there rather than a
-            # silently dropped page. Log with the traceback so the real cause is
-            # in the serve log.
-            logger.exception("Spyre KV offload job %d failed", job_id)
+            # silently dropped page. Serialize the traceback before logging so
+            # handlers cannot retain native pool handles through its frames.
+            failure = traceback.format_exc()
+            logger.error("Spyre KV offload job %d failed:\n%s", job_id, failure)
             self._finished_jobs.append(TransferResult(job_id=job_id, success=False))
         else:
             self._finished_jobs.append(
@@ -300,23 +298,12 @@ class SpyreOffloadingWorker(OffloadingWorker):
         """No-op: transfers complete synchronously before `submit_*` returns."""
 
     def shutdown(self) -> None:
-        """Release every pool this worker attached. Idempotent.
-
-        Reached from vLLM's orderly shutdown (`OffloadingConnector.shutdown` ->
-        `OffloadingConnectorWorker.shutdown` -> here). Dropping the last flex
-        handle for a name unlinks it: the whole segment for a host pool, the
-        `.ctl` control segment for a Marvell pool. A crash or SIGKILL skips
-        this, and the attach refcount is stranded exactly as in M1; see
-        `reclaim_shm_pools.sh`.
-        """
-        for offloader in getattr(self, "_offloaders", []):
-            release = getattr(offloader, "release", None)
-            if release is None:
-                continue
-            try:
-                release()
-            except Exception:  # noqa: BLE001 - release the rest regardless
-                logger.exception(
-                    "Spyre KV offload: releasing pool %s failed",
-                    getattr(offloader, "pool_name", "?"),
-                )
+        """Fence outstanding DMA and release this worker's root lock lease."""
+        try:
+            torch.spyre.synchronize()
+        finally:
+            self._finished_jobs.clear()
+            for offloader in self._offloaders:
+                offloader.close()
+            self._offloaders.clear()
+            self._attachment.close()

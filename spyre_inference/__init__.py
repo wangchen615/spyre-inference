@@ -90,3 +90,17 @@ def _init_logging():
 
 
 _init_logging()
+
+# After register(): importing vllm loads platform plugins, which call back into this module.
+from vllm.v1.kv_offload.factory import OffloadingSpecFactory  # noqa: E402
+
+OffloadingSpecFactory.register_spec(
+    "SpyreOffloadingSpec",
+    "spyre_inference.v1.kv_offload.spec",
+    "SpyreOffloadingSpec",
+)
+OffloadingSpecFactory.register_spec(
+    "SpyreSharedOffloadingSpec",
+    "spyre_inference.v1.kv_offload.shared_spec",
+    "SpyreSharedOffloadingSpec",
+)

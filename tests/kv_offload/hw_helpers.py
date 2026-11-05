@@ -22,21 +22,26 @@ differently -- see the individual docstrings.
 
 from __future__ import annotations
 
-import contextlib
+import gc
 import os
+import subprocess
+import time
+import uuid
+from pathlib import Path
 
 import pytest
 import torch
 
+from scripts.cleanup_shared_kv_demo import cleanup_pool
+from scripts.shared_kv_two_instance_demo import PreparedDemoPool, prepare_demo_pool
+from scripts.shared_pool_delegator import SharedPoolCtl
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
 from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
     SpyreHeadMajorAttentionImpl,
 )
-from spyre_inference.v1.worker.spyre_kv_offload import (
-    HostPoolFactory,
-    MarvellPoolFactory,
-    SpyreKvPageOffloader,
-)
+from spyre_inference.v1.kv_offload.shared_attachment import SharedPoolAttachment
+from spyre_inference.v1.kv_offload.shared_identity import SharedPoolIdentity
+from spyre_inference.v1.worker.spyre_kv_offload import SpyreKvPageOffloader, page_signature
 
 DTYPE = torch.float16
 NUM_BLOCKS = 8
@@ -50,84 +55,6 @@ LAYOUT_KIND = {
     SpyreAttentionImpl: "token-major",
     SpyreHeadMajorAttentionImpl: "head-major",
 }
-
-# The Marvell card and where in its BAR2 these tests may write. FLEX_TEST_PCI_BDF
-# is the same switch flex's and torch-spyre's Marvell tests use; without it the
-# Marvell cases skip. FLEX_TEST_BAR2_OFFSET moves the tests' region so they can
-# stay clear of anything else using the card.
-MARVELL_BDF = os.environ.get("FLEX_TEST_PCI_BDF", "")
-MARVELL_BAR2_OFFSET = int(os.environ.get("FLEX_TEST_BAR2_OFFSET", "0"), 0)
-
-POOL_BACKENDS = [
-    "host",
-    pytest.param(
-        "marvell",
-        marks=pytest.mark.skipif(
-            not MARVELL_BDF, reason="FLEX_TEST_PCI_BDF (Marvell card BDF) not set"
-        ),
-    ),
-]
-
-
-class _PoolFactories:
-    """Hands out pool factories for one test, each Marvell one in a fresh window.
-
-    Several pools can be alive together inside one test (one per offloader, or
-    per cache in a worker), and flex does not detect overlapping BAR2 windows,
-    so each Marvell pool gets the window right after the previous one -- the
-    same rule `SpyreOffloadingSpec` applies in production. Every name handed
-    out is unlinked on the way in (a crashed run's stale `.ctl` would otherwise
-    be attached, and its geometry check would mask the real error) and again
-    in teardown.
-    """
-
-    def __init__(self, backend: str):
-        self.backend = backend
-        self._next_offset = MARVELL_BAR2_OFFSET
-        self._names: list[str] = []
-
-    @property
-    def unlink_by_name(self):
-        return (
-            MarvellPoolFactory.unlink_by_name
-            if self.backend == "marvell"
-            else HostPoolFactory.unlink_by_name
-        )
-
-    def claim(self, name: str) -> None:
-        self.unlink_by_name(name)
-        self._names.append(name)
-
-    def factory(self, name: str, num_slots: int, page_bytes: int):
-        """A factory for pool `name` holding `num_slots` logical K/V pages."""
-        self.claim(name)
-        if self.backend == "host":
-            return HostPoolFactory()
-        from spyre_inference.v1.kv_offload.spec import marvell_window_bytes
-
-        window = marvell_window_bytes(page_bytes, num_slots)
-        offset = self._next_offset
-        self._next_offset += window
-        return MarvellPoolFactory(MARVELL_BDF, bar_offset=offset, window_bytes=window)
-
-    def cleanup(self) -> None:
-        for name in self._names:
-            # Teardown must not mask a test failure.
-            with contextlib.suppress(Exception):
-                self.unlink_by_name(name)
-
-
-@pytest.fixture(params=POOL_BACKENDS)
-def pool_backend(request):
-    """Every hardware test runs once per tier: host DRAM, then the Marvell card."""
-    return request.param
-
-
-@pytest.fixture
-def pool_factories(pool_backend):
-    pools = _PoolFactories(pool_backend)
-    yield pools
-    pools.cleanup()
 
 
 def _real_device() -> bool:
@@ -145,6 +72,79 @@ requires_hardware = pytest.mark.skipif(
 )
 
 
+def _delegator_artifacts() -> tuple[Path, Path]:
+    build = Path(os.environ.get("DELEGATOR_BUILD_DIR", ""))
+    return build / "shared-pool-delegator", build / "shared-poolctl"
+
+
+def _wait_for_delegator(ctl: Path, socket: Path, process: subprocess.Popen) -> None:
+    for _ in range(200):
+        if process.poll() is not None:
+            raise RuntimeError("shared-pool-delegator exited before becoming ready")
+        result = subprocess.run(
+            [str(ctl), "--socket", str(socket), "health"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return
+        time.sleep(0.05)
+    raise RuntimeError("shared-pool-delegator did not become ready")
+
+
+@pytest.fixture
+def persistent_pool(tmp_path):
+    """Create complete READY generations and destroy them after consumers detach."""
+
+    daemon, ctl_binary = _delegator_artifacts()
+    if not daemon.is_file() or not ctl_binary.is_file():
+        pytest.skip("DELEGATOR_BUILD_DIR does not contain delegator test artifacts")
+
+    socket = tmp_path / "delegator.sock"
+    process = subprocess.Popen(
+        [str(daemon), "--socket-path", str(socket)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    prepared_pools: list[PreparedDemoPool] = []
+    try:
+        _wait_for_delegator(ctl_binary, socket, process)
+        ctl = SharedPoolCtl(binary=ctl_binary, socket_path=socket)
+
+        def _create(
+            *,
+            num_slots: int,
+            slot_bytes: int,
+            block_size: int = BLOCK_SIZE,
+        ) -> SharedPoolIdentity:
+            prepared = prepare_demo_pool(
+                ctl=ctl,
+                pool_name=f"/spyre-kv-hw-{os.getpid()}-{uuid.uuid4().hex}",
+                data_pool_name="host-0",
+                model="spyre-kv-hardware-test",
+                cpu_bytes_to_use=num_slots * slot_bytes,
+                slot_bytes=slot_bytes,
+                block_size=block_size,
+            )
+            prepared_pools.append(prepared)
+            return SharedPoolIdentity(
+                prepared.pool_name,
+                bytes.fromhex(prepared.generation),
+                prepared.data_pool_name,
+            )
+
+        yield _create
+        gc.collect()
+        for prepared in reversed(prepared_pools):
+            cleanup_pool(prepared.pool_name, prepared.generation, ctl=ctl)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=10)
+
+
 @pytest.fixture(autouse=True)
 def _init_device():
     """Create the RuntimeContext before any device allocation.
@@ -154,6 +154,8 @@ def _init_device():
     because the mock path initializes lazily elsewhere; on a real card the
     context must exist first.
     """
+    if not _real_device():
+        return
     torch.spyre._impl._lazy_init()
 
 
@@ -291,31 +293,38 @@ def _zero_pages(cache, blocks) -> dict:
 
 
 @pytest.fixture
-def offloader(request, pool_factories):
-    """An offloader on a uniquely-named pool of the test's backend.
+def offloader(persistent_pool):
+    """Attach an offloader to a delegator-created persistent generation."""
 
-    The name is unlinked before and after (see `_PoolFactories`), and every
-    offloader is released at teardown so its attach does not outlive the test.
-    """
-    from spyre_inference.v1.worker.spyre_kv_offload import page_bytes
+    attachments: list[SharedPoolAttachment] = []
+    offloaders: list[SpyreKvPageOffloader] = []
 
-    made: list[SpyreKvPageOffloader] = []
-
-    def _make(cache, impl_cls, num_slots=2):
-        name = f"kv_e2e_{os.getpid()}_{abs(hash(request.node.name)) % 10**6}_{len(made)}"
-        off = SpyreKvPageOffloader(
-            cache,
-            name,
+    def _make(cache, impl_cls, num_slots=2, expect_signature=None):
+        signature = page_signature(cache, LAYOUT_KIND[impl_cls])
+        identity = persistent_pool(
+            num_slots=num_slots * 2,
+            slot_bytes=signature.page_bytes,
+            block_size=signature.block_size,
+        )
+        attachment = SharedPoolAttachment.attach(identity)
+        attachments.append(attachment)
+        offloader = SpyreKvPageOffloader(
+            cache=cache,
+            pool=attachment.data_pool,
             num_slots=num_slots,
             layout_kind=LAYOUT_KIND[impl_cls],
-            pool_factory=pool_factories.factory(name, num_slots, page_bytes(cache)),
+            component_count=2,
+            component_offset=0,
+            signature=signature,
+            expect_signature=expect_signature,
         )
-        made.append(off)
-        return off
+        offloaders.append(offloader)
+        return offloader
 
     yield _make
 
-    for off in made:
-        # Teardown must not mask a test failure.
-        with contextlib.suppress(Exception):
-            off.release()
+    for offloader in reversed(offloaders):
+        offloader.close()
+    for attachment in reversed(attachments):
+        attachment.close()
+    gc.collect()

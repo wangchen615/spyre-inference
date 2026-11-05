@@ -25,6 +25,7 @@ Visit our [documentation](https://torch-spyre.github.io/spyre-inference/):
 
 - [Installation](https://torch-spyre.github.io/spyre-inference/latest/getting_started/installation.html)
 - [Examples](https://torch-spyre.github.io/spyre-inference/latest/examples/offline_inference/)
+- [Persistent KV offload pools](docs/user_guide/kv_offload.md)
 - [Contributing Guide](https://torch-spyre.github.io/spyre-inference/latest/contributing/)
 
 ## Contributing

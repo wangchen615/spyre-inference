@@ -40,19 +40,15 @@ Assertions are bitwise on raw fp16 patterns via `_bits`. Expectations are always
 re-read from the device after a write, never taken from the host source: H2D is
 not bit-preserving (see `hw_helpers._fill_all`).
 
-Every test runs once per tier (`pool_backend`): host shared memory, and the
-Marvell card's BAR2 (skipped unless FLEX_TEST_PCI_BDF is set). A fresh host
-pool is zero-filled; a fresh Marvell pool is *not* (stale bytes from an earlier
-user of the window stay on the card), so the untouched-slot test zeroes its
-slots through the device before relying on that.
-
 Sizing stays at the proven conservative shape -- a few 256 KiB pages, moved
 synchronously with a synchronize() between phases.
 """
 
+# ruff: noqa: F811 - imported pytest fixtures are intentionally used by name
+
 from __future__ import annotations
 
-import os
+import gc
 
 import pytest
 import torch
@@ -61,6 +57,7 @@ from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 
 from spyre_inference.v1.kv_offload.connector import SpyrePhysicalCaches
 from spyre_inference.v1.kv_offload.worker import SpyreOffloadingWorker
+from spyre_inference.v1.worker.spyre_kv_offload import page_signature
 from tests.kv_offload.hw_helpers import (  # noqa: F401 - fixtures used by name
     IMPL_IDS,
     IMPLS,
@@ -71,8 +68,7 @@ from tests.kv_offload.hw_helpers import (  # noqa: F401 - fixtures used by name
     _fill_all,
     _init_device,
     _zero_pages,
-    pool_backend,
-    pool_factories,
+    persistent_pool,
     requires_hardware,
 )
 
@@ -104,42 +100,38 @@ def _physical(caches, impl_cls) -> SpyrePhysicalCaches:
 
 
 @pytest.fixture
-def worker(request, pool_factories):
-    """A worker on the test's backend whose pools are unlinked on both ends.
+def worker(persistent_pool):
+    """A worker attached to one complete persistent generation per call."""
 
-    Stale segments outlive a crashed run, and `create_or_attach` will happily
-    attach one whose geometry matches -- its bytes then read back as a "valid"
-    page. Unlinking on the way in as well as out keeps a previous failure from
-    masking the next one. Workers are shut down (pools released) at teardown.
-    """
-    from spyre_inference.v1.worker.spyre_kv_offload import page_bytes
-
-    made: list[SpyreOffloadingWorker] = []
+    workers: list[SpyreOffloadingWorker] = []
 
     def _make(caches, impl_cls, num_host_blocks=NUM_HOST_BLOCKS):
-        prefix = f"kv_wrk_{os.getpid()}_{abs(hash(request.node.name)) % 10**6}"
-        factories = [
-            pool_factories.factory(f"{prefix}_c{c_idx}", num_host_blocks, page_bytes(c))
-            for c_idx, c in enumerate(caches)
-        ]
-        wrk = SpyreOffloadingWorker(
-            physical=_physical(caches, impl_cls),
-            num_host_blocks=num_host_blocks,
-            pool_prefix=prefix,
-            pool_factories=factories,
+        physical = _physical(caches, impl_cls)
+        signatures = [page_signature(cache, LAYOUT_KIND[impl_cls]) for cache in caches]
+        component_count = 2 * len(caches)
+        identity = persistent_pool(
+            num_slots=num_host_blocks * component_count,
+            slot_bytes=max(signature.page_bytes for signature in signatures),
+            block_size=signatures[0].block_size,
         )
-        made.append(wrk)
-        return wrk
+        work = SpyreOffloadingWorker(
+            physical=physical,
+            num_host_blocks=num_host_blocks,
+            identity=identity,
+        )
+        workers.append(work)
+        return work
 
     yield _make
 
-    for wrk in made:
-        wrk.shutdown()
+    for work in reversed(workers):
+        work.shutdown()
+    gc.collect()
 
 
-def _drain_ok(wrk: SpyreOffloadingWorker, expect_bytes: int | None = None) -> None:
+def _drain_ok(work: SpyreOffloadingWorker, expect_bytes: int | None = None) -> None:
     """Assert exactly one successful result, with instrumentation populated."""
-    results = wrk.get_finished()
+    results = work.get_finished()
     assert len(results) == 1, f"expected 1 result, got {len(results)}"
     result = results[0]
     assert result.success, "transfer reported failure; see the logged traceback"
@@ -165,28 +157,19 @@ def test_single_block_store_does_not_touch_neighbouring_host_slots(impl_cls, wor
     so an overflow cancels itself out.
     """
     cache = _cache(impl_cls)
-    wrk = worker([cache], impl_cls)
-    # Host slots start zeroed (fresh shm); Marvell slots hold whatever an
-    # earlier user left on the card. Store zeroed device pages into every host
-    # block first so both tiers start from all-zero slots.
-    _zero_pages(cache, list(range(NUM_HOST_BLOCKS)))
-    wrk.submit_store(
-        0, _gpu_spec(list(range(NUM_HOST_BLOCKS))), CPULoadStoreSpec(list(range(NUM_HOST_BLOCKS)))
-    )
-    torch.spyre.synchronize()
-    _drain_ok(wrk)
+    work = worker([cache], impl_cls)
     expected = _fill_all(cache, {3: 11})
 
-    wrk.submit_store(1, _gpu_spec([3]), CPULoadStoreSpec([1]))
+    work.submit_store(1, _gpu_spec([3]), CPULoadStoreSpec([1]))
     torch.spyre.synchronize()
-    _drain_ok(wrk, expect_bytes=wrk._bytes_per_block)
+    _drain_ok(work, expect_bytes=work._bytes_per_block)
 
     # Reload the two host blocks that were never written into scratch device
     # blocks. Block 3 (the one actually stored) is left alone so the reload
     # cannot be satisfied from it.
-    wrk.submit_load(2, CPULoadStoreSpec([0, 2]), _gpu_spec([0, 1]))
+    work.submit_load(2, CPULoadStoreSpec([0, 2]), _gpu_spec([0, 1]))
     torch.spyre.synchronize()
-    _drain_ok(wrk, expect_bytes=2 * wrk._bytes_per_block)
+    _drain_ok(work, expect_bytes=2 * work._bytes_per_block)
 
     k_dev = cache.k_pages.to("cpu")
     v_dev = cache.v_pages.to("cpu")
@@ -215,21 +198,21 @@ def test_single_block_load_does_not_touch_neighbouring_device_blocks(impl_cls, w
     that rewrote the whole allocation from one slot would clobber them all.
     """
     cache = _cache(impl_cls)
-    wrk = worker([cache], impl_cls)
+    work = worker([cache], impl_cls)
     before = _fill_all(cache, {2: 21})
 
-    wrk.submit_store(1, _gpu_spec([2]), CPULoadStoreSpec([1]))
+    work.submit_store(1, _gpu_spec([2]), CPULoadStoreSpec([1]))
     torch.spyre.synchronize()
-    _drain_ok(wrk)
+    _drain_ok(work)
 
     # Overwrite every page, so a correct load restores block 2 only and the
     # other blocks keep these new values.
     after_refill = _fill_all(cache, {b: 700 + b for b in range(int(cache.k_pages.shape[0]))})
     _assert_bit_exact(cache.k_pages.to("cpu")[2], after_refill[2][0], "k page 2 was refilled")
 
-    wrk.submit_load(2, CPULoadStoreSpec([1]), _gpu_spec([2]))
+    work.submit_load(2, CPULoadStoreSpec([1]), _gpu_spec([2]))
     torch.spyre.synchronize()
-    _drain_ok(wrk)
+    _drain_ok(work)
 
     k_dev = cache.k_pages.to("cpu")
     v_dev = cache.v_pages.to("cpu")
@@ -254,13 +237,13 @@ def test_multi_layer_pages_do_not_cross_pools(impl_cls, worker):
     must recover its own content.
     """
     caches = [_cache(impl_cls, num_blocks=2) for _ in range(3)]
-    wrk = worker(caches, impl_cls)
+    work = worker(caches, impl_cls)
 
     expected = [_fill_all(c, {0: 31 + 7 * i}) for i, c in enumerate(caches)]
 
-    wrk.submit_store(1, _gpu_spec([0]), CPULoadStoreSpec([0]))
+    work.submit_store(1, _gpu_spec([0]), CPULoadStoreSpec([0]))
     torch.spyre.synchronize()
-    _drain_ok(wrk)
+    _drain_ok(work)
 
     # Destroy the device copies so a no-op load cannot pass.
     for c in caches:
@@ -268,9 +251,9 @@ def test_multi_layer_pages_do_not_cross_pools(impl_cls, worker):
     for c in caches:
         assert int(_bits(c.k_pages.to("cpu")[0]).ne(0).sum().item()) == 0
 
-    wrk.submit_load(2, CPULoadStoreSpec([0]), _gpu_spec([0]))
+    work.submit_load(2, CPULoadStoreSpec([0]), _gpu_spec([0]))
     torch.spyre.synchronize()
-    _drain_ok(wrk)
+    _drain_ok(work)
 
     for i, c in enumerate(caches):
         _assert_bit_exact(c.k_pages.to("cpu")[0], expected[i][0][0], f"cache {i} k page 0")
@@ -288,21 +271,21 @@ def test_worker_round_trip_via_load_store_specs(impl_cls, worker):
     host slot, and not a leftover device page, is the source.
     """
     cache = _cache(impl_cls)
-    wrk = worker([cache], impl_cls)
+    work = worker([cache], impl_cls)
 
     device_blocks = [5, 2, 6]
     host_blocks = [2, 0, 3]
     expected = _fill_all(cache, {b: 41 + b for b in device_blocks})
 
-    wrk.submit_store(7, _gpu_spec(device_blocks), CPULoadStoreSpec(host_blocks))
+    work.submit_store(7, _gpu_spec(device_blocks), CPULoadStoreSpec(host_blocks))
     torch.spyre.synchronize()
-    _drain_ok(wrk, expect_bytes=3 * wrk._bytes_per_block)
+    _drain_ok(work, expect_bytes=3 * work._bytes_per_block)
 
     # Relocate: the same host slots land on three previously-unrelated blocks.
     targets = [0, 1, 4]
-    wrk.submit_load(8, CPULoadStoreSpec(host_blocks), _gpu_spec(targets))
+    work.submit_load(8, CPULoadStoreSpec(host_blocks), _gpu_spec(targets))
     torch.spyre.synchronize()
-    _drain_ok(wrk, expect_bytes=3 * wrk._bytes_per_block)
+    _drain_ok(work, expect_bytes=3 * work._bytes_per_block)
 
     k_dev = cache.k_pages.to("cpu")
     v_dev = cache.v_pages.to("cpu")
@@ -320,11 +303,11 @@ def test_out_of_range_host_block_fails_before_any_dma(impl_cls, worker):
     id in the middle of a batch cannot leave a half-applied transfer behind.
     """
     cache = _cache(impl_cls, num_blocks=2)
-    wrk = worker([cache], impl_cls, num_host_blocks=2)
+    work = worker([cache], impl_cls, num_host_blocks=2)
     expected = _fill_all(cache, {0: 51, 1: 52})
 
-    assert wrk.submit_store(1, _gpu_spec([0, 1]), CPULoadStoreSpec([0, 9])) is True
-    results = wrk.get_finished()
+    assert work.submit_store(1, _gpu_spec([0, 1]), CPULoadStoreSpec([0, 9])) is True
+    results = work.get_finished()
     assert len(results) == 1
     assert results[0].success is False
 
@@ -353,12 +336,12 @@ def test_out_of_range_device_block_is_rejected_not_silently_moved(impl_cls, work
     about the copy primitive.
     """
     cache = _cache(impl_cls, num_blocks=2)
-    wrk = worker([cache], impl_cls, num_host_blocks=2)
+    work = worker([cache], impl_cls, num_host_blocks=2)
     expected = _fill_all(cache, {0: 61, 1: 62})
 
     # 5 is past the end of a 2-block cache.
-    assert wrk.submit_store(1, _gpu_spec([5]), CPULoadStoreSpec([0])) is True
-    results = wrk.get_finished()
+    assert work.submit_store(1, _gpu_spec([5]), CPULoadStoreSpec([0])) is True
+    results = work.get_finished()
     assert len(results) == 1
     assert results[0].success is False, (
         "an out-of-range device block was accepted; copy_kv_page_raw should have "
@@ -384,53 +367,15 @@ def test_multiple_kv_groups_are_rejected(impl_cls, worker):
     pages.
     """
     cache = _cache(impl_cls, num_blocks=2)
-    wrk = worker([cache], impl_cls, num_host_blocks=2)
+    work = worker([cache], impl_cls, num_host_blocks=2)
     expected = _fill_all(cache, {0: 71, 1: 72})
 
     two_groups = GPULoadStoreSpec([0, 1], group_sizes=[1, 1], block_indices=[0, 0])
-    assert wrk.submit_store(1, two_groups, CPULoadStoreSpec([0, 1])) is True
-    results = wrk.get_finished()
+    assert work.submit_store(1, two_groups, CPULoadStoreSpec([0, 1])) is True
+    results = work.get_finished()
     assert len(results) == 1
     assert results[0].success is False
 
     k_dev = cache.k_pages.to("cpu")
     for b in (0, 1):
         _assert_bit_exact(k_dev[b], expected[b][0], f"k page {b} after rejected store")
-
-
-@requires_hardware
-@pytest.mark.parametrize("impl_cls", IMPLS[:1], ids=IMPL_IDS[:1])
-def test_shutdown_alone_unlinks_the_pool_segments(impl_cls, pool_backend, pool_factories):
-    """An orderly shutdown must leave nothing in /dev/shm, without unlink_by_name.
-
-    vLLM reaches `SpyreOffloadingWorker.shutdown` on an orderly exit. Releasing
-    the last flex handle for a name is what unlinks it -- data and `.ctl` for a
-    host pool, only `.ctl` for a Marvell pool (its bytes live on the card). The
-    fixture's own unlink runs only after this assertion, so it cannot mask a
-    handle that was never dropped.
-    """
-    from spyre_inference.v1.worker.spyre_kv_offload import page_bytes
-
-    caches = [_cache(impl_cls, num_blocks=2) for _ in range(2)]
-    prefix = f"spyre_kv_shutdown_{os.getpid()}"
-    factories = [
-        pool_factories.factory(f"{prefix}_c{c}", 2, page_bytes(cache))
-        for c, cache in enumerate(caches)
-    ]
-    wrk = SpyreOffloadingWorker(
-        physical=_physical(caches, impl_cls),
-        num_host_blocks=2,
-        pool_prefix=prefix,
-        pool_factories=factories,
-    )
-    expected = {f"{prefix}_c{c}.ctl" for c in range(2)}
-    if pool_backend == "host":
-        expected |= {f"{prefix}_c{c}" for c in range(2)}
-
-    def present():
-        return {n for n in os.listdir("/dev/shm") if n.startswith(prefix)}
-
-    assert present() == expected, f"backend {pool_backend}: unexpected segments"
-    wrk.shutdown()
-    assert present() == set(), f"segments left after shutdown: {sorted(present())}"
-    wrk.shutdown()  # idempotent

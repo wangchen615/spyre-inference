@@ -1,0 +1,1176 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Policy and lifecycle tests for one-pool shared KV metadata."""
+
+from __future__ import annotations
+
+import gc
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from types import SimpleNamespace
+
+import pytest
+from vllm.v1.kv_offload.base import LookupResult, ReqContext, make_offload_key
+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+
+from spyre_inference.v1.kv_offload import shared_manager as shared_manager_mod
+from spyre_inference.v1.kv_offload.pool_plan import (
+    PlannedArena,
+    PlannedComponent,
+    PlannedPartition,
+    PlannedPool,
+)
+from spyre_inference.v1.kv_offload.shared_identity import SharedPoolIdentity
+from spyre_inference.v1.kv_offload.shared_manager import SpyreSharedOffloadingManager
+from spyre_inference.v1.kv_offload.shared_types import shared_page_hash
+
+OFFLOAD_KEY = make_offload_key(bytes.fromhex("11" * 32), 0)
+OTHER_KEY = make_offload_key(bytes.fromhex("22" * 32), 0)
+THIRD_KEY = make_offload_key(bytes.fromhex("33" * 32), 0)
+COMPONENT_COUNT = 4
+GENERATION = bytes.fromhex("44" * 16)
+IDENTITY = SharedPoolIdentity("shared-root", GENERATION, "shared.data")
+
+
+@dataclass(frozen=True)
+class FakeCompatibility:
+    metadata_version: int
+    compatibility_id: int
+
+
+@dataclass(frozen=True)
+class FakePoolRef:
+    metadata_version: int
+    pool_id: int
+    pool_version: int
+
+
+@dataclass(frozen=True)
+class FakeRegisteredPool:
+    name: str
+    pool_ref: FakePoolRef
+    compatibility: FakeCompatibility
+    slot_count: int = 8
+    slot_bytes: int = 4096
+
+
+@dataclass(frozen=True)
+class FakeCompatibleBlockKey:
+    compatibility: FakeCompatibility
+    block_hash: int
+
+
+@dataclass(frozen=True)
+class FakeSlotRef:
+    pool: FakePoolRef
+    slot_id: int
+    slot_version: int = 1
+
+
+@dataclass
+class PinRecord:
+    released: bool = False
+    lifecycle_calls: list | None = None
+
+
+class FakePin:
+    def __init__(self, record: PinRecord):
+        self.record = record
+
+    def __del__(self):
+        self.record.released = True
+        if self.record.lifecycle_calls is not None:
+            self.record.lifecycle_calls.append(("release_pin",))
+
+
+@dataclass
+class FakeLookupEntry:
+    key: FakeCompatibleBlockKey
+    slot: FakeSlotRef
+    chunks: tuple = ()
+    pin_records: list[PinRecord] = field(default_factory=list)
+
+
+@dataclass
+class FakeReservation:
+    key: FakeCompatibleBlockKey
+    slot: FakeSlotRef
+
+    @property
+    def token(self):
+        return FakeReservationToken(self.key, self.slot)
+
+
+@dataclass(frozen=True)
+class FakeReservationToken:
+    key: FakeCompatibleBlockKey
+    slot: FakeSlotRef
+
+
+@dataclass(frozen=True)
+class FakeExistingClaim:
+    slot: FakeSlotRef
+    valid: bool
+
+
+class FakeNoSpace:
+    pass
+
+
+class FakeUnavailable:
+    pass
+
+
+@dataclass(frozen=True)
+class FakeCapacity:
+    max_pools: int
+    max_slots_per_pool: int
+    max_compatibilities: int
+
+
+@dataclass(frozen=True)
+class FakeMetadataConfig:
+    max_chunks: int
+    pools: tuple
+    capacity: FakeCapacity
+
+
+class FakeDirectory:
+    def __init__(self, registered: FakeRegisteredPool | dict[str, FakeRegisteredPool]):
+        registrations = (
+            registered if isinstance(registered, dict) else {registered.name: registered}
+        )
+        self.registrations = registrations
+        self.registered = next(iter(registrations.values()))
+        self.attach_calls = []
+        self.lookup_calls = []
+        self.entries: dict[int, FakeLookupEntry] = {}
+        self.pin_failures: set[int] = set()
+        self.pin_calls = []
+        self.claim_results: dict[int, object] = {}
+        self.claim_calls = []
+        self.live_reservations: list[FakeReservation] = []
+        self.aborted: list[FakeReservation] = []
+        self.evicted: list[FakeLookupEntry] = []
+        self.lifecycle_calls = []
+        self.data_pool = object()
+
+    def find_pool(self, name):
+        return self.registrations.get(name)
+
+    def lookup(self, key):
+        self.lookup_calls.append(key)
+        return self.entries.get(key.block_hash)
+
+    def pin_read(self, entry):
+        self.pin_calls.append(entry)
+        if entry.key.block_hash in self.pin_failures:
+            return None
+        record = PinRecord(lifecycle_calls=self.lifecycle_calls)
+        entry.pin_records.append(record)
+        return FakePin(record)
+
+    def claim(self, pool_ref, key):
+        self.claim_calls.append((pool_ref, key))
+        outcome = self.claim_results.get(key.block_hash, 0)
+        if isinstance(outcome, int):
+            reservation = FakeReservation(key, FakeSlotRef(pool_ref, outcome))
+            self.live_reservations.append(reservation)
+            return reservation
+        return outcome
+
+    def publish(self, reservation, chunks=()):
+        live = next(item for item in self.live_reservations if item.token == reservation)
+        self.live_reservations.remove(live)
+        entry = FakeLookupEntry(reservation.key, reservation.slot, tuple(chunks))
+        self.entries[reservation.key.block_hash] = entry
+        return entry
+
+    def abort(self, reservation):
+        live = next((item for item in self.live_reservations if item.token == reservation), None)
+        if live is None:
+            raise RuntimeError("reservation token is no longer live")
+        self.live_reservations.remove(live)
+        self.aborted.append(reservation)
+
+    def evict(self, entry):
+        self.evicted.append(entry)
+        if self.entries.get(entry.key.block_hash) is not entry:
+            return False
+        del self.entries[entry.key.block_hash]
+        return True
+
+
+class _Code(Enum):
+    OK = auto()
+
+
+class FakePoolBackend(Enum):
+    HOST_DRAM = auto()
+
+
+@dataclass(frozen=True)
+class FakePoolCompatibilityConfig:
+    model: str
+    kv_dtype: str
+    block_size: int
+    tensor_parallel_size: int
+    layout_signature: str
+
+
+@dataclass(frozen=True)
+class FakeDataPartitionConfig:
+    name: str
+    tp_rank: int
+    cache_index: int
+    num_slots: int
+    slot_bytes: int
+    offset_bytes: int
+
+
+@dataclass(frozen=True)
+class FakeDataPoolConfig:
+    name: str
+    backend: FakePoolBackend
+    num_slots: int
+    slot_bytes: int
+    partitions: list[FakeDataPartitionConfig]
+    compatibility: FakePoolCompatibilityConfig
+
+
+@dataclass(frozen=True)
+class FakePoolMetadataConfig:
+    max_chunks: int
+
+
+@dataclass(frozen=True)
+class FakePoolConfig:
+    name: str
+    metadata: FakePoolMetadataConfig
+    data_pools: list[FakeDataPoolConfig]
+
+
+def _runtime(directory: FakeDirectory):
+    class FakeSharedPool:
+        @staticmethod
+        def attach_pool(name, generation, expected_config_or_rank, tp_rank=None):
+            expected_config = None if tp_rank is None else expected_config_or_rank
+            rank = expected_config_or_rank if tp_rank is None else tp_rank
+            directory.attach_calls.append(("attach", name, generation, expected_config, rank))
+            if expected_config is None:
+                local_names = [directory.registered.name]
+            else:
+                local_names = [
+                    partition.name
+                    for arena in expected_config.data_pools
+                    for partition in arena.partitions
+                    if partition.tp_rank == rank
+                ]
+            native_attachment = SimpleNamespace(
+                tp_rank=rank,
+                metadata=directory,
+                data_pools=[
+                    SimpleNamespace(
+                        registration=directory.registrations[local_name],
+                        data_pool=directory.data_pool,
+                    )
+                    for local_name in local_names
+                ],
+            )
+            directory.native_attachment = native_attachment
+            return SimpleNamespace(
+                code=_Code.OK,
+                attachment=native_attachment,
+                detail="",
+            )
+
+        @staticmethod
+        def detach_pool(attachment):
+            assert attachment is directory.native_attachment
+            directory.lifecycle_calls.append(("detach",))
+
+        @staticmethod
+        def create_pool(*args):
+            directory.lifecycle_calls.append(("create", args))
+
+        @staticmethod
+        def open_pool(*args):
+            directory.lifecycle_calls.append(("open", args))
+
+        @staticmethod
+        def destroy_pool(*args):
+            directory.lifecycle_calls.append(("destroy", args))
+
+    return SimpleNamespace(
+        SharedPool=FakeSharedPool,
+        PoolResultCode=_Code,
+        CompatibleBlockKey=FakeCompatibleBlockKey,
+        Reservation=FakeReservation,
+        ReservationToken=FakeReservationToken,
+        ExistingClaim=FakeExistingClaim,
+        NoSpace=FakeNoSpace,
+        Unavailable=FakeUnavailable,
+        PoolBackend=FakePoolBackend,
+        PoolCompatibility=FakePoolCompatibilityConfig,
+        SharedDataPartitionConfig=FakeDataPartitionConfig,
+        SharedDataPoolConfig=FakeDataPoolConfig,
+        MetadataConfig=FakePoolMetadataConfig,
+        PoolConfig=FakePoolConfig,
+    )
+
+
+def _manager_directory_runtime(
+    *,
+    slot_count: int = 8,
+    cache_policy: str = "lru",
+    store_threshold: int = 0,
+):
+    registered = FakeRegisteredPool(
+        "shared.data",
+        FakePoolRef(1, 10, 1),
+        FakeCompatibility(2, 7),
+        slot_count=slot_count,
+    )
+    directory = FakeDirectory(registered)
+    runtime = _runtime(directory)
+    manager = SpyreSharedOffloadingManager(
+        identity=IDENTITY,
+        component_count=COMPONENT_COUNT,
+        max_pool_slots=16,
+        cache_policy=cache_policy,
+        cache_policy_module_path=None,
+        enable_events=False,
+        store_threshold=store_threshold,
+        max_tracker_size=64_000,
+        runtime_loader=lambda: runtime,
+    )
+    return manager, directory, runtime
+
+
+def _tp_plan(cache_counts: tuple[int, ...]) -> PlannedPool:
+    identity = SharedPoolIdentity("shared-root", GENERATION, "host-r0")
+    partitions = []
+    components = []
+    allocated_bytes = 0
+    for tp_rank, cache_count in enumerate(cache_counts):
+        offset = 0
+        for cache_index in range(cache_count):
+            partition = PlannedPartition(
+                partition_id=len(partitions),
+                arena_name=f"host-r{tp_rank}",
+                partition_name=f"host-r{tp_rank}-c{cache_index}",
+                tp_rank=tp_rank,
+                cache_index=cache_index,
+                offset_bytes=offset,
+                num_slots=4,
+                slot_bytes=4096,
+                physical_page_bytes=3000,
+            )
+            partitions.append(partition)
+            for role in ("k", "v"):
+                components.append(
+                    PlannedComponent(
+                        global_component_id=len(components),
+                        tp_rank=tp_rank,
+                        cache_index=cache_index,
+                        role=role,
+                        arena_name=f"host-r{tp_rank}",
+                        partition_name=partition.partition_name,
+                        partition_id=partition.partition_id,
+                        partition_offset_bytes=offset,
+                        partition_slot_bytes=4096,
+                        physical_page_bytes=3000,
+                    )
+                )
+            offset += 4 * 4096
+            allocated_bytes += 4 * 4096
+    partition_tuple = tuple(partitions)
+    return PlannedPool(
+        identity=identity,
+        planning_version=1,
+        model="model-a",
+        model_revision="rev-a",
+        kv_dtype="float16",
+        block_size=128,
+        tensor_parallel_size=len(cache_counts),
+        cpu_bytes_to_use=allocated_bytes,
+        bytes_per_complete_block=2 * 4096 * len(partitions),
+        logical_block_capacity=2,
+        allocated_bytes=allocated_bytes,
+        unused_bytes=0,
+        arenas=tuple(
+            PlannedArena(
+                name=f"host-r{tp_rank}",
+                tp_rank=tp_rank,
+                backend="HOST_DRAM",
+                model="model-a@rev-a",
+                kv_dtype="float16",
+                block_size=128,
+                tensor_parallel_size=len(cache_counts),
+                partitions=tuple(item for item in partition_tuple if item.tp_rank == tp_rank),
+                num_slots=sum(
+                    item.num_slots for item in partition_tuple if item.tp_rank == tp_rank
+                ),
+                slot_bytes=4096,
+                layout_signature="ab" * 20,
+            )
+            for tp_rank in range(len(cache_counts))
+        ),
+        partitions=partition_tuple,
+        components=tuple(components),
+        metadata_max_chunks=1,
+    )
+
+
+def _tp4_plan() -> PlannedPool:
+    return _tp_plan((1, 2, 1, 3))
+
+
+def _global_manager_directory_runtime(*, plan=None, tp_rank=0, directory=None, runtime=None):
+    plan = plan or _tp4_plan()
+    if directory is None:
+        registrations = {
+            partition.partition_name: FakeRegisteredPool(
+                partition.partition_name,
+                FakePoolRef(1, 100 + partition.partition_id, 1),
+                FakeCompatibility(2, 1000 + partition.partition_id),
+                slot_count=partition.num_slots,
+                slot_bytes=partition.slot_bytes,
+            )
+            for partition in plan.partitions
+        }
+        directory = FakeDirectory(registrations)
+    runtime = runtime or _runtime(directory)
+    manager = SpyreSharedOffloadingManager(
+        plan=plan,
+        tp_rank=tp_rank,
+        cache_policy="lru",
+        cache_policy_module_path=None,
+        enable_events=False,
+        store_threshold=0,
+        max_tracker_size=64_000,
+        runtime_loader=lambda: runtime,
+    )
+    return manager, directory, runtime, plan
+
+
+@pytest.fixture
+def manager_directory_runtime():
+    return _manager_directory_runtime()
+
+
+def test_planned_manager_requires_tensor_parallel_rank():
+    with pytest.raises(ValueError, match="requires a tensor-parallel rank"):
+        _global_manager_directory_runtime(tp_rank=None)
+
+
+def _compatible_key(directory, runtime, key, component_id):
+    return runtime.CompatibleBlockKey(
+        directory.registered.compatibility,
+        shared_page_hash(key, component_id),
+    )
+
+
+def _entry(directory, runtime, key, component_id, slot_id, *, pool_ref=None):
+    compatible_key = _compatible_key(directory, runtime, key, component_id)
+    return FakeLookupEntry(
+        compatible_key,
+        FakeSlotRef(pool_ref or directory.registered.pool_ref, slot_id),
+    )
+
+
+def _publish_complete(directory, runtime, key=OFFLOAD_KEY, slots=(7, 2, 6, 1)):
+    entries = []
+    for component_id, slot_id in enumerate(slots):
+        entry = _entry(directory, runtime, key, component_id, slot_id)
+        directory.entries[entry.key.block_hash] = entry
+        entries.append(entry)
+    return tuple(entries)
+
+
+def _set_reservation_slots(directory, key, slots=(7, 2, 6, 1)):
+    for component_id, slot_id in enumerate(slots):
+        directory.claim_results[shared_page_hash(key, component_id)] = slot_id
+
+
+def _publish_store(directory, output):
+    for transfer in output.store_spec.transfers:
+        for page in transfer.pages:
+            directory.publish(page.reservation)
+
+
+def test_directory_attach_lazily_sizes_policy_from_registered_pool(
+    manager_directory_runtime,
+):
+    manager, directory, _ = manager_directory_runtime
+    assert manager._local_manager is None
+
+    assert manager.lookup(OFFLOAD_KEY, ReqContext("request-1")) is LookupResult.MISS
+
+    assert directory.attach_calls == [("attach", "shared-root", GENERATION, None, 0)]
+    assert manager._local_manager is not None
+    assert manager._local_manager._num_blocks == 2
+
+
+def test_manager_never_manages_pool_lifecycle(manager_directory_runtime):
+    manager, directory, _ = manager_directory_runtime
+
+    manager.on_new_request(ReqContext("request-1"))
+
+    assert not any(call[0] in {"create", "open", "destroy"} for call in directory.lifecycle_calls)
+
+
+def test_shutdown_releases_protocol_state_before_detach(manager_directory_runtime):
+    manager, directory, runtime = manager_directory_runtime
+    _publish_complete(directory, runtime)
+    ctx = ReqContext("request-1")
+    assert manager.lookup(OFFLOAD_KEY, ctx) is LookupResult.HIT
+    manager.prepare_load([OFFLOAD_KEY], ctx)
+
+    manager.shutdown()
+    gc.collect()
+
+    release_indices = [
+        index for index, call in enumerate(directory.lifecycle_calls) if call == ("release_pin",)
+    ]
+    detach_index = directory.lifecycle_calls.index(("detach",))
+    assert len(release_indices) == COMPONENT_COUNT
+    assert max(release_indices) < detach_index
+
+
+@pytest.mark.parametrize("slot_count", [0, 6, 20])
+def test_registered_pool_geometry_must_match_scheduler_limits(slot_count):
+    manager, _, _ = _manager_directory_runtime(slot_count=slot_count)
+    with pytest.raises(RuntimeError, match="slot_count"):
+        manager.lookup(OFFLOAD_KEY, ReqContext("request-1"))
+
+
+def test_fragmented_complete_hit_pins_every_page_until_complete_load(
+    manager_directory_runtime,
+):
+    manager, directory, runtime = manager_directory_runtime
+    entries = _publish_complete(directory, runtime)
+    ctx = ReqContext("request-1")
+
+    assert manager.lookup(OFFLOAD_KEY, ctx) is LookupResult.HIT
+    assert len(directory.lookup_calls) == COMPONENT_COUNT
+    assert len(directory.pin_calls) == COMPONENT_COUNT
+
+    spec = manager.prepare_load([OFFLOAD_KEY], ctx)
+    assert [
+        (page.component_id, page.location.pool_id, page.location.slot_id)
+        for page in spec.transfers[0].pages
+    ] == [(0, 10, 7), (1, 10, 2), (2, 10, 6), (3, 10, 1)]
+    assert all(not entry.pin_records[-1].released for entry in entries)
+
+    manager.complete_load([OFFLOAD_KEY], ctx)
+    gc.collect()
+    assert all(entry.pin_records[-1].released for entry in entries)
+
+
+def test_reused_request_state_is_tracked_for_shutdown_pin_release(
+    manager_directory_runtime,
+):
+    """A second load on one request must remain visible to shutdown cleanup."""
+
+    manager, directory, runtime = manager_directory_runtime
+    entries = _publish_complete(directory, runtime)
+    ctx = ReqContext("request-1")
+
+    assert manager.lookup(OFFLOAD_KEY, ctx) is LookupResult.HIT
+    manager.prepare_load([OFFLOAD_KEY], ctx)
+    manager.complete_load([OFFLOAD_KEY], ctx)
+    gc.collect()
+
+    assert manager.lookup(OFFLOAD_KEY, ctx) is LookupResult.HIT
+    manager.prepare_load([OFFLOAD_KEY], ctx)
+    second_pins = [entry.pin_records[-1] for entry in entries]
+    assert all(not pin.released for pin in second_pins)
+
+    manager.shutdown()
+    gc.collect()
+
+    assert all(pin.released for pin in second_pins)
+
+
+def test_shared_hit_reports_host_as_its_load_source(manager_directory_runtime):
+    manager, _, _ = manager_directory_runtime
+    cache_hit_source = shared_manager_mod.CacheHitSource
+
+    if cache_hit_source is None:  # vLLM 0.28: no get_load_source to override.
+        assert not hasattr(manager, "get_load_source")
+        return
+    assert manager.get_load_source(OFFLOAD_KEY, ReqContext("request-1")) is cache_hit_source.HOST
+
+
+@pytest.mark.parametrize("missing_component", range(COMPONENT_COUNT))
+def test_partial_page_set_is_a_miss_and_releases_earlier_pins(
+    missing_component, manager_directory_runtime
+):
+    manager, directory, runtime = manager_directory_runtime
+    entries = _publish_complete(directory, runtime)
+    del directory.entries[entries[missing_component].key.block_hash]
+    ctx = ReqContext("request-1")
+
+    assert manager.lookup(OFFLOAD_KEY, ctx) is LookupResult.MISS
+    gc.collect()
+    assert all(
+        entry.pin_records[-1].released for entry in entries[:missing_component] if entry.pin_records
+    )
+    state = ctx.get_state(type(manager._request_states[0]))
+    assert state.pending_pins == {}
+
+
+@pytest.mark.parametrize("failed_component", range(COMPONENT_COUNT))
+def test_failed_page_pin_is_a_miss_and_releases_earlier_pins(
+    failed_component, manager_directory_runtime
+):
+    manager, directory, runtime = manager_directory_runtime
+    entries = _publish_complete(directory, runtime)
+    directory.pin_failures.add(entries[failed_component].key.block_hash)
+    ctx = ReqContext("request-1")
+
+    assert manager.lookup(OFFLOAD_KEY, ctx) is LookupResult.MISS
+    gc.collect()
+    assert all(
+        entry.pin_records[-1].released for entry in entries[:failed_component] if entry.pin_records
+    )
+
+
+def test_foreign_pool_page_is_a_normal_miss(manager_directory_runtime):
+    manager, directory, runtime = manager_directory_runtime
+    entries = list(_publish_complete(directory, runtime))
+    foreign = FakePoolRef(1, 99, 1)
+    entries[2] = _entry(directory, runtime, OFFLOAD_KEY, 2, 6, pool_ref=foreign)
+    directory.entries[entries[2].key.block_hash] = entries[2]
+    ctx = ReqContext("request-1")
+
+    assert manager.lookup(OFFLOAD_KEY, ctx) is LookupResult.MISS
+    with pytest.raises(RuntimeError, match="not pinned"):
+        manager.prepare_load([OFFLOAD_KEY], ctx)
+
+
+def test_prepare_load_releases_scanned_but_unselected_page_bundles(
+    manager_directory_runtime,
+):
+    manager, directory, runtime = manager_directory_runtime
+    selected = _publish_complete(directory, runtime, OFFLOAD_KEY, (0, 1, 2, 3))
+    unselected = _publish_complete(directory, runtime, OTHER_KEY, (4, 5, 6, 7))
+    ctx = ReqContext("request-1")
+    assert manager.lookup(OFFLOAD_KEY, ctx) is LookupResult.HIT
+    assert manager.lookup(OTHER_KEY, ctx) is LookupResult.HIT
+
+    manager.prepare_load([OFFLOAD_KEY], ctx)
+    gc.collect()
+    assert all(not entry.pin_records[-1].released for entry in selected)
+    assert all(entry.pin_records[-1].released for entry in unselected)
+
+
+def test_request_finish_releases_pending_but_not_active_page_bundles(
+    manager_directory_runtime,
+):
+    manager, directory, runtime = manager_directory_runtime
+    active = _publish_complete(directory, runtime, OFFLOAD_KEY, (0, 1, 2, 3))
+    pending = _publish_complete(directory, runtime, OTHER_KEY, (4, 5, 6, 7))
+    ctx = ReqContext("request-1")
+    manager.lookup(OFFLOAD_KEY, ctx)
+    manager.lookup(OTHER_KEY, ctx)
+    manager.prepare_load([OFFLOAD_KEY], ctx)
+
+    manager.on_request_finished(ctx)
+    gc.collect()
+    assert all(entry.pin_records[-1].released for entry in pending)
+    assert all(not entry.pin_records[-1].released for entry in active)
+    manager.complete_load([OFFLOAD_KEY], ctx)
+    gc.collect()
+    assert all(entry.pin_records[-1].released for entry in active)
+
+
+def test_request_state_cleanup_uses_identity_not_dataclass_equality(
+    manager_directory_runtime,
+):
+    manager, _, _ = manager_directory_runtime
+    first_ctx = ReqContext("request-1")
+    second_ctx = ReqContext("request-2")
+    assert manager.lookup(OFFLOAD_KEY, first_ctx) is LookupResult.MISS
+    assert manager.lookup(OFFLOAD_KEY, second_ctx) is LookupResult.MISS
+    first_state = first_ctx.get_state(type(manager._request_states[0]))
+
+    manager.on_request_finished(second_ctx)
+
+    assert len(manager._request_states) == 1
+    assert manager._request_states[0] is first_state
+
+
+def test_store_claims_fragmented_component_slots_in_order(manager_directory_runtime):
+    manager, directory, _ = manager_directory_runtime
+    _set_reservation_slots(directory, OFFLOAD_KEY)
+    ctx = ReqContext("request-1")
+
+    output = manager.prepare_store([OFFLOAD_KEY], ctx)
+
+    assert output is not None
+    assert output.keys_to_store == [OFFLOAD_KEY]
+    assert [
+        (page.component_id, page.location.pool_id, page.location.slot_id)
+        for page in output.store_spec.transfers[0].pages
+    ] == [(0, 10, 7), (1, 10, 2), (2, 10, 6), (3, 10, 1)]
+
+
+def test_store_omits_preexisting_valid_pages_from_worker_spec(
+    manager_directory_runtime,
+):
+    manager, directory, runtime = manager_directory_runtime
+    for component_id, slot_id in ((0, 7), (2, 6)):
+        entry = _entry(directory, runtime, OFFLOAD_KEY, component_id, slot_id)
+        directory.entries[entry.key.block_hash] = entry
+        directory.claim_results[entry.key.block_hash] = FakeExistingClaim(entry.slot, True)
+    for component_id, slot_id in ((1, 2), (3, 1)):
+        directory.claim_results[shared_page_hash(OFFLOAD_KEY, component_id)] = slot_id
+
+    output = manager.prepare_store([OFFLOAD_KEY], ReqContext("request-1"))
+
+    assert output is not None
+    assert [page.component_id for page in output.store_spec.transfers[0].pages] == [
+        1,
+        3,
+    ]
+
+
+@pytest.mark.parametrize("failed_component", [1, 2, 3])
+@pytest.mark.parametrize("outcome", ["existing_reserved", "no_space"])
+def test_partial_claim_failure_aborts_new_pages_and_rolls_back_logical_admission(
+    failed_component, outcome, manager_directory_runtime
+):
+    manager, directory, _ = manager_directory_runtime
+    _set_reservation_slots(directory, OFFLOAD_KEY)
+    page_hash = shared_page_hash(OFFLOAD_KEY, failed_component)
+    if outcome == "existing_reserved":
+        directory.claim_results[page_hash] = FakeExistingClaim(
+            FakeSlotRef(directory.registered.pool_ref, 7), False
+        )
+    else:
+        directory.claim_results[page_hash] = FakeNoSpace()
+
+    output = manager.prepare_store([OFFLOAD_KEY], ReqContext("request-1"))
+
+    assert output is not None
+    assert output.keys_to_store == []
+    assert len(directory.aborted) == failed_component
+    assert directory.live_reservations == []
+    assert manager._local_manager._policy.get(OFFLOAD_KEY) is None
+
+
+def test_unavailable_aborts_current_and_prior_batch_reservations(
+    manager_directory_runtime,
+):
+    manager, directory, _ = manager_directory_runtime
+    _set_reservation_slots(directory, OFFLOAD_KEY)
+    _set_reservation_slots(directory, OTHER_KEY, (3, 4, 5, 6))
+    directory.claim_results[shared_page_hash(OTHER_KEY, 2)] = FakeUnavailable()
+    ctx = ReqContext("request-1")
+
+    with pytest.raises(RuntimeError, match="unavailable"):
+        manager.prepare_store([OFFLOAD_KEY, OTHER_KEY], ctx)
+
+    assert directory.live_reservations == []
+    assert len(directory.aborted) == 6
+    assert manager._local_manager._policy.get(OFFLOAD_KEY) is None
+    assert manager._local_manager._policy.get(OTHER_KEY) is None
+
+
+def test_foreign_pool_existing_claim_aborts_and_raises(manager_directory_runtime):
+    manager, directory, _ = manager_directory_runtime
+    _set_reservation_slots(directory, OFFLOAD_KEY, (0, 1, 2, 3))
+    component_id = 2
+    directory.claim_results[shared_page_hash(OFFLOAD_KEY, component_id)] = FakeExistingClaim(
+        FakeSlotRef(FakePoolRef(1, 99, 1), 3), True
+    )
+
+    with pytest.raises(RuntimeError, match="foreign pool"):
+        manager.prepare_store([OFFLOAD_KEY], ReqContext("request-1"))
+    assert len(directory.aborted) == component_id
+
+
+def test_successful_mixed_publication_owns_only_new_pages(manager_directory_runtime):
+    manager, directory, runtime = manager_directory_runtime
+    peer_entries = []
+    for component_id, slot_id in ((0, 7), (2, 6)):
+        entry = _entry(directory, runtime, OFFLOAD_KEY, component_id, slot_id)
+        directory.entries[entry.key.block_hash] = entry
+        directory.claim_results[entry.key.block_hash] = FakeExistingClaim(entry.slot, True)
+        peer_entries.append(entry)
+    for component_id, slot_id in ((1, 2), (3, 1)):
+        directory.claim_results[shared_page_hash(OFFLOAD_KEY, component_id)] = slot_id
+    ctx = ReqContext("request-1")
+    output = manager.prepare_store([OFFLOAD_KEY], ctx)
+    assert output is not None
+    _publish_store(directory, output)
+
+    manager.complete_store(output.keys_to_store, ctx)
+
+    owned = manager._owned_entries[OFFLOAD_KEY]
+    assert {entry.key.block_hash for entry in owned} == {
+        shared_page_hash(OFFLOAD_KEY, 1),
+        shared_page_hash(OFFLOAD_KEY, 3),
+    }
+    assert all(entry not in owned for entry in peer_entries)
+
+
+def test_incomplete_publication_evicts_only_attempt_pages_and_rolls_back(
+    manager_directory_runtime,
+):
+    manager, directory, runtime = manager_directory_runtime
+    peer = _entry(directory, runtime, OFFLOAD_KEY, 0, 7)
+    directory.entries[peer.key.block_hash] = peer
+    directory.claim_results[peer.key.block_hash] = FakeExistingClaim(peer.slot, True)
+    for component_id, slot_id in ((1, 2), (2, 6), (3, 1)):
+        directory.claim_results[shared_page_hash(OFFLOAD_KEY, component_id)] = slot_id
+    ctx = ReqContext("request-1")
+    output = manager.prepare_store([OFFLOAD_KEY], ctx)
+    assert output is not None
+    directory.publish(output.store_spec.transfers[0].pages[0].reservation)
+
+    with pytest.raises(RuntimeError, match="complete page set"):
+        manager.complete_store(output.keys_to_store, ctx)
+
+    assert directory.entries[peer.key.block_hash] is peer
+    assert directory.evicted and peer not in directory.evicted
+    assert directory.live_reservations == []
+    assert manager._local_manager._policy.get(OFFLOAD_KEY) is None
+
+
+def test_complete_store_preserves_replacement_with_new_slot_tenancy(
+    manager_directory_runtime,
+):
+    manager, directory, _ = manager_directory_runtime
+    _set_reservation_slots(directory, OFFLOAD_KEY)
+    ctx = ReqContext("request-1")
+    output = manager.prepare_store([OFFLOAD_KEY], ctx)
+    assert output is not None
+    _publish_store(directory, output)
+    replaced_page = output.store_spec.transfers[0].pages[0]
+    replacement = FakeLookupEntry(
+        replaced_page.reservation.key,
+        FakeSlotRef(
+            replaced_page.reservation.slot.pool,
+            replaced_page.reservation.slot.slot_id,
+            replaced_page.reservation.slot.slot_version + 1,
+        ),
+    )
+    directory.entries[replacement.key.block_hash] = replacement
+
+    with pytest.raises(RuntimeError, match="publication changed"):
+        manager.complete_store(output.keys_to_store, ctx)
+
+    assert directory.entries[replacement.key.block_hash] is replacement
+    assert replacement not in directory.evicted
+    assert manager._local_manager._policy.get(OFFLOAD_KEY) is None
+
+
+def test_failed_store_drops_pending_ownership_and_local_admission(
+    manager_directory_runtime,
+):
+    manager, directory, _ = manager_directory_runtime
+    _set_reservation_slots(directory, OFFLOAD_KEY)
+    ctx = ReqContext("request-1")
+    output = manager.prepare_store([OFFLOAD_KEY], ctx)
+    assert output is not None
+    for page in output.store_spec.transfers[0].pages:
+        directory.abort(page.reservation)
+
+    manager.complete_store(output.keys_to_store, ctx, success=False)
+
+    assert manager._local_manager._policy.get(OFFLOAD_KEY) is None
+    assert manager._pending_stores == {}
+
+
+def test_local_eviction_removes_all_owned_pages():
+    manager, directory, _ = _manager_directory_runtime(slot_count=4)
+    _set_reservation_slots(directory, OFFLOAD_KEY, (0, 1, 2, 3))
+    ctx = ReqContext("request-1")
+    first = manager.prepare_store([OFFLOAD_KEY], ctx)
+    assert first is not None
+    _publish_store(directory, first)
+    manager.complete_store(first.keys_to_store, ctx)
+    owned = manager._owned_entries[OFFLOAD_KEY]
+
+    _set_reservation_slots(directory, OTHER_KEY, (0, 1, 2, 3))
+    second = manager.prepare_store([OTHER_KEY], ctx)
+
+    assert second is not None
+    assert second.evicted_keys == [OFFLOAD_KEY]
+    assert directory.evicted == list(owned)
+
+
+@pytest.mark.parametrize("cache_policy", ["lru", "arc"])
+def test_shared_manager_reuses_upstream_admission_and_victim_policy(cache_policy):
+    manager, directory, _ = _manager_directory_runtime(cache_policy=cache_policy, store_threshold=2)
+    upstream = CPUOffloadingManager(
+        num_blocks=2,
+        cache_policy=cache_policy,
+        store_threshold=2,
+    )
+    shared_ctx = ReqContext("shared")
+    upstream_ctx = ReqContext("upstream")
+
+    for key in (OFFLOAD_KEY, OTHER_KEY, THIRD_KEY):
+        _set_reservation_slots(directory, key)
+        for _ in range(2):
+            assert manager.lookup(key, shared_ctx) is LookupResult.MISS
+            assert upstream.lookup(key, upstream_ctx) is LookupResult.MISS
+
+    # vLLM 0.28: two lookups meet store_threshold=2, so the first store admits both.
+    shared_first = manager.prepare_store([OFFLOAD_KEY, OTHER_KEY], shared_ctx)
+    upstream_first = upstream.prepare_store([OFFLOAD_KEY, OTHER_KEY], upstream_ctx)
+    assert shared_first is not None and upstream_first is not None
+    assert shared_first.keys_to_store == upstream_first.keys_to_store == [OFFLOAD_KEY, OTHER_KEY]
+    _publish_store(directory, shared_first)
+    manager.complete_store(shared_first.keys_to_store, shared_ctx)
+    upstream.complete_store(upstream_first.keys_to_store, upstream_ctx)
+    manager.touch([OFFLOAD_KEY], shared_ctx)
+    upstream.touch([OFFLOAD_KEY], upstream_ctx)
+    manager.on_request_finished(shared_ctx)
+    upstream.on_request_finished(upstream_ctx)
+
+    shared_second_ctx = ReqContext("shared-second")
+    upstream_second_ctx = ReqContext("upstream-second")
+    shared_second = manager.prepare_store([THIRD_KEY], shared_second_ctx)
+    upstream_second = upstream.prepare_store([THIRD_KEY], upstream_second_ctx)
+    assert shared_second is not None and upstream_second is not None
+    assert shared_second.keys_to_store == upstream_second.keys_to_store == [THIRD_KEY]
+    assert shared_second.evicted_keys == upstream_second.evicted_keys == [OTHER_KEY]
+    assert len(directory.evicted) == COMPONENT_COUNT
+
+
+def test_hit_pending_does_not_scan_partial_directory(manager_directory_runtime):
+    manager, directory, _ = manager_directory_runtime
+    _set_reservation_slots(directory, OFFLOAD_KEY)
+    output = manager.prepare_store([OFFLOAD_KEY], ReqContext("store"))
+    assert output is not None
+    directory.lookup_calls.clear()
+
+    assert manager.lookup(OFFLOAD_KEY, ReqContext("load")) is LookupResult.HIT_PENDING
+    assert directory.lookup_calls == []
+
+
+def test_tp4_store_claims_every_component_in_its_planned_partition_with_tokens():
+    manager, directory, _, plan = _global_manager_directory_runtime(tp_rank=3)
+    local_components = plan.components_for_rank(3)
+    for component in plan.components:
+        directory.claim_results[shared_page_hash(OFFLOAD_KEY, component.global_component_id)] = (
+            component.global_component_id % 4
+        )
+
+    output = manager.prepare_store([OFFLOAD_KEY], ReqContext("store"))
+
+    assert output is not None
+    pages = output.store_spec.transfers[0].pages
+    assert len(pages) == len(local_components)
+    assert all(isinstance(page.reservation, FakeReservationToken) for page in pages)
+    assert [pool_ref for pool_ref, _ in directory.claim_calls] == [
+        directory.registrations[component.partition_name].pool_ref for component in local_components
+    ]
+    assert manager._local_manager._num_blocks == plan.logical_block_capacity
+    expected_config = directory.attach_calls[0][3]
+    assert expected_config.name == plan.identity.pool_name
+    assert expected_config.data_pools[0].num_slots == plan.arena_for_rank(0).num_slots
+    assert expected_config.data_pools[0].compatibility.layout_signature == (
+        plan.arena_for_rank(0).layout_signature
+    )
+    assert directory.attach_calls[0][4] == 3
+
+
+def test_rank_local_stores_require_all_ranks_before_global_lookup_hits():
+    plan = _tp_plan((1, 1))
+    rank0, directory, runtime, _ = _global_manager_directory_runtime(plan=plan, tp_rank=0)
+    rank1, _, _, _ = _global_manager_directory_runtime(
+        plan=plan,
+        tp_rank=1,
+        directory=directory,
+        runtime=runtime,
+    )
+
+    rank0_context = ReqContext("rank-0-store")
+    rank0_store = rank0.prepare_store([OFFLOAD_KEY], rank0_context)
+    assert rank0_store is not None
+    assert [page.component_id for page in rank0_store.store_spec.transfers[0].pages] == [
+        0,
+        1,
+    ]
+    _publish_store(directory, rank0_store)
+    rank0.complete_store(rank0_store.keys_to_store, rank0_context)
+    assert rank0.lookup(OFFLOAD_KEY, ReqContext("partial-load")) is LookupResult.MISS
+
+    rank1_context = ReqContext("rank-1-store")
+    rank1_store = rank1.prepare_store([OFFLOAD_KEY], rank1_context)
+    assert rank1_store is not None
+    assert [page.component_id for page in rank1_store.store_spec.transfers[0].pages] == [
+        2,
+        3,
+    ]
+    _publish_store(directory, rank1_store)
+    rank1.complete_store(rank1_store.keys_to_store, rank1_context)
+    assert rank0.lookup(OFFLOAD_KEY, ReqContext("complete-load")) is LookupResult.HIT
+
+
+@pytest.mark.parametrize("missing_component", [0, 1, 4, 8, 13])
+def test_tp4_lookup_requires_every_global_component(missing_component):
+    manager, directory, runtime, plan = _global_manager_directory_runtime()
+    for component in plan.components:
+        registered = directory.registrations[component.partition_name]
+        key = runtime.CompatibleBlockKey(
+            registered.compatibility,
+            shared_page_hash(OFFLOAD_KEY, component.global_component_id),
+        )
+        directory.entries[key.block_hash] = FakeLookupEntry(
+            key, FakeSlotRef(registered.pool_ref, component.global_component_id % 4)
+        )
+    missing = plan.components[missing_component]
+    del directory.entries[shared_page_hash(OFFLOAD_KEY, missing.global_component_id)]
+
+    assert manager.lookup(OFFLOAD_KEY, ReqContext("load")) is LookupResult.MISS
+
+
+@pytest.mark.parametrize("outcome", [FakeNoSpace(), FakeUnavailable()])
+def test_tp4_claim_failure_aborts_every_prior_partition_reservation(outcome):
+    manager, directory, _, plan = _global_manager_directory_runtime(tp_rank=3)
+    local_components = plan.components_for_rank(3)
+    failed_component = local_components[2]
+    for component in plan.components:
+        page_hash = shared_page_hash(OFFLOAD_KEY, component.global_component_id)
+        directory.claim_results[page_hash] = component.global_component_id % 4
+    directory.claim_results[shared_page_hash(OFFLOAD_KEY, failed_component.global_component_id)] = (
+        outcome
+    )
+
+    if isinstance(outcome, FakeUnavailable):
+        with pytest.raises(RuntimeError, match="unavailable"):
+            manager.prepare_store([OFFLOAD_KEY], ReqContext("store"))
+    else:
+        result = manager.prepare_store([OFFLOAD_KEY], ReqContext("store"))
+        assert result is not None and result.keys_to_store == []
+
+    assert len(directory.aborted) == 2
+    assert directory.live_reservations == []
+
+
+def test_failed_tp4_completion_cleans_reserved_and_published_components():
+    manager, directory, _, plan = _global_manager_directory_runtime(tp_rank=3)
+    local_components = plan.components_for_rank(3)
+    for component in plan.components:
+        directory.claim_results[shared_page_hash(OFFLOAD_KEY, component.global_component_id)] = (
+            component.global_component_id % 4
+        )
+    ctx = ReqContext("store")
+    output = manager.prepare_store([OFFLOAD_KEY], ctx)
+    assert output is not None
+    pages = output.store_spec.transfers[0].pages
+    for page in pages[:3]:
+        directory.publish(page.reservation)
+
+    manager.complete_store(output.keys_to_store, ctx, success=False)
+
+    assert len(directory.evicted) == 3
+    assert len(directory.aborted) == len(local_components) - 3
+    assert directory.live_reservations == []
+
+
+def _published_and_pending(manager, directory):
+    """Publish OFFLOAD_KEY, pin it for a load, and leave OTHER_KEY claimed but unpublished."""
+    _set_reservation_slots(directory, OFFLOAD_KEY)
+    ctx = ReqContext("request-1")
+    stored = manager.prepare_store([OFFLOAD_KEY], ctx)
+    assert stored is not None
+    _publish_store(directory, stored)
+    manager.complete_store(stored.keys_to_store, ctx)
+    owned = manager._owned_entries[OFFLOAD_KEY]
+    assert manager.lookup(OFFLOAD_KEY, ctx) is LookupResult.HIT
+    manager.prepare_load([OFFLOAD_KEY], ctx)
+    pins = [entry.pin_records[-1] for entry in owned]
+
+    _set_reservation_slots(directory, OTHER_KEY, (4, 5, 6, 7))
+    pending = manager.prepare_store([OTHER_KEY], ctx)
+    assert pending is not None
+    pending_reservations = [page.reservation for page in pending.store_spec.transfers[0].pages]
+    return owned, pins, pending_reservations
+
+
+def test_reset_releases_pins_and_pending_stores_but_keeps_published_pages(
+    manager_directory_runtime,
+):
+    manager, directory, _ = manager_directory_runtime
+    owned, pins, pending_reservations = _published_and_pending(manager, directory)
+
+    manager.reset_cache()
+    gc.collect()
+
+    assert directory.evicted == []  # published pages belong to the pool.
+    assert [directory.entries[entry.key.block_hash] for entry in owned] == list(owned)
+    assert all(pin.released for pin in pins)  # this replica's pins are dropped.
+    assert directory.aborted == pending_reservations  # unpublished claims are freed.
+    assert directory.live_reservations == []
+    assert manager._request_states == []
+    assert manager._owned_entries == {}
+    assert manager._pending_stores == {}
+    assert manager._local_keys == set()
+    assert manager._local_manager._policy.get(OFFLOAD_KEY) is None
+
+
+def test_shutdown_keeps_published_pages_for_a_new_replica(manager_directory_runtime):
+    manager, directory, runtime = manager_directory_runtime
+    owned, pins, pending_reservations = _published_and_pending(manager, directory)
+
+    manager.shutdown()
+    gc.collect()
+
+    assert ("detach",) in directory.lifecycle_calls
+    assert directory.evicted == []
+    assert all(pin.released for pin in pins)
+    assert directory.aborted == pending_reservations
+
+    replacement = SpyreSharedOffloadingManager(
+        identity=IDENTITY,
+        component_count=COMPONENT_COUNT,
+        max_pool_slots=16,
+        cache_policy="lru",
+        cache_policy_module_path=None,
+        enable_events=False,
+        store_threshold=0,
+        max_tracker_size=64_000,
+        runtime_loader=lambda: runtime,
+    )
+    ctx = ReqContext("after-restart")
+    assert replacement.lookup(OFFLOAD_KEY, ctx) is LookupResult.HIT  # reload after restart.
+    spec = replacement.prepare_load([OFFLOAD_KEY], ctx)
+    assert [page.location.slot_id for page in spec.transfers[0].pages] == [
+        entry.slot.slot_id for entry in owned
+    ]
+
+
+def test_reset_reclaims_partially_published_pending_store(manager_directory_runtime):
+    manager, directory, _ = manager_directory_runtime
+    _set_reservation_slots(directory, OFFLOAD_KEY)
+    pending = manager.prepare_store([OFFLOAD_KEY], ReqContext("store"))
+    assert pending is not None
+    pages = pending.store_spec.transfers[0].pages
+    published = [directory.publish(page.reservation) for page in pages[:2]]
+
+    manager.reset_cache()
+
+    assert directory.evicted == published
+    assert directory.aborted == [page.reservation for page in pages[2:]]
+    assert directory.entries == {}
+    assert directory.live_reservations == []

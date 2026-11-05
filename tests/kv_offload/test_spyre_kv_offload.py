@@ -23,11 +23,12 @@ not assert byte fidelity after a round trip -- that needs a card and lives with
 the hardware cases in the M1 plan.
 """
 
-import pytest
+# ruff: noqa: F811 - imported pytest fixtures are intentionally used by name
+
 import dataclasses
 
+import pytest
 import torch
-from spyre_testing_plugin.pytest_plugin import spyre_available
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
@@ -37,10 +38,14 @@ from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
 from spyre_inference.v1.worker.spyre_kv_offload import (
     PageSignature,
     SpyreKvPageOffloader,
-    k_slot,
     page_bytes,
     page_signature,
-    v_slot,
+)
+from tests.kv_offload.hw_helpers import (  # noqa: F401 - fixtures used by name
+    _init_device,
+    offloader,
+    persistent_pool,
+    requires_hardware,
 )
 
 DTYPE = torch.float16
@@ -76,18 +81,71 @@ def _cache(impl_cls, num_blocks=NUM_BLOCKS, **spec_kwargs):
 # --- pairing logic: no device needed ---------------------------------------
 
 
-def test_k_and_v_slots_are_disjoint():
-    """K and V are separate allocations, so one logical page needs two slots."""
-    assert [k_slot(s) for s in range(4)] == [0, 2, 4, 6]
-    assert [v_slot(s) for s in range(4)] == [1, 3, 5, 7]
-    used = [k_slot(s) for s in range(32)] + [v_slot(s) for s in range(32)]
-    assert len(set(used)) == 64, "K/V host slots collide"
+def test_fixed_child_routes_k_and_v_to_disjoint_component_slots():
+    """Each logical block owns a consecutive run spanning every K/V component."""
+    calls = []
+    cache = (object(), object())
+    pool = object()
+    signature = PageSignature(
+        layout_kind="token-major",
+        device_dtype="torch.float16",
+        block_size=128,
+        local_kv_heads=8,
+        head_size=128,
+        page_bytes=4096,
+    )
+
+    def copy_fn(*args):
+        calls.append(args)
+
+    offloader = SpyreKvPageOffloader(
+        cache,
+        pool=pool,
+        num_slots=4,
+        layout_kind="token-major",
+        component_count=6,
+        component_offset=2,
+        signature=signature,
+        copy_fn=copy_fn,
+    )
+    offloader.offload(block_id=7, slot=3, non_blocking=True)
+
+    assert calls == [
+        (cache[0], 7, pool, 20, False, True),
+        (cache[1], 7, pool, 21, False, True),
+    ]
+
+
+def test_close_releases_the_resolved_fixed_child_handle():
+    pool = object()
+    offloader = SpyreKvPageOffloader(
+        (object(), object()),
+        pool=pool,
+        num_slots=1,
+        layout_kind="token-major",
+        component_count=2,
+        component_offset=0,
+        signature=PageSignature(
+            layout_kind="token-major",
+            device_dtype="torch.float16",
+            block_size=128,
+            local_kv_heads=8,
+            head_size=128,
+            page_bytes=4096,
+        ),
+        copy_fn=lambda *args: None,
+    )
+
+    offloader.close()
+    offloader.close()
+
+    assert offloader.pool is None
 
 
 # --- everything below drives real device allocations -----------------------
 
 
-@pytest.mark.skipif(not spyre_available(), reason="requires a Spyre device")
+@requires_hardware
 @pytest.mark.parametrize("impl_cls", IMPLS, ids=IMPL_IDS)
 def test_page_bytes_matches_one_page(impl_cls):
     cache = _cache(impl_cls)
@@ -95,79 +153,67 @@ def test_page_bytes_matches_one_page(impl_cls):
     assert page_bytes(cache) == expected
 
 
-@pytest.mark.skipif(not spyre_available(), reason="requires a Spyre device")
+@requires_hardware
 @pytest.mark.parametrize("impl_cls", IMPLS, ids=IMPL_IDS)
-def test_pool_has_two_slots_per_logical_page(impl_cls, request):
+def test_pool_has_two_slots_per_logical_page(impl_cls, offloader):
     cache = _cache(impl_cls)
-    off = SpyreKvPageOffloader(
-        cache, request.node.name, num_slots=4, layout_kind=LAYOUT_KIND[impl_cls]
-    )
+    off = offloader(cache, impl_cls, num_slots=4)
     assert off.pool.slot_count() == 8
     assert off.pool.slot_bytes() == off.page_size_bytes
 
 
-@pytest.mark.skipif(not spyre_available(), reason="requires a Spyre device")
+@requires_hardware
 @pytest.mark.parametrize("impl_cls", IMPLS, ids=IMPL_IDS)
-def test_offload_and_reload_every_block(impl_cls, request):
+def test_offload_and_reload_every_block(impl_cls, offloader):
     cache = _cache(impl_cls)
-    off = SpyreKvPageOffloader(
-        cache, request.node.name, num_slots=2, layout_kind=LAYOUT_KIND[impl_cls]
-    )
+    off = offloader(cache, impl_cls, num_slots=2)
     for block_id in range(NUM_BLOCKS):
         off.offload(block_id=block_id, slot=block_id % 2)
         off.reload(slot=block_id % 2, block_id=block_id)
 
 
-@pytest.mark.skipif(not spyre_available(), reason="requires a Spyre device")
+@requires_hardware
 @pytest.mark.parametrize("impl_cls", IMPLS, ids=IMPL_IDS)
-def test_reload_may_relocate_to_another_block(impl_cls, request):
+def test_reload_may_relocate_to_another_block(impl_cls, offloader):
     """A page is position-independent, so a restore may target a new block."""
     cache = _cache(impl_cls)
-    off = SpyreKvPageOffloader(
-        cache, request.node.name, num_slots=1, layout_kind=LAYOUT_KIND[impl_cls]
-    )
+    off = offloader(cache, impl_cls, num_slots=1)
     off.offload(block_id=0, slot=0)
     off.reload(slot=0, block_id=NUM_BLOCKS - 1)
 
 
-@pytest.mark.skipif(not spyre_available(), reason="requires a Spyre device")
+@requires_hardware
 @pytest.mark.parametrize("impl_cls", IMPLS, ids=IMPL_IDS)
-def test_batch_helpers(impl_cls, request):
+def test_batch_helpers(impl_cls, offloader):
     cache = _cache(impl_cls)
-    off = SpyreKvPageOffloader(
-        cache, request.node.name, num_slots=4, layout_kind=LAYOUT_KIND[impl_cls]
-    )
+    off = offloader(cache, impl_cls, num_slots=4)
     off.offload_many([(0, 0), (1, 1), (2, 2)])
     off.reload_many([(0, 0), (1, 1), (2, 2)])
 
 
-@pytest.mark.skipif(not spyre_available(), reason="requires a Spyre device")
+@requires_hardware
 @pytest.mark.parametrize("impl_cls", IMPLS, ids=IMPL_IDS)
-def test_rejects_out_of_range_slot(impl_cls, request):
+def test_rejects_out_of_range_slot(impl_cls, offloader):
     cache = _cache(impl_cls)
-    off = SpyreKvPageOffloader(
-        cache, request.node.name, num_slots=2, layout_kind=LAYOUT_KIND[impl_cls]
-    )
+    off = offloader(cache, impl_cls, num_slots=2)
     with pytest.raises(IndexError, match="out of range"):
         off.offload(block_id=0, slot=2)
     with pytest.raises(IndexError, match="out of range"):
         off.reload(slot=-1, block_id=0)
 
 
-@pytest.mark.skipif(not spyre_available(), reason="requires a Spyre device")
+@requires_hardware
 @pytest.mark.parametrize("impl_cls", IMPLS, ids=IMPL_IDS)
-def test_rejects_out_of_range_block(impl_cls, request):
+def test_rejects_out_of_range_block(impl_cls, offloader):
     """Rejected by the torch-spyre validator before any DMA is enqueued."""
     cache = _cache(impl_cls)
-    off = SpyreKvPageOffloader(
-        cache, request.node.name, num_slots=1, layout_kind=LAYOUT_KIND[impl_cls]
-    )
+    off = offloader(cache, impl_cls, num_slots=1)
     with pytest.raises(RuntimeError, match="out of range"):
         off.offload(block_id=NUM_BLOCKS, slot=0)
 
 
-@pytest.mark.skipif(not spyre_available(), reason="requires a Spyre device")
-def test_rejects_page_view_instead_of_cache():
+@requires_hardware
+def test_rejects_page_view_instead_of_cache(offloader):
     """The validator requires the whole cache plus a block_id.
 
     A zero-offset prefix view is the dangerous case: storage_offset() is 0, so
@@ -176,23 +222,19 @@ def test_rejects_page_view_instead_of_cache():
     from torch_spyre._C import copy_kv_page_raw  # ty: ignore[unresolved-import]
 
     cache = _cache(SpyreAttentionImpl)
-    off = SpyreKvPageOffloader(
-        cache, "reject_view", num_slots=1, layout_kind="token-major"
-    )
+    off = offloader(cache, SpyreAttentionImpl, num_slots=1)
     for lo, hi in ((0, 4), (2, 6)):
-        with pytest.raises(RuntimeError, match="is not num_blocks"):
+        with pytest.raises(RuntimeError, match="full cache"):
             copy_kv_page_raw(cache.k_pages[lo:hi], 0, off.pool, 0, False, False)
 
 
-@pytest.mark.skipif(not spyre_available(), reason="requires a Spyre device")
-def test_rejects_generic_layout():
+@requires_hardware
+def test_rejects_generic_layout(offloader):
     """A plain .to('spyre') gets the generic tiled layout, which is not a cache."""
     from torch_spyre._C import copy_kv_page_raw  # ty: ignore[unresolved-import]
 
     cache = _cache(SpyreAttentionImpl)
-    off = SpyreKvPageOffloader(
-        cache, "reject_generic", num_slots=1, layout_kind="token-major"
-    )
+    off = offloader(cache, SpyreAttentionImpl, num_slots=1)
     shape = (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
     generic = torch.zeros(shape, dtype=DTYPE).to("spyre")
     with pytest.raises(RuntimeError, match="rank-4 device layout"):
@@ -202,7 +244,7 @@ def test_rejects_generic_layout():
 # --- page signature (contract check 8) --------------------------------------
 
 
-@pytest.mark.skipif(not spyre_available(), reason="requires a Spyre device")
+@requires_hardware
 @pytest.mark.parametrize("impl_cls", IMPLS, ids=IMPL_IDS)
 def test_signature_reports_true_geometry(impl_cls):
     """block_size and local_kv_heads must not be swapped by layout.
@@ -218,7 +260,7 @@ def test_signature_reports_true_geometry(impl_cls):
     assert sig.layout_kind == LAYOUT_KIND[impl_cls]
 
 
-@pytest.mark.skipif(not spyre_available(), reason="requires a Spyre device")
+@requires_hardware
 def test_layouts_differ_despite_identical_page_bytes():
     """The case byte length alone cannot catch."""
     tm = page_signature(_cache(SpyreAttentionImpl), "token-major")
@@ -227,63 +269,42 @@ def test_layouts_differ_despite_identical_page_bytes():
     assert tm != hm, "token-major and head-major pages must not compare equal"
 
 
-@pytest.mark.skipif(not spyre_available(), reason="requires a Spyre device")
+@requires_hardware
 @pytest.mark.parametrize("impl_cls", IMPLS, ids=IMPL_IDS)
-def test_matching_signature_accepted(impl_cls, request):
+def test_matching_signature_accepted(impl_cls, offloader):
     cache = _cache(impl_cls)
-    kind = LAYOUT_KIND[impl_cls]
-    first = SpyreKvPageOffloader(
-        cache, request.node.name, num_slots=2, layout_kind=kind
-    )
-    second = SpyreKvPageOffloader(
-        cache,
-        request.node.name,
-        num_slots=2,
-        layout_kind=kind,
-        expect_signature=first.signature,
-    )
+    first = offloader(cache, impl_cls, num_slots=2)
+    second = offloader(cache, impl_cls, num_slots=2, expect_signature=first.signature)
     assert second.signature == first.signature
 
 
-@pytest.mark.skipif(not spyre_available(), reason="requires a Spyre device")
-def test_mismatched_layout_rejected(request):
+@requires_hardware
+def test_mismatched_layout_rejected(offloader):
     """Attaching a head-major cache to token-major slots must fail."""
-    tm = SpyreKvPageOffloader(
-        _cache(SpyreAttentionImpl),
-        request.node.name,
-        num_slots=2,
-        layout_kind="token-major",
-    )
+    tm = offloader(_cache(SpyreAttentionImpl), SpyreAttentionImpl, num_slots=2)
     with pytest.raises(ValueError, match="signature mismatch"):
-        SpyreKvPageOffloader(
+        offloader(
             _cache(SpyreHeadMajorAttentionImpl),
-            request.node.name,
+            SpyreHeadMajorAttentionImpl,
             num_slots=2,
-            layout_kind="head-major",
             expect_signature=tm.signature,
         )
 
 
-@pytest.mark.skipif(not spyre_available(), reason="requires a Spyre device")
-def test_mismatched_head_size_rejected(request):
+@requires_hardware
+def test_mismatched_head_size_rejected(offloader):
     """Same layout kind, different head_size: also a mismatch."""
-    tm = SpyreKvPageOffloader(
-        _cache(SpyreAttentionImpl),
-        request.node.name,
-        num_slots=2,
-        layout_kind="token-major",
-    )
+    tm = offloader(_cache(SpyreAttentionImpl), SpyreAttentionImpl, num_slots=2)
     with pytest.raises(ValueError, match="signature mismatch"):
-        SpyreKvPageOffloader(
+        offloader(
             _cache(SpyreAttentionImpl, head_size=64),
-            request.node.name,
+            SpyreAttentionImpl,
             num_slots=2,
-            layout_kind="token-major",
             expect_signature=tm.signature,
         )
 
 
-@pytest.mark.skipif(not spyre_available(), reason="requires a Spyre device")
+@requires_hardware
 def test_bad_layout_kind_rejected():
     with pytest.raises(ValueError, match="layout_kind"):
         page_signature(_cache(SpyreAttentionImpl), "row-major")

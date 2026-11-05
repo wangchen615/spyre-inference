@@ -14,10 +14,9 @@
 
 """End-to-end KV page offload and reuse on real Spyre hardware.
 
-What these prove that the mock tests cannot: that a page offloaded to the
-offload tier and reloaded is **bit-exact**, and that reusing it does not disturb
-anything else. Every test runs once per tier (`pool_backend`): host shared
-memory, and the Marvell card's BAR2 (skipped unless FLEX_TEST_PCI_BDF is set). The mock accepts a DMA without moving bytes through an IOMMU
+What these prove that the mock tests cannot: that a page offloaded to shared
+host memory and reloaded is **bit-exact**, and that reusing it does not disturb
+anything else. The mock accepts a DMA without moving bytes through an IOMMU
 mapping, so only a card can close this.
 
 Every assertion is bitwise on the raw fp16 bit patterns (`view(torch.int16)`),
@@ -39,6 +38,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+# ruff: noqa: F811 - imported pytest fixtures are intentionally used by name
 # Fixtures and byte-fidelity helpers live in hw_helpers so the connector/worker
 # hardware tests share them verbatim. `offloader` and `_init_device` are
 # fixtures and must be imported into this module's namespace for pytest to
@@ -58,8 +58,7 @@ from tests.kv_offload.hw_helpers import (  # noqa: F401 - fixtures used by name
     _spec,
     _zero_pages,
     offloader,
-    pool_backend,
-    pool_factories,
+    persistent_pool,
     requires_hardware,
 )
 
@@ -80,7 +79,7 @@ def test_round_trip_is_bit_exact(impl_cls, offloader):
     torch.spyre.synchronize()
 
     _zero_pages(cache, [3])
-    assert _bits(cache.k_pages[3]).any() == False, "zeroing the device page failed"
+    assert not _bits(cache.k_pages[3]).any(), "zeroing the device page failed"
 
     off.reload(slot=0, block_id=3)
     torch.spyre.synchronize()

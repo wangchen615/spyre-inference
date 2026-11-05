@@ -26,6 +26,8 @@ represent. Both raise.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from vllm.v1.kv_offload.base import OffloadingSpec
 from vllm.v1.kv_offload.config import (
@@ -37,6 +39,10 @@ from vllm.v1.kv_offload.config import (
 )
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
+from spyre_inference.v1.kv_offload.connector import (
+    SpyreOffloadingConnectorWorker,
+    SpyrePhysicalCaches,
+)
 from spyre_inference.v1.kv_offload.spec import SpyreOffloadingSpec
 
 # One K page of the geometry this work is benchmarked at (128 tokens x 8 heads x
@@ -53,23 +59,28 @@ def _config(
     worker_kv_bytes_per_block: int = KV_BYTES_PER_BLOCK,
     enable_kv_cache_events: bool = False,
 ) -> OffloadingConfig:
-    extra_config = {"cpu_bytes_to_use": 32 * KV_BYTES_PER_BLOCK}
+    extra_config = {
+        "cpu_bytes_to_use": 32 * KV_BYTES_PER_BLOCK,
+        "pool_name": "test-root",
+        "pool_generation": "11" * 16,
+    }
     if extra is not None:
         extra_config = {**extra_config, **extra}
         # a None value means "remove this key", so a test can drop a required one
         extra_config = {k: v for k, v in extra_config.items() if v is not None}
     return OffloadingConfig(
         groups=(
-            OffloadingGroupConfig(tokens_per_block=128, layer_names=("layer.0",)),
+            OffloadingGroupConfig(
+                tokens_per_block=128,
+                layer_names=("layer.0",),
+            ),
         ),
         worker_kv_bytes_per_block=worker_kv_bytes_per_block,
         enable_kv_cache_events=enable_kv_cache_events,
         extra_config=extra_config,
         engine_id="eng0",
         model=OffloadingModelConfig(name="micro-g3.3-8b", dtype="float16"),
-        cache=OffloadingCacheConfig(
-            tokens_per_hash=128, blocks_per_chunk=blocks_per_chunk
-        ),
+        cache=OffloadingCacheConfig(tokens_per_hash=128, blocks_per_chunk=blocks_per_chunk),
         parallel=OffloadingParallelConfig(
             rank=rank,
             world_size=world_size,
@@ -105,10 +116,21 @@ def test_num_blocks_divides_budget_by_kv_bytes_per_block():
     assert spec.num_blocks == 32
 
 
-def test_num_blocks_accounts_for_world_size():
-    """The budget is shared across workers, so more workers means fewer blocks."""
-    spec = SpyreOffloadingSpec(_config(world_size=4))
-    assert spec.num_blocks == 8
+def test_spec_loads_the_persistent_pool_identity():
+    spec = SpyreOffloadingSpec(
+        _config(extra={"data_pool_name": "data-child", "pool_generation": "AA" * 16})
+    )
+
+    assert spec.shared_pool_identity.pool_name == "test-root"
+    assert spec.shared_pool_identity.generation == bytes.fromhex("AA" * 16)
+    assert spec.shared_pool_identity.data_pool_name == "data-child"
+
+
+def test_m1_rejects_multiple_ranks_until_pool_slots_are_rank_partitioned():
+    """Distinct TP shards must never map to the same persistent child slots."""
+
+    with pytest.raises(ValueError, match="world_size == 1 and TP1"):
+        SpyreOffloadingSpec(_config(world_size=2))
 
 
 def test_zero_blocks_raises_rather_than_offloading_nothing():
@@ -150,14 +172,99 @@ def test_get_manager_is_the_upstream_cpu_manager_and_memoized():
     assert spec.get_manager() is manager
 
 
-def test_pool_prefix_is_unique_per_engine_and_rank():
-    """Two ranks on one host must not collide on a POSIX shared-memory name."""
-    prefixes = {
-        SpyreOffloadingSpec(_config(rank=r, world_size=2))._pool_prefix
-        for r in (0, 1)
-    }
-    assert len(prefixes) == 2
-    assert all("eng0" in p for p in prefixes)
+def test_construction_hooks_preserve_memoization_and_physical_binding():
+    """Subclass construction must not bypass memoization or cache validation."""
+
+    class RecordingSpec(SpyreOffloadingSpec):
+        def _create_manager(self):
+            self.manager_calls = getattr(self, "manager_calls", 0) + 1
+            return object()
+
+        def _create_worker(self, physical):
+            self.worker_physical = physical
+            return SimpleNamespace(_bytes_per_block=KV_BYTES_PER_BLOCK)
+
+    spec = RecordingSpec(_config())
+    manager = spec.get_manager()
+    assert spec.get_manager() is manager
+    assert spec.manager_calls == 1
+
+    physical = SpyrePhysicalCaches(
+        caches=((object(), object()),),
+        layout_kinds=("token-major",),
+        tensor_idx_to_cache={0: 0, 1: 0},
+        num_blocks=8,
+    )
+    spec.bind_physical_caches(physical)
+    with pytest.raises(ValueError, match="canonical tensor count"):
+        spec.get_worker(SimpleNamespace(tensors=(object(),), group_data_refs=()))
+    assert not hasattr(spec, "worker_physical")
+
+    worker = spec.get_worker(SimpleNamespace(tensors=(object(), object()), group_data_refs=()))
+    assert worker is not None
+    assert spec.worker_physical is physical
+
+
+def test_connector_binds_vllm_config_before_initializing_worker(monkeypatch):
+    """M2 compatibility inputs must be bound before its worker is constructed."""
+    from spyre_inference.v1.kv_offload import connector as connector_mod
+
+    calls = []
+
+    class RecordingSpec(SpyreOffloadingSpec):
+        def bind_vllm_config(self, vllm_config):
+            calls.append(("config", vllm_config))
+
+        def bind_physical_caches(self, physical):
+            calls.append(("physical", physical))
+
+    canonical = SimpleNamespace(tensors=())
+    physical = SimpleNamespace(caches=(), layout_kinds=())
+    vllm_config = SimpleNamespace()
+    spec = RecordingSpec(_config())
+    connector = object.__new__(SpyreOffloadingConnectorWorker)
+    connector.spec = spec
+    connector.vllm_config = vllm_config
+    connector.kv_cache_config = SimpleNamespace()
+    connector._init_worker = lambda value: calls.append(("worker", value))
+    monkeypatch.setattr(connector_mod, "_layout_kind_by_layer", lambda *_: {})
+    monkeypatch.setattr(
+        connector_mod,
+        "spyre_paged_to_canonical",
+        lambda *_: (canonical, physical),
+    )
+
+    connector.register_kv_caches({})
+
+    assert calls == [
+        ("config", vllm_config),
+        ("physical", physical),
+        ("worker", canonical),
+    ]
+
+
+def test_worker_factory_uses_the_configured_persistent_identity(monkeypatch):
+    from spyre_inference.v1.kv_offload import worker as worker_mod
+
+    calls = []
+    physical = object()
+
+    def build_worker(**kwargs):
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(worker_mod, "SpyreOffloadingWorker", build_worker)
+    spec = SpyreOffloadingSpec(_config())
+
+    spec._create_worker(physical)
+
+    assert calls == [
+        {
+            "physical": physical,
+            "num_host_blocks": 32,
+            "identity": spec.shared_pool_identity,
+        }
+    ]
 
 
 def test_get_worker_before_binding_raises_naming_the_method():
@@ -194,9 +301,7 @@ def test_resolvable_through_the_upstream_spec_factory():
             "spec_module_path": "spyre_inference.v1.kv_offload.spec",
         }
     )
-    assert (
-        OffloadingSpecFactory.get_spec_cls(config.extra_config) is SpyreOffloadingSpec
-    )
+    assert OffloadingSpecFactory.get_spec_cls(config.extra_config) is SpyreOffloadingSpec
     spec = OffloadingSpecFactory.create_spec(config)
     assert isinstance(spec, SpyreOffloadingSpec)
     assert spec.num_blocks == 32
@@ -227,9 +332,7 @@ def test_declares_every_metric_the_reused_manager_emits() -> None:
     # definitions dict is keyed by the metric-name *string* those members hold
     # ("vllm:kv_offload_stores_skipped"), which is also what `observe()` looks up.
     # Resolve through the class so the two sides are compared in one namespace.
-    members = set(
-        re.findall(r"CPUOffloadingMetrics\.([A-Z_]+)", inspect.getsource(manager_mod))
-    )
+    members = set(re.findall(r"CPUOffloadingMetrics\.([A-Z_]+)", inspect.getsource(manager_mod)))
     assert members, "found no CPUOffloadingMetrics references; upstream changed shape"
     emitted = {getattr(CPUOffloadingMetrics, name) for name in members}
 
