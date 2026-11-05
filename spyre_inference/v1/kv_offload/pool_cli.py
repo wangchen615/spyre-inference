@@ -49,9 +49,23 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--pool-name", required=True)
-    parser.add_argument("--cpu-bytes-to-use", required=True, type=int)
+    budget = parser.add_mutually_exclusive_group(required=True)
+    budget.add_argument("--cpu-bytes-to-use", type=int)
+    budget.add_argument("--marvell-bytes-to-use", type=int)
+    parser.add_argument("--marvell-bdf", help="Marvell card PCI BDF; plans a Marvell pool")
     parser.add_argument("--output", type=Path)
     return parser
+
+
+def _marvell_option(
+    parser: argparse.ArgumentParser, arguments: argparse.Namespace
+) -> tuple[str, int] | None:
+    """`(pci_bdf, bytes)` when both Marvell options are given, None for a host pool."""
+    if (arguments.marvell_bdf is None) != (arguments.marvell_bytes_to_use is None):
+        parser.error("--marvell-bdf and --marvell-bytes-to-use must be given together")
+    if arguments.marvell_bdf is None:
+        return None
+    return arguments.marvell_bdf, arguments.marvell_bytes_to_use
 
 
 def _cache_dtype(value: str, model_dtype: torch.dtype | str) -> torch.dtype:
@@ -170,6 +184,7 @@ def resolve_model_pool_spec(
     pool_name: str,
     cpu_bytes_to_use: int,
     resolve_inputs: Callable | None = None,
+    marvell: tuple[str, int] | None = None,
 ) -> dict:
     arguments = SimpleNamespace(
         model=model,
@@ -188,6 +203,7 @@ def resolve_model_pool_spec(
         kv_cache_config,
         pool_name,
         cpu_bytes_to_use,
+        marvell=marvell,
     )
 
 
@@ -196,7 +212,9 @@ def main(
     *,
     resolve_inputs: Callable | None = None,
 ) -> int:
-    arguments = _parser().parse_args(argv)
+    parser = _parser()
+    arguments = parser.parse_args(argv)
+    marvell = _marvell_option(parser, arguments)
     spec = resolve_model_pool_spec(
         model=arguments.model,
         revision=arguments.revision,
@@ -206,8 +224,9 @@ def main(
         block_size=arguments.block_size,
         trust_remote_code=arguments.trust_remote_code,
         pool_name=arguments.pool_name,
-        cpu_bytes_to_use=arguments.cpu_bytes_to_use,
+        cpu_bytes_to_use=0 if marvell is not None else arguments.cpu_bytes_to_use,
         resolve_inputs=resolve_inputs,
+        marvell=marvell,
     )
     rendered = json.dumps(spec, indent=2, sort_keys=True) + "\n"
     if arguments.output is None:

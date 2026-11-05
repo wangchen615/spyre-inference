@@ -29,6 +29,9 @@ from typing import cast
 
 from spyre_inference.v1.kv_offload.shared_identity import SharedPoolIdentity
 
+# One backend per plan; arena and partition names use its prefix.
+_TIER_PREFIX = {"HOST_DRAM": "host", "MARVELL": "marvell"}
+
 
 @dataclass(frozen=True)
 class PlannedPartition:
@@ -81,6 +84,9 @@ class PlannedArena:
     num_slots: int = 0
     slot_bytes: int = 0
     layout_signature: str = ""
+    # MARVELL arenas only: the card, and the BAR2 offset flex placed the arena at.
+    pci_bdf: str = ""
+    bar_offset: int | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +98,7 @@ class PlannedPool:
     kv_dtype: str
     block_size: int
     tensor_parallel_size: int
+    # Offload budget of the plan's tier: cpuBytesToUse, or marvellBytesToUse for MARVELL.
     cpu_bytes_to_use: int
     bytes_per_complete_block: int
     logical_block_capacity: int
@@ -102,6 +109,7 @@ class PlannedPool:
     components: tuple[PlannedComponent, ...]
     rank_caches: tuple[PlannedRankCache, ...] = ()
     metadata_max_chunks: int = 1
+    backend: str = "HOST_DRAM"
 
     def partitions_for_rank(self, tp_rank: int) -> tuple[PlannedPartition, ...]:
         if not 0 <= tp_rank < self.tensor_parallel_size:
@@ -306,11 +314,27 @@ def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
     )
     kv_dtype = _text(spec.get("kvDtype"), "plan.normalizedSpec.kvDtype")
     block_size = _uint(spec.get("blockSize"), "plan.normalizedSpec.blockSize", positive=True)
-    budget = _uint(
-        spec.get("cpuBytesToUse"),
-        "plan.normalizedSpec.cpuBytesToUse",
-        positive=True,
-    )
+    marvell_spec = spec.get("marvell")
+    if marvell_spec is None:
+        backend = "HOST_DRAM"
+        pci_bdf = ""
+        budget = _uint(
+            spec.get("cpuBytesToUse"),
+            "plan.normalizedSpec.cpuBytesToUse",
+            positive=True,
+        )
+    else:
+        marvell_row = _mapping(marvell_spec, "plan.normalizedSpec.marvell")
+        backend = "MARVELL"
+        pci_bdf = _text(marvell_row.get("pciBdf"), "plan.normalizedSpec.marvell.pciBdf")
+        budget = _uint(
+            marvell_row.get("marvellBytesToUse"),
+            "plan.normalizedSpec.marvell.marvellBytesToUse",
+            positive=True,
+        )
+        if _uint(spec.get("cpuBytesToUse", 0), "plan.normalizedSpec.cpuBytesToUse") != 0:
+            raise ValueError("a Marvell plan must have cpuBytesToUse 0")
+    prefix = _TIER_PREFIX[backend]
 
     raw_arenas = _sequence(plan_config.get("dataPools"), "plan.config.dataPools")
     raw_effective_arenas = _sequence(effective.get("dataPools"), "effectiveConfig.dataPools")
@@ -342,8 +366,8 @@ def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
 
     arena_extents = [0] * tp_size
     for item in partitions:
-        expected_name = f"host-r{item.tp_rank}-c{item.cache_index}"
-        expected_arena = f"host-r{item.tp_rank}"
+        expected_name = f"{prefix}-r{item.tp_rank}-c{item.cache_index}"
+        expected_arena = f"{prefix}-r{item.tp_rank}"
         if item.partition_name != expected_name:
             raise ValueError(
                 f"planned partition name {item.partition_name!r} does not equal "
@@ -389,17 +413,40 @@ def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
         arena_row = _mapping(raw_arena, field)
         effective_arena_row = _mapping(raw_effective_arena, effective_field)
         arena_name = _text(arena_row.get("name"), f"{field}.name")
-        expected_arena_name = f"host-r{rank}"
+        expected_arena_name = f"{prefix}-r{rank}"
         if arena_name != expected_arena_name:
             raise ValueError(f"planned arena for rank {rank} must be named {expected_arena_name!r}")
         if _text(effective_arena_row.get("name"), f"{effective_field}.name") != arena_name:
             raise ValueError("descriptor effective arena differs from the planned config")
-        backend = _text(arena_row.get("backend"), f"{field}.backend")
+        arena_backend = _text(arena_row.get("backend"), f"{field}.backend")
         if (
-            backend != "HOST_DRAM"
-            or _text(effective_arena_row.get("backend"), f"{effective_field}.backend") != backend
+            arena_backend != backend
+            or _text(effective_arena_row.get("backend"), f"{effective_field}.backend")
+            != arena_backend
         ):
-            raise ValueError(f"unsupported planned arena backend {backend!r}")
+            raise ValueError(
+                f"planned arena backend {arena_backend!r} does not match the plan's {backend!r}"
+            )
+        bar_offset = None
+        if backend == "MARVELL":
+            planned_marvell = _mapping(arena_row.get("marvell"), f"{field}.marvell")
+            effective_marvell = _mapping(
+                effective_arena_row.get("marvell"), f"{effective_field}.marvell"
+            )
+            if _text(planned_marvell.get("pciBdf"), f"{field}.marvell.pciBdf") != pci_bdf:
+                raise ValueError("planned Marvell arena card differs from the normalized spec")
+            if (
+                _text(effective_marvell.get("pciBdf"), f"{effective_field}.marvell.pciBdf")
+                != pci_bdf
+            ):
+                raise ValueError("descriptor effective Marvell card differs from the plan")
+            bar_offset = _uint(
+                effective_marvell.get("barOffset"), f"{effective_field}.marvell.barOffset"
+            )
+            if bar_offset % mmap.PAGESIZE:
+                raise ValueError("descriptor effective Marvell BAR2 offset must be page aligned")
+        elif "marvell" in arena_row or "marvell" in effective_arena_row:
+            raise ValueError("a host arena must not carry a Marvell placement")
 
         compatibility = _mapping(arena_row.get("compatibility"), f"{field}.compatibility")
         effective_compatibility = _mapping(
@@ -502,6 +549,8 @@ def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
                 num_slots=effective_slots,
                 slot_bytes=effective_stride,
                 layout_signature=signature,
+                pci_bdf=pci_bdf,
+                bar_offset=bar_offset,
             )
         )
     assert layout_signature is not None
@@ -578,12 +627,12 @@ def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
     if sum(arena_extents) != allocated:
         raise ValueError("partition extents do not match allocatedBytes")
     if budget < allocated:
-        raise ValueError("planned allocation exceeds cpuBytesToUse")
+        raise ValueError("planned allocation exceeds the plan's bytes to use")
     unused = budget - allocated
     if _uint(plan.get("unusedBytes"), "unusedBytes") != unused:
         raise ValueError("unusedBytes does not match budget arithmetic")
     if unused >= bytes_per_block:
-        raise ValueError("logicalBlockCapacity is not maximal for cpuBytesToUse")
+        raise ValueError("logicalBlockCapacity is not maximal for the plan's bytes to use")
     components = tuple(
         _parse_component(value, f"plan.components[{index}]")
         for index, value in enumerate(_sequence(plan.get("components"), "plan.components"))
@@ -647,6 +696,7 @@ def parse_planned_pool(document: Mapping[str, object]) -> PlannedPool:
         components=components,
         rank_caches=tuple(rank_caches),
         metadata_max_chunks=metadata_max_chunks,
+        backend=backend,
     )
 
 

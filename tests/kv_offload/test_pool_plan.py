@@ -420,3 +420,123 @@ def test_parser_requires_layout_signature():
 
     with pytest.raises(ValueError, match="layout signature"):
         parse_planned_pool(document)
+
+
+MARVELL_BDF = "0000:ed:00.0"
+
+
+def _rename_tier(value, old: str, new: str):
+    if isinstance(value, dict):
+        return {key: _rename_tier(item, old, new) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_rename_tier(item, old, new) for item in value]
+    if isinstance(value, str) and value.startswith(f"{old}-r"):
+        return new + value[len(old) :]
+    return value
+
+
+def marvell_planned_pool_document(bar_offsets=(0, 1 << 20)) -> dict:
+    """The host document as the delegator plans it for one Marvell card."""
+    document = _rename_tier(valid_planned_pool_document(), "host", "marvell")
+    spec = document["plan"]["normalizedSpec"]
+    spec["marvell"] = {"pciBdf": MARVELL_BDF, "marvellBytesToUse": spec["cpuBytesToUse"]}
+    spec["cpuBytesToUse"] = "0"
+    for arena in document["plan"]["config"]["dataPools"]:
+        arena["backend"] = "MARVELL"
+        arena["marvell"] = {"pciBdf": MARVELL_BDF}
+    for arena, offset in zip(
+        document["poolDescriptor"]["effectiveConfig"]["dataPools"], bar_offsets, strict=True
+    ):
+        arena["backend"] = "MARVELL"
+        arena["marvell"] = {"pciBdf": MARVELL_BDF, "barOffset": str(offset)}
+    return document
+
+
+def test_marvell_plan_uses_marvell_tier_names_and_flex_bar_offsets():
+    plan = parse_planned_pool(marvell_planned_pool_document())
+
+    assert plan.backend == "MARVELL"
+    assert plan.cpu_bytes_to_use == 40000  # the plan's marvellBytesToUse.
+    assert [arena.name for arena in plan.arenas] == ["marvell-r0", "marvell-r1"]
+    assert {arena.backend for arena in plan.arenas} == {"MARVELL"}
+    assert {arena.pci_bdf for arena in plan.arenas} == {MARVELL_BDF}
+    assert [arena.bar_offset for arena in plan.arenas] == [0, 1 << 20]  # placed by flex.
+    assert [item.partition_name for item in plan.partitions] == [
+        "marvell-r0-c0",
+        "marvell-r1-c0",
+    ]
+    assert plan.identity.data_pool_name == "marvell-r0"
+
+
+def test_host_plan_carries_no_marvell_placement():
+    plan = parse_planned_pool(valid_planned_pool_document())
+
+    assert plan.backend == "HOST_DRAM"
+    assert {(arena.pci_bdf, arena.bar_offset) for arena in plan.arenas} == {("", None)}
+
+
+def test_mixed_host_and_marvell_arenas_are_rejected():
+    """D3: one backend per pool."""
+    document = marvell_planned_pool_document()
+    for config in (
+        document["plan"]["config"],
+        document["poolDescriptor"]["effectiveConfig"],
+    ):
+        config["dataPools"][1]["backend"] = "HOST_DRAM"
+    with pytest.raises(ValueError, match="does not match the plan's 'MARVELL'"):
+        parse_planned_pool(document)
+
+
+def test_host_names_are_rejected_in_a_marvell_plan():
+    document = marvell_planned_pool_document()
+    document["plan"]["config"]["dataPools"][0]["name"] = "host-r0"
+    with pytest.raises(ValueError, match="'marvell-r0'"):
+        parse_planned_pool(document)
+
+
+def test_host_plan_rejects_a_marvell_placement():
+    document = valid_planned_pool_document()
+    document["poolDescriptor"]["effectiveConfig"]["dataPools"][0]["marvell"] = {
+        "pciBdf": MARVELL_BDF,
+        "barOffset": "0",
+    }
+    with pytest.raises(ValueError, match="host arena must not carry a Marvell placement"):
+        parse_planned_pool(document)
+
+
+@pytest.mark.parametrize(
+    ("location", "message"),
+    [
+        (("plan", "config", "dataPools", 0, "marvell"), "differs from the normalized spec"),
+        (
+            ("poolDescriptor", "effectiveConfig", "dataPools", 1, "marvell"),
+            "effective Marvell card",
+        ),
+    ],
+)
+def test_marvell_card_must_match_the_spec_everywhere(location, message):
+    document = marvell_planned_pool_document()
+    target = document
+    for key in location:
+        target = target[key]
+    target["pciBdf"] = "0000:ee:00.0"
+    with pytest.raises(ValueError, match=message):
+        parse_planned_pool(document)
+
+
+def test_marvell_effective_bar_offset_is_required_and_page_aligned():
+    missing = marvell_planned_pool_document()
+    del missing["poolDescriptor"]["effectiveConfig"]["dataPools"][0]["marvell"]["barOffset"]
+    with pytest.raises(ValueError, match="barOffset"):
+        parse_planned_pool(missing)
+
+    unaligned = marvell_planned_pool_document(bar_offsets=(0, 128))
+    with pytest.raises(ValueError, match="page aligned"):
+        parse_planned_pool(unaligned)
+
+
+def test_marvell_plan_requires_zero_cpu_bytes_to_use():
+    document = marvell_planned_pool_document()
+    document["plan"]["normalizedSpec"]["cpuBytesToUse"] = "40000"
+    with pytest.raises(ValueError, match="cpuBytesToUse 0"):
+        parse_planned_pool(document)

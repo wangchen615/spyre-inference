@@ -295,6 +295,7 @@ def prepare_resolved_model_pool_command(
     trust_remote_code: bool,
     pool_name: str,
     cpu_bytes_to_use: int,
+    marvell: tuple[str, int] | None = None,
 ) -> dict[str, Any]:
     from spyre_inference.v1.kv_offload import pool_cli
 
@@ -308,6 +309,7 @@ def prepare_resolved_model_pool_command(
         trust_remote_code=trust_remote_code,
         pool_name=pool_name,
         cpu_bytes_to_use=cpu_bytes_to_use,
+        **({"marvell": marvell} if marvell is not None else {}),
     )
     return prepare_model_pool_command(ctl=ctl, model_spec=model_spec)
 
@@ -852,7 +854,10 @@ def _parse_prepare_model_pool_args() -> argparse.Namespace:
     parser.add_argument("--block-size", type=int)
     parser.add_argument("--trust-remote-code", action="store_true", default=None)
     parser.add_argument("--pool-name")
-    parser.add_argument("--cpu-bytes-to-use", type=int)
+    budget = parser.add_mutually_exclusive_group()
+    budget.add_argument("--cpu-bytes-to-use", type=int)
+    budget.add_argument("--marvell-bytes-to-use", type=int)
+    parser.add_argument("--marvell-bdf", help="Marvell card PCI BDF; plans a Marvell pool")
     parser.add_argument("--ctl", default="shared-poolctl")
     parser.add_argument("--socket", default=None)
     arguments = parser.parse_args(sys.argv[2:])
@@ -865,6 +870,8 @@ def _parse_prepare_model_pool_args() -> argparse.Namespace:
         "trust_remote_code": "--trust-remote-code",
         "pool_name": "--pool-name",
         "cpu_bytes_to_use": "--cpu-bytes-to-use",
+        "marvell_bytes_to_use": "--marvell-bytes-to-use",
+        "marvell_bdf": "--marvell-bdf",
     }
     if arguments.spec is not None:
         mixed = [
@@ -879,8 +886,10 @@ def _parse_prepare_model_pool_args() -> argparse.Namespace:
         missing = []
         if arguments.pool_name is None:
             missing.append("--pool-name")
-        if arguments.cpu_bytes_to_use is None:
-            missing.append("--cpu-bytes-to-use")
+        if (arguments.marvell_bdf is None) != (arguments.marvell_bytes_to_use is None):
+            parser.error("--marvell-bdf and --marvell-bytes-to-use must be given together")
+        if arguments.cpu_bytes_to_use is None and arguments.marvell_bdf is None:
+            missing.append("--cpu-bytes-to-use or --marvell-bdf/--marvell-bytes-to-use")
         if missing:
             parser.error(f"the following arguments are required with --model: {', '.join(missing)}")
         if arguments.tensor_parallel_size is None:
@@ -911,6 +920,7 @@ def main() -> None:
                 raise ValueError("model pool specification must be a JSON object")
             prepare_model_pool_command(ctl=ctl, model_spec=model_spec)
         else:
+            marvell_bdf = getattr(args, "marvell_bdf", None)
             prepare_resolved_model_pool_command(
                 ctl=ctl,
                 model=args.model,
@@ -921,7 +931,12 @@ def main() -> None:
                 block_size=args.block_size,
                 trust_remote_code=args.trust_remote_code,
                 pool_name=args.pool_name,
-                cpu_bytes_to_use=args.cpu_bytes_to_use,
+                cpu_bytes_to_use=0 if marvell_bdf is not None else args.cpu_bytes_to_use,
+                **(
+                    {"marvell": (marvell_bdf, args.marvell_bytes_to_use)}
+                    if marvell_bdf is not None
+                    else {}
+                ),
             )
         return
 

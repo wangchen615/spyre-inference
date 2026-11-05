@@ -121,12 +121,27 @@ def build_model_pool_spec(
     kv_cache_config,
     pool_name: str,
     cpu_bytes_to_use: int,
+    *,
+    marvell: tuple[str, int] | None = None,
 ) -> dict[str, object]:
-    """Build delegator protobuf JSON without allocating any device tensors."""
+    """Build delegator protobuf JSON without allocating any device tensors.
+
+    `marvell=(pci_bdf, marvell_bytes_to_use)` plans a Marvell pool instead of a
+    host pool; `cpu_bytes_to_use` must then be 0.
+    """
     if not pool_name:
         raise ValueError("pool_name must not be empty")
-    if cpu_bytes_to_use <= 0:
-        raise ValueError("cpu_bytes_to_use must be positive")
+    if marvell is None:
+        if cpu_bytes_to_use <= 0:
+            raise ValueError("cpu_bytes_to_use must be positive")
+    else:
+        pci_bdf, marvell_bytes_to_use = marvell
+        if cpu_bytes_to_use != 0:
+            raise ValueError("cpu_bytes_to_use must be 0 for a Marvell pool")
+        if not pci_bdf or "/" in pci_bdf:
+            raise ValueError(f"invalid Marvell PCI BDF {pci_bdf!r}")
+        if marvell_bytes_to_use <= 0:
+            raise ValueError("marvell_bytes_to_use must be positive")
     if len(kv_cache_config.kv_cache_groups) != 1:
         raise ValueError("shared host offload requires exactly one KV cache group")
 
@@ -189,7 +204,7 @@ def build_model_pool_spec(
 
     rank_rows = [{"tpRank": tp_rank, **row} for tp_rank in range(tp_size) for row in cache_rows]
     model_config = vllm_config.model_config
-    return {
+    spec: dict[str, object] = {
         "planningVersion": 1,
         "name": pool_name,
         "model": str(model_config.model),
@@ -200,3 +215,6 @@ def build_model_pool_spec(
         "cpuBytesToUse": str(cpu_bytes_to_use),
         "rankCaches": rank_rows,
     }
+    if marvell is not None:
+        spec["marvell"] = {"pciBdf": marvell[0], "marvellBytesToUse": str(marvell[1])}
+    return spec

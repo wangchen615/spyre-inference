@@ -609,3 +609,66 @@ def test_measured_prompt_is_identical_for_a_a_and_b(monkeypatch):
         )
 
     assert prepared_texts[0] == prepared_texts[1] == prepared_texts[2]
+
+
+def test_prepare_model_pool_main_plans_a_marvell_pool(monkeypatch):
+    calls = []
+
+    class Ctl:
+        def __init__(self, *, binary, socket_path):
+            pass
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "shared_kv_two_instance_demo.py",
+            "prepare-model-pool",
+            "--model",
+            "model-a",
+            "--pool-name",
+            "/model-a",
+            "--marvell-bdf",
+            "0000:ed:00.0",
+            "--marvell-bytes-to-use",
+            str(1 << 30),
+        ],
+    )
+    monkeypatch.setattr(shared_pool_delegator, "SharedPoolCtl", Ctl)
+    monkeypatch.setattr(
+        demo,
+        "prepare_resolved_model_pool_command",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    demo.main()
+
+    (prepared,) = calls
+    assert prepared["cpu_bytes_to_use"] == 0
+    assert prepared["marvell"] == ("0000:ed:00.0", 1 << 30)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--cpu-bytes-to-use", "4096", "--marvell-bytes-to-use", "4096"],
+        ["--marvell-bdf", "0000:ed:00.0"],
+        [],
+    ],
+)
+def test_prepare_model_pool_rejects_missing_or_mixed_budgets(monkeypatch, extra):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "shared_kv_two_instance_demo.py",
+            "prepare-model-pool",
+            "--model",
+            "model-a",
+            "--pool-name",
+            "/model-a",
+            *extra,
+        ],
+    )
+    with pytest.raises(SystemExit):
+        demo._parse_prepare_model_pool_args()

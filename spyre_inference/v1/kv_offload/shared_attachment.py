@@ -67,6 +67,20 @@ def _expected_native_config(runtime: Any, plan: PlannedPool) -> Any:
             )
             for partition in arena.partitions
         ]
+        if arena.backend == "MARVELL":
+            # flex compares the effective placement, so pass the BAR2 offset it chose.
+            arenas.append(
+                runtime.SharedDataPoolConfig(
+                    arena.name,
+                    runtime.PoolBackend.MARVELL,
+                    arena.num_slots,
+                    arena.slot_bytes,
+                    partitions,
+                    compatibility,
+                    marvell=runtime.MarvellPlacement(arena.pci_bdf, arena.bar_offset),
+                )
+            )
+            continue
         arenas.append(
             runtime.SharedDataPoolConfig(
                 arena.name,

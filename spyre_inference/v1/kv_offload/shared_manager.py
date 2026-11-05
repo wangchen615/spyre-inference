@@ -34,11 +34,6 @@ from vllm.v1.kv_offload.base import (
 )
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
-try:
-    from vllm.v1.kv_offload.base import CacheHitSource
-except ImportError:  # vLLM 0.28 has no CacheHitSource or get_load_source.
-    CacheHitSource = None
-
 from spyre_inference.v1.kv_offload.pool_plan import PlannedPool
 from spyre_inference.v1.kv_offload.shared_attachment import (
     SharedMetadataAttachment,
@@ -289,12 +284,6 @@ class SpyreSharedOffloadingManager(OffloadingManager):
 
         state.pending_pins[key] = tuple(pinned)
         return LookupResult.HIT
-
-    if CacheHitSource is not None:
-
-        @override
-        def get_load_source(self, key: OffloadKey, req_context: ReqContext) -> CacheHitSource:
-            return CacheHitSource.HOST
 
     @override
     def prepare_load(

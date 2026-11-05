@@ -262,3 +262,37 @@ def test_model_pool_spec_rejects_unsupported_inputs(vllm_config, kv_cache_config
             "/unsupported",
             1 << 30,
         )
+
+
+def test_marvell_model_pool_spec_replaces_the_host_budget():
+    names = ["layer.0", "layer.1"]
+    host = build_model_pool_spec(_vllm_config(names), _kv_cache_config(names), "/pool", 1 << 30)
+    marvell = build_model_pool_spec(
+        _vllm_config(names),
+        _kv_cache_config(names),
+        "/pool",
+        0,
+        marvell=("0000:ed:00.0", 1 << 30),
+    )
+
+    assert marvell.pop("marvell") == {"pciBdf": "0000:ed:00.0", "marvellBytesToUse": str(1 << 30)}
+    assert marvell.pop("cpuBytesToUse") == "0"
+    host.pop("cpuBytesToUse")
+    assert marvell == host  # identical geometry and layout rows.
+
+
+@pytest.mark.parametrize(
+    ("cpu_bytes", "marvell", "match"),
+    [
+        (1 << 30, ("0000:ed:00.0", 1 << 30), "cpu_bytes_to_use must be 0"),
+        (0, ("", 1 << 30), "PCI BDF"),
+        (0, ("../0000:ed:00.0", 1 << 30), "PCI BDF"),
+        (0, ("0000:ed:00.0", 0), "marvell_bytes_to_use must be positive"),
+    ],
+)
+def test_marvell_model_pool_spec_rejects_invalid_inputs(cpu_bytes, marvell, match):
+    names = ["layer.0"]
+    with pytest.raises(ValueError, match=match):
+        build_model_pool_spec(
+            _vllm_config(names), _kv_cache_config(names), "/pool", cpu_bytes, marvell=marvell
+        )

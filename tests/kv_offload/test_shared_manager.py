@@ -25,7 +25,6 @@ import pytest
 from vllm.v1.kv_offload.base import LookupResult, ReqContext, make_offload_key
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
-from spyre_inference.v1.kv_offload import shared_manager as shared_manager_mod
 from spyre_inference.v1.kv_offload.pool_plan import (
     PlannedArena,
     PlannedComponent,
@@ -605,14 +604,10 @@ def test_reused_request_state_is_tracked_for_shutdown_pin_release(
     assert all(pin.released for pin in second_pins)
 
 
-def test_shared_hit_reports_host_as_its_load_source(manager_directory_runtime):
+def test_shared_manager_has_no_load_source_on_vllm_028(manager_directory_runtime):
     manager, _, _ = manager_directory_runtime
-    cache_hit_source = shared_manager_mod.CacheHitSource
-
-    if cache_hit_source is None:  # vLLM 0.28: no get_load_source to override.
-        assert not hasattr(manager, "get_load_source")
-        return
-    assert manager.get_load_source(OFFLOAD_KEY, ReqContext("request-1")) is cache_hit_source.HOST
+    # vLLM 0.28's OffloadingManager has no get_load_source; m4's override targets 0.32.
+    assert not hasattr(manager, "get_load_source")
 
 
 @pytest.mark.parametrize("missing_component", range(COMPONENT_COUNT))

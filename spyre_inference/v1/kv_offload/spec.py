@@ -95,8 +95,8 @@ class SpyreOffloadingSpec(OffloadingSpec):
         pool_backend = self.extra_config.get("pool_backend", "host")
         if pool_backend != "host":
             raise ValueError(
-                f"pool_backend={pool_backend!r} is not supported; configure a "
-                "delegator-created pool_plan instead"
+                f"pool_backend={pool_backend!r} is not supported; plan a Marvell pool "
+                "with spyre-kv-pool-spec --marvell-bdf and pass its pool_plan"
             )
         pool_configuration = load_shared_pool_configuration(self.extra_config)
         self.shared_pool_plan = (

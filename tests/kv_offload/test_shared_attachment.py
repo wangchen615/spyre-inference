@@ -26,7 +26,11 @@ from spyre_inference.v1.kv_offload.shared_attachment import (
     SharedPoolAttachment,
 )
 from spyre_inference.v1.kv_offload.shared_identity import SharedPoolIdentity
-from tests.kv_offload.test_pool_plan import valid_planned_pool_document
+from tests.kv_offload.test_pool_plan import (
+    MARVELL_BDF,
+    marvell_planned_pool_document,
+    valid_planned_pool_document,
+)
 
 GENERATION = bytes.fromhex("11" * 16)
 IDENTITY = SharedPoolIdentity("root", GENERATION, "host-0")
@@ -45,6 +49,13 @@ class _Code(Enum):
 
 class _Backend(Enum):
     HOST_DRAM = auto()
+    MARVELL = auto()
+
+
+@dataclass(frozen=True)
+class _MarvellPlacement:
+    pci_bdf: str
+    bar_offset: int | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +85,7 @@ class _ArenaConfig:
     slot_bytes: int
     partitions: list[_PartitionConfig]
     compatibility: _Compatibility
+    marvell: _MarvellPlacement | None = None
 
 
 @dataclass(frozen=True)
@@ -164,6 +176,7 @@ def fake_runtime():
         PoolCompatibility=_Compatibility,
         SharedDataPartitionConfig=_PartitionConfig,
         SharedDataPoolConfig=_ArenaConfig,
+        MarvellPlacement=_MarvellPlacement,
         MetadataConfig=_MetadataConfig,
         PoolConfig=_PoolConfig,
     )
@@ -319,6 +332,37 @@ def test_planned_attach_registers_global_directory_and_returns_eager_rank_entrie
     assert [item.data_pool for item in attachment.local_partitions] == ["view:host-r1-c0"]
     attachment.close()
     assert fake_runtime.calls.count(("detach", native_attachment)) == 1
+
+
+def test_planned_marvell_attach_expects_flex_placement_and_uses_eager_handles(fake_runtime):
+    plan = parse_planned_pool(marvell_planned_pool_document(bar_offsets=(0, 1 << 20)))
+    registrations, native_attachment = _configure_planned_rank(fake_runtime, plan, 1)
+
+    attachment = SharedMetadataAttachment.attach(plan, 1, lambda: fake_runtime)
+
+    expected_config = fake_runtime.calls[0][3]
+    assert [arena.backend for arena in expected_config.data_pools] == [_Backend.MARVELL] * 2
+    assert [arena.marvell for arena in expected_config.data_pools] == [
+        _MarvellPlacement(MARVELL_BDF, 0),
+        _MarvellPlacement(MARVELL_BDF, 1 << 20),
+    ]
+    assert [arena.name for arena in expected_config.data_pools] == ["marvell-r0", "marvell-r1"]
+    assert [item.data_pool for item in attachment.local_partitions] == [
+        "view:marvell-r1-c0"
+    ]  # DMA uses the rank-local handle flex returned.
+    attachment.close()
+    assert fake_runtime.calls.count(("detach", native_attachment)) == 1
+
+
+def test_planned_host_attach_passes_no_marvell_placement(fake_runtime):
+    plan = parse_planned_pool(valid_planned_pool_document())
+    _configure_planned_rank(fake_runtime, plan, 0)
+
+    SharedMetadataAttachment.attach(plan, 0, lambda: fake_runtime).close()
+
+    expected_config = fake_runtime.calls[0][3]
+    assert {arena.backend for arena in expected_config.data_pools} == {_Backend.HOST_DRAM}
+    assert {arena.marvell for arena in expected_config.data_pools} == {None}
 
 
 def test_planned_attach_rejects_native_attachment_for_another_rank(fake_runtime):

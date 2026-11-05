@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -201,3 +202,47 @@ def test_cli_redirects_resolver_output_away_from_machine_json(capsys):
     captured = capsys.readouterr()
     assert json.loads(captured.out)["name"] == "/deployment-a"
     assert "resolver diagnostic" in captured.err
+
+
+def _marvell_arguments():
+    result = _arguments()
+    index = result.index("--cpu-bytes-to-use")
+    del result[index : index + 2]
+    return [*result, "--marvell-bdf", "0000:ed:00.0", "--marvell-bytes-to-use", str(1 << 30)]
+
+
+def test_cli_plans_a_marvell_pool_with_zero_cpu_bytes(capsys):
+    assert main(_marvell_arguments(), resolve_inputs=_resolved_inputs) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["cpuBytesToUse"] == "0"
+    assert payload["marvell"] == {"pciBdf": "0000:ed:00.0", "marvellBytesToUse": str(1 << 30)}
+    assert [(row["tpRank"], row["cacheIndex"]) for row in payload["rankCaches"]] == [
+        (0, 0),
+        (1, 0),
+    ]
+
+
+def test_cli_host_output_has_no_marvell_field(capsys):
+    assert main(_arguments(), resolve_inputs=_resolved_inputs) == 0
+    assert "marvell" not in json.loads(capsys.readouterr().out)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--marvell-bytes-to-use", "4096"],  # with --cpu-bytes-to-use.
+        ["--marvell-bdf", "0000:ed:00.0"],  # BDF without a Marvell budget.
+    ],
+)
+def test_cli_rejects_mixed_or_partial_marvell_options(extra):
+    with pytest.raises(SystemExit):
+        main([*_arguments(), *extra], resolve_inputs=_resolved_inputs)
+
+
+def test_cli_rejects_marvell_budget_without_bdf():
+    arguments = _marvell_arguments()
+    index = arguments.index("--marvell-bdf")
+    del arguments[index : index + 2]
+    with pytest.raises(SystemExit):
+        main(arguments, resolve_inputs=_resolved_inputs)
