@@ -1169,3 +1169,241 @@ def test_reset_reclaims_partially_published_pending_store(manager_directory_runt
     assert directory.aborted == [page.reservation for page in pages[2:]]
     assert directory.entries == {}
     assert directory.live_reservations == []
+
+
+# --- A full shared pool: evict this replica's oldest idle block and claim again. ---
+
+FOURTH_KEY = make_offload_key(bytes.fromhex("55" * 32), 0)
+
+
+class SlottedDirectory(FakeDirectory):
+    """A pool with a fixed number of free slots: claim takes one, evict returns it."""
+
+    def __init__(self, registered: FakeRegisteredPool, free_slots: int):
+        super().__init__(registered)
+        self.free = list(range(free_slots))
+
+    def claim(self, pool_ref, key):
+        self.claim_calls.append((pool_ref, key))
+        forced = self.claim_results.get(key.block_hash)
+        if forced is not None and not isinstance(forced, int):
+            return forced
+        if not self.free:
+            return FakeNoSpace()
+        reservation = FakeReservation(key, FakeSlotRef(pool_ref, self.free.pop(0)))
+        self.live_reservations.append(reservation)
+        return reservation
+
+    def abort(self, reservation):
+        super().abort(reservation)
+        self.free.append(reservation.slot.slot_id)
+
+    def evict(self, entry):
+        freed = super().evict(entry)
+        if freed:
+            self.free.append(entry.slot.slot_id)
+        return freed
+
+
+def _slotted_manager(free_blocks: int, *, policy_blocks: int = 4, max_pool_slots: int = 16):
+    """A manager whose local LRU holds `policy_blocks`, on a pool with room for `free_blocks`.
+
+    The local LRU is sized to the whole pool while the other replica's blocks use part of it, so
+    the pool fills before the local LRU does.
+    """
+    registered = FakeRegisteredPool(
+        "shared.data",
+        FakePoolRef(1, 10, 1),
+        FakeCompatibility(2, 7),
+        slot_count=policy_blocks * COMPONENT_COUNT,
+    )
+    directory = SlottedDirectory(registered, free_blocks * COMPONENT_COUNT)
+    runtime = _runtime(directory)
+    manager = SpyreSharedOffloadingManager(
+        identity=IDENTITY,
+        component_count=COMPONENT_COUNT,
+        max_pool_slots=max_pool_slots,
+        cache_policy="lru",
+        cache_policy_module_path=None,
+        enable_events=False,
+        store_threshold=0,
+        max_tracker_size=64_000,
+        runtime_loader=lambda: runtime,
+    )
+    return manager, directory, runtime
+
+
+def _store(manager, directory, key, request_id="store"):
+    ctx = ReqContext(request_id)
+    output = manager.prepare_store([key], ctx)
+    assert output is not None
+    _publish_store(directory, output)
+    manager.complete_store(output.keys_to_store, ctx)
+    manager.on_request_finished(ctx)
+    return output
+
+
+def test_full_pool_evicts_oldest_idle_block_and_stores():
+    manager, directory, _ = _slotted_manager(free_blocks=2)
+    _store(manager, directory, OFFLOAD_KEY)
+    _store(manager, directory, OTHER_KEY)
+    owned = manager._owned_entries[OFFLOAD_KEY]
+
+    output = _store(manager, directory, THIRD_KEY)
+
+    assert output.keys_to_store == [THIRD_KEY]
+    assert OFFLOAD_KEY in output.evicted_keys
+    assert directory.evicted == list(owned)
+    assert OFFLOAD_KEY not in manager._owned_entries
+    assert OFFLOAD_KEY not in manager._local_keys
+    assert manager._local_manager._policy.get(OFFLOAD_KEY) is None
+    assert set(manager._owned_entries) == {OTHER_KEY, THIRD_KEY}
+
+
+def test_full_pool_eviction_follows_recent_use():
+    manager, directory, _ = _slotted_manager(free_blocks=2)
+    _store(manager, directory, OFFLOAD_KEY)
+    _store(manager, directory, OTHER_KEY)
+    manager.touch([OFFLOAD_KEY], ReqContext("reader"))
+
+    output = _store(manager, directory, THIRD_KEY)
+
+    assert output.evicted_keys == [OTHER_KEY]
+    assert set(manager._owned_entries) == {OFFLOAD_KEY, THIRD_KEY}
+
+
+def test_full_pool_never_evicts_a_block_being_loaded():
+    manager, directory, _ = _slotted_manager(free_blocks=2)
+    _store(manager, directory, OFFLOAD_KEY)
+    _store(manager, directory, OTHER_KEY)
+    reader = ReqContext("reader")
+    assert manager.lookup(OFFLOAD_KEY, reader) is LookupResult.HIT
+    manager.prepare_load([OFFLOAD_KEY], reader)
+
+    output = _store(manager, directory, THIRD_KEY)
+
+    assert output.evicted_keys == [OTHER_KEY]
+    assert OFFLOAD_KEY in manager._owned_entries
+
+
+def test_full_pool_never_evicts_a_block_pinned_by_lookup_only():
+    """lookup pins the page before prepare_load raises ref_cnt: the block still looks idle."""
+
+    manager, directory, _ = _slotted_manager(free_blocks=2)
+    _store(manager, directory, OFFLOAD_KEY)
+    _store(manager, directory, OTHER_KEY)
+    reader = ReqContext("reader")
+    assert manager.lookup(OFFLOAD_KEY, reader) is LookupResult.HIT
+    pins = [entry.pin_records[-1] for entry in manager._owned_entries[OFFLOAD_KEY]]
+
+    output = _store(manager, directory, THIRD_KEY)
+
+    assert output.evicted_keys == [OTHER_KEY]
+    assert OFFLOAD_KEY in manager._owned_entries
+    assert all(not pin.released for pin in pins)
+
+
+def test_full_pool_with_every_block_in_use_drops_the_store():
+    manager, directory, _ = _slotted_manager(free_blocks=2)
+    _store(manager, directory, OFFLOAD_KEY)
+    _store(manager, directory, OTHER_KEY)
+    reader = ReqContext("reader")
+    for key in (OFFLOAD_KEY, OTHER_KEY):
+        assert manager.lookup(key, reader) is LookupResult.HIT
+    manager.prepare_load([OFFLOAD_KEY, OTHER_KEY], reader)
+
+    output = manager.prepare_store([THIRD_KEY], ReqContext("store"))
+
+    assert output is not None and output.keys_to_store == []
+    assert directory.evicted == []
+    assert directory.live_reservations == []
+    assert set(manager._owned_entries) == {OFFLOAD_KEY, OTHER_KEY}
+    assert manager._local_manager._policy.get(THIRD_KEY) is None
+
+
+def test_full_pool_never_evicts_a_block_of_the_same_store():
+    manager, directory, _ = _slotted_manager(free_blocks=1)
+
+    output = manager.prepare_store([OFFLOAD_KEY, OTHER_KEY], ReqContext("store"))
+
+    assert output is not None
+    assert output.keys_to_store == [OFFLOAD_KEY]
+    assert directory.evicted == []
+    assert manager._local_manager._policy.get(OTHER_KEY) is None
+
+
+def test_full_pool_never_evicts_another_replicas_block():
+    manager, directory, runtime = _slotted_manager(free_blocks=0)
+    foreign = _publish_complete(directory, runtime, key=FOURTH_KEY, slots=(0, 1, 2, 3))
+
+    output = manager.prepare_store([OFFLOAD_KEY], ReqContext("store"))
+
+    assert output is not None and output.keys_to_store == []
+    assert directory.evicted == []
+    assert all(directory.entries[entry.key.block_hash] is entry for entry in foreign)
+
+
+def test_full_pool_mid_block_resumes_at_the_failed_component():
+    manager, directory, _ = _slotted_manager(free_blocks=2)
+    _store(manager, directory, OFFLOAD_KEY)
+    directory.free = directory.free[:2]  # two of the next block's four components fit
+
+    output = _store(manager, directory, OTHER_KEY)
+
+    assert output.keys_to_store == [OTHER_KEY]
+    assert output.evicted_keys == [OFFLOAD_KEY]
+    claimed = [page.component_id for page in output.store_spec.transfers[0].pages]
+    assert claimed == [0, 1, 2, 3]
+    assert directory.aborted == []
+
+
+def test_full_pool_victim_already_gone_is_not_an_error():
+    """The victim's pages were already freed (evict returns False): drop it and keep going."""
+
+    manager, directory, _ = _slotted_manager(free_blocks=2)
+    _store(manager, directory, OFFLOAD_KEY)
+    _store(manager, directory, OTHER_KEY)
+    for entry in manager._owned_entries[OFFLOAD_KEY]:
+        del directory.entries[entry.key.block_hash]  # gone without returning its slot
+
+    output = _store(manager, directory, THIRD_KEY)
+
+    assert OFFLOAD_KEY not in manager._owned_entries
+    assert manager._local_manager._policy.get(OFFLOAD_KEY) is None
+    assert output.keys_to_store == [THIRD_KEY]  # the next victim made the room
+    assert OTHER_KEY in output.evicted_keys
+
+
+def test_full_pool_eviction_attempts_are_bounded():
+    manager, directory, _ = _slotted_manager(free_blocks=4, policy_blocks=8, max_pool_slots=32)
+    for key in (OFFLOAD_KEY, OTHER_KEY, THIRD_KEY, FOURTH_KEY):
+        _store(manager, directory, key)
+    directory.evict = lambda entry: directory.evicted.append(entry) or True
+
+    output = manager.prepare_store(
+        [make_offload_key(bytes.fromhex("66" * 32), 0)], ReqContext("store")
+    )
+
+    assert output is not None and output.keys_to_store == []
+    evicted_blocks = {entry.key.block_hash for entry in directory.evicted}
+    assert len(directory.evicted) == len(evicted_blocks)
+    assert (
+        len(directory.evicted) <= SpyreSharedOffloadingManager.MAX_EVICT_ATTEMPTS * COMPONENT_COUNT
+    )
+
+
+def test_full_pool_eviction_keeps_local_accounting_as_upstream_does():
+    manager, directory, _ = _slotted_manager(free_blocks=2)
+    _store(manager, directory, OFFLOAD_KEY)
+    _store(manager, directory, OTHER_KEY)
+    local = manager._local_manager
+    evictable_before = local._num_evictable_cache_blocks
+    free_before = local._get_num_free_blocks()
+
+    _store(manager, directory, THIRD_KEY)
+
+    # One block evicted to make room and one stored: the local LRU holds as many blocks as
+    # before, all idle, exactly as after an upstream prepare_store that evicts one.
+    assert local._num_evictable_cache_blocks == evictable_before
+    assert local._get_num_free_blocks() == free_before
+    assert len(manager._owned_entries) == 2

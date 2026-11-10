@@ -77,6 +77,9 @@ class _ComponentRoute:
 class SpyreSharedOffloadingManager(OffloadingManager):
     """Apply one logical cache policy to complete shared page bundles."""
 
+    # Victims evicted to make room for one page claim before the block is dropped.
+    MAX_EVICT_ATTEMPTS = 4
+
     def __init__(
         self,
         *,
@@ -373,6 +376,31 @@ class SpyreSharedOffloadingManager(OffloadingManager):
             elif self._same_slot(entry.slot, reservation.slot):
                 directory.evict(entry)
 
+    def _evict_one_idle(self, directory: object, protected: set[OffloadKey]) -> OffloadKey | None:
+        """Free this replica's least recently used idle block from the shared pool.
+
+        The local policy sees only this replica's blocks and is sized to the whole pool, so it
+        never evicts on its own while other replicas fill the pool; this makes room on NoSpace.
+        Pinned keys must be protected: lookup pins a page before prepare_load marks its block
+        busy, and evicting it would wait on this replica's own read lock.
+        """
+        local_manager = self._local_manager
+        assert local_manager is not None
+        for state in self._request_states:
+            protected.update(state.pending_pins)
+            protected.update(state.active_pins)
+        evicted = local_manager._policy.evict(1, protected)
+        if not evicted:
+            return None
+        # The same bookkeeping CPUOffloadingManager.prepare_store does for an eviction.
+        victim, block = evicted[0]
+        local_manager._num_evictable_cache_blocks -= 1
+        local_manager._free_block(block)
+        for entry in self._owned_entries.pop(victim, ()):
+            directory.evict(entry)
+        self._local_keys.discard(victim)
+        return victim
+
     @override
     def prepare_store(
         self,
@@ -385,10 +413,12 @@ class SpyreSharedOffloadingManager(OffloadingManager):
         if upstream is None:
             return None
 
-        for key in upstream.evicted_keys:
+        evicted_keys = list(upstream.evicted_keys)
+        for key in evicted_keys:
             for entry in self._owned_entries.pop(key, ()):
                 directory.evict(entry)
             self._local_keys.discard(key)
+        protected = set(keys)
 
         transfers: list[SharedBlockTransfer] = []
         prepared_keys: list[OffloadKey] = []
@@ -403,6 +433,14 @@ class SpyreSharedOffloadingManager(OffloadingManager):
                     registered = route.registered
                     page_key = self._page_key(runtime, registered, key, component_id)
                     result = directory.claim(registered.pool_ref, page_key)
+                    for _ in range(self.MAX_EVICT_ATTEMPTS):
+                        if not isinstance(result, runtime.NoSpace):
+                            break
+                        victim = self._evict_one_idle(directory, protected)
+                        if victim is None:
+                            break
+                        evicted_keys.append(victim)
+                        result = directory.claim(registered.pool_ref, page_key)
                     if isinstance(result, runtime.Reservation):
                         if not self._valid_slot(result.slot, registered):
                             raise RuntimeError("reservation returned a foreign pool slot")
@@ -458,7 +496,7 @@ class SpyreSharedOffloadingManager(OffloadingManager):
         return PrepareStoreOutput(
             keys_to_store=prepared_keys,
             store_spec=SharedLoadStoreSpec(transfers),
-            evicted_keys=upstream.evicted_keys,
+            evicted_keys=evicted_keys,
         )
 
     @override
